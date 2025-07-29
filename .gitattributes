@@ -1,0 +1,1 @@
+encoder/RETFound_cfp_weights.pth filter=lfs diff=lfs merge=lfs -text
