@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from scipy.spatial import cKDTree
+import json
 
 grape = pd.read_excel("data/vf_tests/grape_data.xlsx", sheet_name="Baseline")
 grape_vf = grape.iloc[:, -61:].values  # last 61 columns: G1 VF values
@@ -55,11 +56,53 @@ grape_vf_242 = grape_vf[:, mapping]
 # blind_spot_indices = [x, y]  # fill with the two indices corresponding to the blind spot
 # grape_vf_242 = np.delete(grape_vf_242, blind_spot_indices, axis=1)
 
-# Saving Data
-df_out = pd.DataFrame(grape_vf_242)
-df_out.insert(0, "PatientID", patient_ids)
-df_out.insert(1, "FundusImage", fundus_files)
-df_out.replace(-1, np.nan, inplace=True)
-df_out.to_csv("data/vf_tests/grape_24-2_converted.csv", index=False)
+# Saving Data to CSV
+# df_out = pd.DataFrame(grape_vf_242)
+# df_out.insert(0, "PatientID", patient_ids)
+# df_out.insert(1, "FundusImage", fundus_files)
+# df_out.replace(-1, np.nan, inplace=True)
+# df_out.to_csv("data/vf_tests/grape_24-2_converted.csv", index=False)
 
-print("Saved converted 24-2 VF data to grape_24-2_converted.csv")
+# print("Saved converted 24-2 VF data to grape_24-2_converted.csv")
+
+# Saving Data to JSON
+pad = 100
+
+# Define 24-2 matrix template
+template = np.full((8,9), pad)
+
+# Define the positions of the 54 real points in the 8x9 matrix
+# These are the row,col indices corresponding to the real test points
+real_indices = [
+    (0,3),(0,4),(0,5),(0,6),
+    (1,2),(1,3),(1,4),(1,5),(1,6),(1,7),
+    (2,1),(2,2),(2,3),(2,4),(2,5),(2,6),(2,7),(2,8),
+    (3,0),(3,1),(3,2),(3,3),(3,4),(3,5),(3,6),(3,7),(3,8),
+    (4,0),(4,1),(4,2),(4,3),(4,4),(4,5),(4,6),(4,7),(4,8),
+    (5,1),(5,2),(5,3),(5,4),(5,5),(5,6),(5,7),(5,8),
+    (6,2),(6,3),(6,4),(6,5),(6,6),(6,7),(6,8),
+    (7,3),(7,4),(7,5),(7,6)
+]
+
+output = []
+grape_vf_242_trimmed = grape_vf_242[:, :len(real_indices)]
+
+for i, patient_id in enumerate(patient_ids):
+    if pd.isna(patient_id):
+        continue   # skip patient
+    matrix = template.copy()
+    vf_values = np.where(grape_vf_242_trimmed[i] == -1, 100, grape_vf_242_trimmed[i])
+    matrix[tuple(zip(*real_indices))] = vf_values
+    
+    entry = {
+        "PatientID": int(patient_id),
+        "FundusImage": fundus_files[i],
+        "hvf": matrix.tolist()
+    }
+    output.append(entry)
+
+# Save JSON
+with open("data/vf_tests/grape_24-2_matrix.json", "w") as f:
+    json.dump(output, f, indent=2)
+
+print("Saved 24-2 HVFs as 8x9 matrices in JSON")
