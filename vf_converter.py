@@ -10,7 +10,6 @@ patient_ids = grape.iloc[:, 0].values
 laterality = grape.iloc[:, 1].values
 fundus_files = grape.iloc[:, 16].values
 
-# Coordinates for G1 and 24-2
 G1_CANON = np.array([
     [-8,  26], [ 8,  26],
     [-20, 20], [-12, 20], [-4, 20], [ 4, 20], [12, 20], [20, 20],
@@ -38,36 +37,14 @@ coords_242 = np.array(
     dtype=float
 )
 
-def polar_angle_deg(x, y):
-    return math.degrees(math.atan2(y, x))
-
-def spiral_order(coords_xy, eye="OD"):
-    coords = coords_xy.copy()
-    center_idx = int(np.argmin(np.hypot(coords[:,0], coords[:,1])))
-    non_center_idx = [i for i in range(len(coords)) if i != center_idx]
-    nonc = coords[non_center_idx]
-
-    r = np.hypot(nonc[:,0], nonc[:,1])
-    ang = np.array([polar_angle_deg(x, y) for x, y in nonc])
-
-    if eye.upper() == "OS":
-        nonc[:,0] *= -1
-        r = np.hypot(nonc[:,0], nonc[:,1])
-        ang = np.array([polar_angle_deg(x, y) for x, y in nonc])
-        start_deg = -135
-        rel = (ang - start_deg) % 360
-        order_within_r = np.lexsort((rel, r))
+def spiral_order(eye):
+    if eye == "OD":
+        return [] # right eye
     else:
-        start_deg = -45
-        rel = (ang - start_deg) % 360
-        rel_cw = (360 - rel) % 360
-        order_within_r = np.lexsort((rel_cw, r))
+        return [] # left eye
 
-    ordered_idx = [non_center_idx[i] for i in order_within_r]
-    return [center_idx] + ordered_idx
-
-order_OD = spiral_order(G1_CANON, "OD")
-order_OS = spiral_order(G1_CANON, "OS")
+order_OD = spiral_order("OD")
+order_OS = spiral_order("OS")
 
 coords_g1_right = G1_CANON[order_OD]
 coords_g1_left  = G1_CANON[order_OS]
