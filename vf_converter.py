@@ -30,71 +30,59 @@ G1_CANON = np.array([
     [ 0,   0],  # center
 ], dtype=float)
 
-# Helper: build spiral ordering (center -> clockwise outwards)
-def polar_angle_deg(x, y):
-    return math.degrees(math.atan2(y, x))
-
-def spiral_order(coords_xy, eye="OD"):
-    coords = coords_xy.copy()
-
-    # center index (exact [0,0])
-    center_idx = int(np.argmin(np.hypot(coords[:,0], coords[:,1])))
-    assert np.allclose(coords[center_idx], [0,0]), "Expected center (0,0) present"
-
-    # separate center and non-center
-    non_center_idx = [i for i in range(len(coords)) if i != center_idx]
-    nonc = coords[non_center_idx]
-
-    # radii and angles
-    r = np.hypot(nonc[:,0], nonc[:,1])
-    ang = np.array([polar_angle_deg(x, y) for x, y in nonc])  # degrees, CCW from +x
-
-    # We want the SECOND item to be the "closest bottom-right from center"
-    # bottom-right ≈ angle near -45°. We'll rotate angle origin accordingly.
-    # For OD (clockwise): sort by (radius asc, angle starting at -45 going CW)
-    # For OS (counter-clockwise): mirror x first (temporal/nasal swap), then start at -135° going CCW (bottom-left).
-    if eye.upper() == "OS":
-        # mirror x for left eye geometry
-        nonc = nonc.copy()
-        nonc[:,0] *= -1
-        r = np.hypot(nonc[:,0], nonc[:,1])
-        ang = np.array([polar_angle_deg(x, y) for x, y in nonc])
-        # start from bottom-left ≈ -135° and go CCW: we can invert sort direction later
-        start_deg = -135.0
-        # To go CCW from start, we map angles to [0,360) relative to start and sort ASC
-        rel = (ang - start_deg) % 360.0
-        order_within_r = np.lexsort((rel, r))
-        ordered_nonc = nonc[order_within_r]
-        # Undo the mirror for returned coords (so we keep original physical coords)
-        ordered_idx = [non_center_idx[i] for i in order_within_r]
-    else:
-        # OD: start ~ -45°, go clockwise => map angles relative to -45°, then sort by radius asc and rel DESC (CW)
-        start_deg = -45.0
-        rel = (ang - start_deg) % 360.0
-        # For clockwise, we sort by decreasing rel (equivalently, sort by (360-rel) ASC)
-        rel_cw = (360.0 - rel) % 360.0
-        order_within_r = np.lexsort((rel_cw, r))
-        ordered_idx = [non_center_idx[i] for i in order_within_r]
-
-    # Final spiral index list: [center] + ordered others
-    return [center_idx] + ordered_idx
-
-# Build OD/OS spiral-ordered coordinate arrays
-order_OD = spiral_order(G1_CANON, eye="OD")
-order_OS = spiral_order(G1_CANON, eye="OS")
-
-coords_g1_right = G1_CANON[order_OD]
-coords_g1_left  = G1_CANON[order_OS]
 x_coords = [-21,-15,-9,-3,3,9,15,21]
 y_coords = [21,18,15,12,9,6,3,0,-3,-6,-9,-12,-15,-18,-21]
+
 coords_242 = np.array(
     [[x,y] for y in y_coords for x in x_coords if not (x==0 and y==0)],
     dtype=float
 )
 
-# Build KDTrees for each laterality
-tree_OD = cKDTree(coords_g1_right)
-tree_OS = cKDTree(coords_g1_left)
+def polar_angle_deg(x, y):
+    return math.degrees(math.atan2(y, x))
+
+def spiral_order(coords_xy, eye="OD"):
+    coords = coords_xy.copy()
+    center_idx = int(np.argmin(np.hypot(coords[:,0], coords[:,1])))
+    non_center_idx = [i for i in range(len(coords)) if i != center_idx]
+    nonc = coords[non_center_idx]
+
+    r = np.hypot(nonc[:,0], nonc[:,1])
+    ang = np.array([polar_angle_deg(x, y) for x, y in nonc])
+
+    if eye.upper() == "OS":
+        nonc[:,0] *= -1
+        r = np.hypot(nonc[:,0], nonc[:,1])
+        ang = np.array([polar_angle_deg(x, y) for x, y in nonc])
+        start_deg = -135
+        rel = (ang - start_deg) % 360
+        order_within_r = np.lexsort((rel, r))
+    else:
+        start_deg = -45
+        rel = (ang - start_deg) % 360
+        rel_cw = (360 - rel) % 360
+        order_within_r = np.lexsort((rel_cw, r))
+
+    ordered_idx = [non_center_idx[i] for i in order_within_r]
+    return [center_idx] + ordered_idx
+
+order_OD = spiral_order(G1_CANON, "OD")
+order_OS = spiral_order(G1_CANON, "OS")
+
+coords_g1_right = G1_CANON[order_OD]
+coords_g1_left  = G1_CANON[order_OS]
+
+tree_OD = cKDTree(coords_242)
+tree_OS = cKDTree(coords_242)
+
+def map_spiral_to_24_2(g1_values, eye="OD", pad=100):
+    matrix = np.full((8,9), pad)
+    # Slice spiral values to match 54 real points
+    g1_values_real = g1_values[:len(real_indices)]
+    for val, (row,col) in zip(g1_values_real, real_indices):
+        matrix[row,col] = val
+    return matrix
+
 
 # Removing last 2 blind spots
 # blind_spot_indices = [x, y]  # fill with the two indices corresponding to the blind spot
@@ -129,38 +117,24 @@ real_indices = [
 ]
 coords_242_real = np.array([coords_242[i] for i in range(len(real_indices))])
 
-coords_OD = G1_CANON.copy()
-coords_OS = G1_CANON.copy()
-coords_OS[:,0] *= -1
-
-tree_OD = cKDTree(coords_OD)
-tree_OS = cKDTree(coords_OS)
-
 output = []
-
-for i, patient_id in enumerate(patient_ids):
-    if pd.isna(patient_id):
+for i, pid in enumerate(patient_ids):
+    if pd.isna(pid):
         continue
-
     eye = str(laterality[i]).upper()
-    matrix = np.full((8,9), 100)
-
-    if eye == "OD":
-        vf_values = grape_vf[i, order_OD][:len(real_indices)]
-    elif eye == "OS":
-        vf_values = grape_vf[i, order_OS][:len(real_indices)]
-    else:
-        print(f"Unknown laterality {eye} for patient {patient_id}, skipping")
+    if eye not in ["OD","OS"]:
+        print(f"Unknown laterality {eye} for patient {pid}, skipping")
         continue
 
-    # Assign spiral-ordered values directly to template
-    matrix[tuple(zip(*real_indices))] = vf_values
+    g1_order = order_OD if eye=="OD" else order_OS
+    vf_spiral = grape_vf[i, g1_order]
+    vf_matrix = map_spiral_to_24_2(vf_spiral, eye)
 
     entry = {
-        "PatientID": int(patient_id),
+        "PatientID": int(pid),
         "FundusImage": fundus_files[i],
         "Laterality": eye,
-        "hvf": matrix.tolist()
+        "hvf": vf_matrix.tolist()
     }
     output.append(entry)
 
