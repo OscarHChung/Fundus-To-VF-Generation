@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
 from scipy.spatial import cKDTree
+import json
+from scipy.interpolate import griddata
 
 grape = pd.read_excel("data/vf_tests/grape_data.xlsx", sheet_name="Baseline")
 grape_vf = grape.iloc[:, -61:].values  # last 61 columns: G1 VF values
@@ -8,6 +10,7 @@ patient_ids = grape.iloc[:, 0].values
 laterality = grape.iloc[:, 1].values
 fundus_files = grape.iloc[:, 16].values
 
+# Degree locations of G1 vf tests (NO BLIND SPOTS - 59 instead of 61)
 G1_LOCATIONS_RIGHT = np.array([
     [-8,  26], [  8, 26],
     [-20, 20], [-12, 20], [ -4, 20], [  4, 20], [ 12, 20], [ 20, 20],
@@ -39,14 +42,34 @@ G1_LOCATIONS_LEFT = np.array([
     [ -8,-26], [  8,-26],
 ], dtype=float)
 
-# Octopus Locations
-x_coords = [-21,-15,-9,-3,3,9,15,21]
-y_coords = [21,18,15,12,9,6,3,0,-3,-6,-9,-12,-15,-18,-21]
-coords_242 = np.array(
-    [[x,y] for y in y_coords for x in x_coords if not (x==0 and y==0)],
-    dtype=float
-)
+# 24-2 VF Test Locations (NO blind spots - 52 not 54)
+VF24_2_RIGHT = np.array([
+    [-9, 21], [-3, 21], [3, 21], [9, 21],
+    [-15, 15], [-9, 15], [-3, 15], [3, 15], [9, 15], [15, 15],
+    [-21, 9], [-15, 9], [-9, 9], [-3, 9], [3, 9], [9, 9], [15, 9], [21, 9],
 
+    [-27, 3], [-21, 3], [-15, 3], [-9, 3], [-3, 3], [3, 3], [9, 3], [21, 3],
+    [-27, -3], [-21, -3], [-15, -3], [-9, -3], [-3, -3], [3, -3], [9, -3],[21, -3],
+
+    [-21, -9], [-15, -9], [-9, -9], [-3, -9], [3, -9], [9, -9], [15, -9], [21, -9],
+    [-15, -15], [-9, -15], [-3, -15], [3, -15], [9, -15], [15, -15],
+    [-9, -21], [-3, -21], [3, -21], [9, -21]
+], dtype=float)
+VF24_2_LEFT = np.array([
+    [-9, 21], [-3, 21], [3, 21], [9, 21],
+    [-15, 15], [-9, 15], [-3, 15], [3, 15], [9, 15], [15, 15],
+    [-21, 9], [-15, 9], [-9, 9], [-3, 9], [3, 9], [9, 9], [15, 9], [21, 9],
+
+    [-21, 3], [-9, 3], [-3, 3], [3, 3], [9, 3], [15, 3], [21, 3], [27, 3],
+    [-21, -3], [-9, -3], [-3, -3], [3, -3], [9, -3], [15, -3], [21, -3], [27, -3],
+
+    [-21, -9], [-15, -9], [-9, -9], [-3, -9], [3, -9], [9, -9], [15, -9], [21, -9],
+    [-15, -15], [-9, -15], [-3, -15], [3, -15], [9, -15], [15, -15],
+    [-9, -21], [-3, -21], [3, -21], [9, -21]
+], dtype=float)
+
+
+# Ordering of the G1 values in GRAPE
 def spiral_order(eye):
     if eye == "OD":
         return [56, 57,
@@ -76,4 +99,103 @@ def spiral_order(eye):
                 32, 21, 22, 23, 24, 39,
                 33, 34, 35, 36, 37, 38,
                 52, 53] # left eye
-    
+
+# Remove 22nd and 33rd columns
+mask = np.ones(grape_vf.shape[1], dtype=bool)
+mask[21] = False
+mask[32] = False
+vf_removed = grape_vf[:, mask]
+
+# Reorder each row based on laterality (now with 59 columns instead of 61)
+reordered_vf = np.zeros_like(vf_removed)
+
+for i, (vf_row, lat) in enumerate(zip(vf_removed, laterality)):
+    order = spiral_order(lat)
+    reordered_vf[i] = vf_row[order]
+
+reordered_df = pd.DataFrame(
+    reordered_vf,
+    index=patient_ids,
+    columns=[f"VF_{i}" for i in range(reordered_vf.shape[1])]
+)
+reordered_df.insert(0, "PatientID", patient_ids)
+reordered_df.insert(1, "Laterality", laterality)
+reordered_df.insert(2, "FundusFile", fundus_files)
+
+reordered_df = reordered_df.iloc[1:]
+
+
+# Mapping from G1 to 24-2
+kd_right = cKDTree(VF24_2_RIGHT)
+kd_left = cKDTree(VF24_2_LEFT)
+
+mask_OD = np.array([
+    [False, False, False,  True,  True,  True,  True, False, False],
+    [False, False,  True,  True,  True,  True,  True,  True, False],
+    [False,  True,  True,  True,  True,  True,  True,  True,  True],
+    [True,  True,  True,  True,  True,  True,  True,  False,  True],
+    [True,  True,  True,  True,  True,  True,  True,  False, True],
+    [False, True,  True,  True,  True,  True,  True, True, True],
+    [False, False, True,  True,  True,  True, True, True, False],
+    [False, False, False, True,  True,  True, True, False, False]
+], dtype=bool)
+mask_OS = reversed_rows_arr = mask_OD[:, ::-1]
+output = []
+
+for i, pid in enumerate(patient_ids):
+    if pd.isna(pid):
+        continue
+
+    eye = str(laterality[i]).upper()
+    if eye not in ["OD", "OS"]:
+        print(f"Unknown laterality {eye} for patient {pid}, skipping")
+        continue
+
+    # KD-Tree selection
+    if eye == "OD":
+        g1_points = G1_LOCATIONS_RIGHT
+        kd_tree = kd_right
+        mask = mask_OD
+    else:
+        g1_points = G1_LOCATIONS_LEFT
+        kd_tree = kd_left
+        mask = mask_OS
+
+    # KD-Tree mapping
+    vf_row = reordered_vf[i]
+    distances, indices = kd_tree.query(g1_points)
+    temp = [[] for _ in range(len(kd_tree.data))]
+    for g1_val, idx in zip(vf_row, indices):
+        temp[idx].append(g1_val)
+    mapped_values = [np.mean(vals) if vals else np.nan for vals in temp]
+
+    # Fill NaNs with nearest neighbor
+    mapped_values = np.array(mapped_values)
+    nan_mask = np.isnan(mapped_values)
+    if nan_mask.any():
+        from scipy.interpolate import griddata
+        mapped_values[nan_mask] = griddata(
+            points=kd_tree.data[~nan_mask],
+            values=mapped_values[~nan_mask],
+            xi=kd_tree.data[nan_mask],
+            method='nearest'
+        )
+
+    # Insert values into 2D HVF matrix with padding = 100
+    hvf_matrix = np.full(mask.shape, 100.0)
+    hvf_matrix[mask] = mapped_values
+
+    # Add to JSON
+    entry = {
+        "PatientID": int(pid),
+        "FundusImage": fundus_files[i],
+        "Laterality": eye,
+        "hvf": hvf_matrix.tolist()
+    }
+    output.append(entry)
+
+# Save JSON
+with open("data/vf_tests/grape_24-2_matrix.json", "w") as f:
+    json.dump(output, f, indent=2)
+
+print("Saved 24-2 HVFs as 8x9 matrices with padding around eye in JSON")
