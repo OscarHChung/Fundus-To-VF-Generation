@@ -124,7 +124,6 @@ reordered_df.insert(2, "FundusFile", fundus_files)
 
 reordered_df = reordered_df.iloc[1:]
 
-
 # Mapping from G1 to 24-2
 kd_right = cKDTree(VF24_2_RIGHT)
 kd_left = cKDTree(VF24_2_LEFT)
