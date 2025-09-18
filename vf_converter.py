@@ -194,7 +194,7 @@ for i, pid in enumerate(patient_ids):
     output.append(entry)
 
 # Save JSON
-with open("data/vf_tests/grape_24-2_matrix.json", "w") as f:
+with open("data/vf_tests/grape_new_vf_tests.json", "w") as f:
     json.dump(output, f, indent=2)
 
 print("Saved 24-2 HVFs as 8x9 matrices with padding around eye in JSON")

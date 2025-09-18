@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
 
 # Load JSON
-with open("data/vf_tests/grape_24-2_matrix.json", "r") as f:
+with open("data/vf_tests/grape_new_vf_tests.json", "r") as f:
     data = json.load(f)
 
 def print_vf(entry):
@@ -47,7 +47,7 @@ def visualize_vf(row_id):
     plt.figure(figsize=(6, 5))
     im = plt.imshow(hvf_masked, cmap=cmap, vmin=-1, vmax=30)
     plt.colorbar(im, label="VF sensitivity (dB)")
-    plt.title(f"24-2 | Patient ID: {pid} | Eye: {eye}", fontsize=12)
+    plt.title(f"GRAPE | 24-2 | Patient ID: {pid} | Eye: {eye}", fontsize=12)
     plt.axis('off')
     plt.show()
 
@@ -173,9 +173,8 @@ def visualize_old_vf(row_idx, grape_xlsx="data/vf_tests/grape_data.xlsx", sheet=
     plt.colorbar(sc, label="VF sensitivity (dB)")
     plt.axis('equal')
     plt.axis('off')
-    plt.title(f"G1 | Patient ID: {int(pid)} | Eye: {eye}", fontsize=12)
+    plt.title(f"GRAPE | G1 | Patient ID: {int(pid)} | Eye: {eye}", fontsize=12)
     plt.show()
-
 
 # Loop over patients (print first few for demo)
 #for entry in data[:10]:
