@@ -181,7 +181,7 @@ def visualize_old_vf(row_idx, grape_xlsx="data/vf_tests/grape_data.xlsx", sheet=
 #    print_vf(entry)
 
 # Old heatmap of specific entry row id
-visualize_old_vf(27)
+visualize_old_vf(6)
 
 # Heatmap of a specific entry row id
-visualize_vf(27)
+visualize_vf(6)
