@@ -2,11 +2,7 @@ import numpy as np
 import json
 
 def convert(dataset2_path, dataset1_output_path):
-    """
-    Simple converter from dataset 2 to dataset 1 format
-    """
-    
-    # Load dataset 2
+    # Load uwhvf
     with open(dataset2_path, 'r') as f:
         dataset2 = json.load(f)
     
@@ -21,7 +17,7 @@ def convert(dataset2_path, dataset1_output_path):
     # Create mapping from (x,y) to index
     coord_mapping = {(coord['x'], coord['y']): coord['index'] for coord in coords}
     
-    # Convert to dataset 1 format
+    # Convert to standardized format
     dataset1 = []
     
     for patient_id, patient_data in data_dict.items():
