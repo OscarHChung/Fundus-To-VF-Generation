@@ -3,6 +3,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
+from PIL import Image
+import os
 
 # Load JSON
 with open("data/vf_tests/grape_new_vf_tests.json", "r") as f:
@@ -48,8 +50,11 @@ def visualize_vf(row_id):
     im = plt.imshow(hvf_masked, cmap=cmap, vmin=-1, vmax=30)
     plt.colorbar(im, label="VF sensitivity (dB)")
     plt.title(f"GRAPE | 24-2 | Patient ID: {pid} | Eye: {eye}", fontsize=12)
+    plt.savefig(f"./data/vf_tests/visuals/GRAPE_24-2_ID_{int(pid)}_EYE_{eye}.png")
     plt.axis('off')
-    plt.show()
+    # plt.show()
+
+    return pid, eye
 
 # Ordering of the G1 values in GRAPE
 def spiral_order(eye):
@@ -174,14 +179,45 @@ def visualize_old_vf(row_idx, grape_xlsx="data/vf_tests/grape_data.xlsx", sheet=
     plt.axis('equal')
     plt.axis('off')
     plt.title(f"GRAPE | G1 | Patient ID: {int(pid)} | Eye: {eye}", fontsize=12)
-    plt.show()
+    plt.savefig(f"./data/vf_tests/visuals/GRAPE_G1_ID_{int(pid)}_EYE_{eye}.png")
+    # plt.show()
+
+    return pid, eye
 
 # Loop over patients (print first few for demo)
 #for entry in data[:10]:
 #    print_vf(entry)
 
-# Old heatmap of specific entry row id
-visualize_old_vf(6)
+if __name__ == '__main__':
+    id = 2
+    # Old heatmap of specific entry row id
+    old_pid, old_eye = visualize_old_vf(id)
 
-# Heatmap of a specific entry row id
-visualize_vf(6)
+    # Heatmap of a specific entry row id
+    new_pid, new_eye = visualize_vf(id)
+
+    # Save heatmaps side by side
+    image1 = Image.open(f"./data/vf_tests/visuals/GRAPE_G1_ID_{int(old_pid)}_EYE_{old_eye}.png")
+    image2 = Image.open(f"./data/vf_tests/visuals/GRAPE_24-2_ID_{int(new_pid)}_EYE_{new_eye}.png")
+
+    # Determine the minimum height of the two images
+    min_height = min(image1.height, image2.height)
+
+    # Resize images to the minimum height while maintaining aspect ratio
+    image1 = image1.resize((int(image1.width * min_height / image1.height), min_height))
+    image2 = image2.resize((int(image2.width * min_height / image2.height), min_height))
+
+    combined_width = image1.width + image2.width
+    combined_image = Image.new("RGBA", (combined_width, min_height)) # Use RGBA for transparency
+
+    combined_image.paste(image1, (0, 0))
+    combined_image.paste(image2, (image1.width, 0))
+
+    # Save to file
+    combined_image.save(f"./data/vf_tests/visuals/COMPARISON_ID_{int(old_pid)}_EYE_{old_eye}.png")
+
+    os.remove(f"./data/vf_tests/visuals/GRAPE_G1_ID_{int(old_pid)}_EYE_{old_eye}.png")
+    os.remove(f"./data/vf_tests/visuals/GRAPE_24-2_ID_{int(new_pid)}_EYE_{new_eye}.png")
+
+    # Or display it (if running in Jupyter/IPython)
+    combined_image.show()
