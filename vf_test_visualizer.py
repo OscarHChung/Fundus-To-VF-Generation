@@ -189,7 +189,7 @@ def visualize_old_vf(row_idx, grape_xlsx="data/vf_tests/grape_data.xlsx", sheet=
 #    print_vf(entry)
 
 if __name__ == '__main__':
-    id = 2
+    id = 6
     # Old heatmap of specific entry row id
     old_pid, old_eye = visualize_old_vf(id)
 
