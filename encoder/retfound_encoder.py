@@ -1,60 +1,65 @@
 import sys
 import os
 import torch
-import argparse
-from PIL import Image
 from torchvision import transforms
+from PIL import Image
+import argparse
 
-# Add RETFound_MAE folder to sys.path
+# ===========================
+# 1. Load RETFound Model
+# ===========================
 current_dir = os.path.dirname(os.path.abspath(__file__))
 retfound_dir = os.path.join(current_dir, 'RETFound_MAE')
-print("Appending path:", retfound_dir)
 sys.path.insert(0, retfound_dir)
 
 from models_mae import mae_vit_large_patch16_dec512d8b
 
-# Path to checkpoint relative to this script
 checkpoint_path = os.path.join(current_dir, "RETFound_cfp_weights.pth")
-print(f"Loading checkpoint from: {checkpoint_path}")
 
-# Load checkpoint safely allowing argparse.Namespace
+# Safe loading for checkpoints containing argparse.Namespace
 with torch.serialization.safe_globals([argparse.Namespace]):
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
-# Initialize model and load weights
 model = mae_vit_large_patch16_dec512d8b()
 model.load_state_dict(checkpoint['model'], strict=False)
-model.eval()
+model.eval()  # freeze encoder by default
 
-# Preprocess image
-transform = transforms.Compose([
+# ===========================
+# 2. Encoder Wrapper
+# ===========================
+class RetFoundEncoderWrapper(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.model.eval()
+
+    def forward(self, x):
+        """
+        x: tensor [B, 3, 224, 224]
+        returns: latent [B, 512] (CLS token)
+        """
+        with torch.no_grad():
+            latent = self.model.forward_encoder(x, mask_ratio=0.75)[0]
+        return latent
+
+encoder = RetFoundEncoderWrapper(model)
+
+# ===========================
+# 3. Preprocessing Transform
+# ===========================
+retfound_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
                          std=[0.229, 0.224, 0.225])
 ])
 
-# Load image (adjust the relative path if necessary)
-img_path = os.path.join(current_dir, "../data/fundus/fundus_example.png")
-img = Image.open(img_path).convert("RGB")
-x = transform(img).unsqueeze(0)
-
-# Extract latent representation
-with torch.no_grad():
-    latent = model.forward_encoder(x, mask_ratio=0.75)[0]  # CLS token (global latent)
+# ===========================
+# 4. Example: Encode a single image
+# ===========================
+if __name__ == "__main__":
+    img_path = os.path.join(current_dir, "../data/fundus/fundus_example.png")
+    img = Image.open(img_path).convert("RGB")
+    x = retfound_transform(img).unsqueeze(0)
+    latent = encoder(x)
     print("Latent vector shape:", latent.shape)
-
-class RetFoundEncoderWrapper(torch.nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-        self.model.eval()  # freeze by default
-
-    def forward(self, x):
-        """
-        x: tensor [B, 3, 224, 224]
-        returns: latent [B, 512]
-        """
-        with torch.no_grad():
-            latent = self.model.forward_encoder(x, mask_ratio=0.75)[0]  # CLS token
-        return latent
