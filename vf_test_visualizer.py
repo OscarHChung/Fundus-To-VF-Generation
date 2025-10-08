@@ -34,10 +34,20 @@ def visualize_vf(row_id):
     eye = entry.get("Laterality", "NA")
     img = entry.get("FundusImage", "NA")
     hvf = np.array(entry["hvf"], dtype=float)
+    print(hvf)
 
     # Flip horizontally for left eyes
     if eye.upper() == "OS":
-        hvf = np.fliplr(hvf)
+        flipped_hvf = hvf.copy()
+
+        for r in range(hvf.shape[0]):
+            mask = hvf[r] != 100
+            # Extract indices of non-100 positions
+            idx = np.where(mask)[0]
+            # Flip the values among these indices
+            flipped_hvf[r, idx] = hvf[r, idx[::-1]]
+        
+        hvf = flipped_hvf
 
     # Set padding (100) to NaN for white
     hvf_masked = np.where(hvf == 100, np.nan, hvf)
@@ -189,12 +199,12 @@ def visualize_old_vf(row_idx, grape_xlsx="data/vf_tests/grape_data.xlsx", sheet=
 #    print_vf(entry)
 
 if __name__ == '__main__':
-    id = 6
+    fundus_id = 15
     # Old heatmap of specific entry row id
-    old_pid, old_eye = visualize_old_vf(id)
+    old_pid, old_eye = visualize_old_vf(fundus_id)
 
     # Heatmap of a specific entry row id
-    new_pid, new_eye = visualize_vf(id)
+    new_pid, new_eye = visualize_vf(fundus_id)
 
     # Save heatmaps side by side
     image1 = Image.open(f"./data/vf_tests/visuals/GRAPE_G1_ID_{int(old_pid)}_EYE_{old_eye}.png")
