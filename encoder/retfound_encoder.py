@@ -43,3 +43,18 @@ x = transform(img).unsqueeze(0)
 with torch.no_grad():
     latent = model.forward_encoder(x, mask_ratio=0.75)[0]  # CLS token (global latent)
     print("Latent vector shape:", latent.shape)
+
+class RetFoundEncoderWrapper(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.model.eval()  # freeze by default
+
+    def forward(self, x):
+        """
+        x: tensor [B, 3, 224, 224]
+        returns: latent [B, 512]
+        """
+        with torch.no_grad():
+            latent = self.model.forward_encoder(x, mask_ratio=0.75)[0]  # CLS token
+        return latent
