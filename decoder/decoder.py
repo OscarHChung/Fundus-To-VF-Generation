@@ -52,6 +52,7 @@ class VFOnlyDataset(Dataset):
 class VFDecoder(nn.Module):
     def __init__(self, latent_dim=512, hidden_dim=1024, output_dim=54):
         super().__init__()
+        # Neural Network Container
         self.model = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
@@ -61,6 +62,7 @@ class VFDecoder(nn.Module):
         )
 
     def forward(self, latent):
+        # The latent: compressed input
         return self.model(latent)
 
 # ===========================
@@ -132,21 +134,21 @@ def finetune_decoder(decoder, paired_json, fundus_dir, encoder, epochs=20, batch
 # ===========================
 if __name__ == "__main__":
     import numpy as np
-    from retfound_encoder import encoder
+    from ..encoder.retfound_encoder import encoder
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     latent_dim = 512
 
     # Paths
-    grape_json = ""
+    grape_json = "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/vf_tests/grape_new_vf_tests.json"
     grape_fundus_dir = ""
-    uhwvf_json = ""
+    uhwvf_json = "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/vf_tests/uwhvf_vf_tests_standardized.json"
 
     # 1) Pretrain decoder
     decoder = pretrain_decoder(uhwvf_json, latent_dim=latent_dim, epochs=10, device=device)
 
     # 2) Fine-tune decoder on GRAPE with RetFound encoder
-    decoder = finetune_decoder(decoder, grape_json, grape_fundus_dir, encoder, epochs=20, device=device)
+    '''decoder = finetune_decoder(decoder, grape_json, grape_fundus_dir, encoder, epochs=20, device=device)'''
 
     # 3) Example prediction
     '''from torchvision.transforms.functional import to_tensor
