@@ -13,7 +13,6 @@ from PIL import Image
 from tqdm import tqdm
 import sys
 
-# Add parent directory for imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # ===========================
@@ -74,42 +73,41 @@ class VFDecoder(nn.Module):
 # ===========================
 # 3. Loss Functions
 # ===========================
+
 def masked_mse_loss_pretrain(pred, target, mask_value=100.0):
+    """Pretraining: only mask out positions with target==mask_value"""
     mask = target != mask_value
+    if mask.sum() == 0:
+        return torch.tensor(0.0, device=pred.device)
     return ((pred[mask] - target[mask]) ** 2).mean()
 
 def apply_mask_to_preds(preds, target, eye_sides, mask_value=100.0):
-    """
-    preds: [batch, n_points]
-    target: same shape
-    eye_sides: list of 'OD'/'OS'
-    """
+    """Fine-tuning: mask based on laterality + 100"""
     preds = preds.clone()
     target = target.clone()
     batch_size, n_points = preds.shape
 
-    # Example anatomical mask: first half = OD, second half = OS
     half = n_points // 2
     mask_OD = torch.ones(half, dtype=torch.bool, device=preds.device)
     mask_OS = mask_OD.flip(dims=[0])
 
     for i in range(batch_size):
         if eye_sides[i] == "OD":
-            mask = torch.cat([mask_OD, mask_OD])  # repeat if needed
+            mask = torch.cat([mask_OD, mask_OD])
         else:
             mask = torch.cat([mask_OS, mask_OS])
-        mask = mask & (target[i] != mask_value)  # also mask out 100 points
+        mask = mask & (target[i] != mask_value)
+        preds[i][~mask] = mask_value
 
-        preds[i][~mask] = mask_value  # enforce masked positions
     return preds
 
 def masked_mse_loss(preds, target, eye_sides, mask_value=100.0):
     preds_masked = apply_mask_to_preds(preds, target, eye_sides, mask_value)
-    loss = ((preds_masked - target)**2)
     valid = target != mask_value
     if valid.sum() == 0:
         return torch.tensor(0.0, device=preds.device), preds_masked
-    return loss[valid].mean(), preds_masked
+    loss = ((preds_masked - target)[valid] ** 2).mean()
+    return loss, preds_masked
 
 # ===========================
 # 4. Pretrain decoder on UWHVF
@@ -126,7 +124,7 @@ def pretrain_decoder(vf_json, latent_dim=1024, epochs=10, batch_size=64, lr=1e-3
         epoch_loss = 0.0
         for vfs in loader:
             vfs = vfs.to(device)
-            latent = torch.randn(vfs.size(0), latent_dim).to(device)  # random latent for pretraining
+            latent = torch.randn(vfs.size(0), latent_dim).to(device)
             preds = decoder(latent)
             loss = masked_mse_loss_pretrain(preds, vfs)
 
@@ -159,7 +157,6 @@ def finetune_decoder(decoder, dataset, encoder, epochs=20, batch_size=16, lr=1e-
             latent = encoder(fundus_imgs)
             preds = decoder(latent)
 
-            # masked loss + enforce mask
             loss, preds_masked = masked_mse_loss(preds, vfs, eye_sides)
             loss.backward()
             optimizer.step()
@@ -180,29 +177,23 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     latent_dim = 1024
 
-    # Paths
     base_dir = "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data"
     grape_json = os.path.join(base_dir, "vf_tests", "grape_new_vf_tests.json")
     grape_fundus_dir = os.path.join(base_dir, "fundus", "grape_fundus_images")
     uwhvf_json = os.path.join(base_dir, "vf_tests", "uwhvf_vf_tests_standardized.json")
 
-    # Transform for encoder input
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
     ])
 
-    # Create GRAPE dataset
     paired_dataset = PairedDataset(grape_json, grape_fundus_dir, transform=transform)
 
-    # 1) Pretrain decoder
     decoder = pretrain_decoder(uwhvf_json, latent_dim=latent_dim, epochs=10, device=device)
-
-    # 2) Fine-tune decoder
     decoder = finetune_decoder(decoder, paired_dataset, encoder, epochs=20, batch_size=16, device=device)
 
-    # 3) Example prediction
+    # Example prediction
     sample_img_path = os.path.join(grape_fundus_dir, "1_OD_1.jpg")
     sample_img = Image.open(sample_img_path).convert("RGB")
     sample_img = transform(sample_img).unsqueeze(0).to(device)
@@ -210,9 +201,5 @@ if __name__ == "__main__":
     with torch.no_grad():
         latent = encoder(sample_img)
         vf_pred = decoder(latent)
-
-        # Apply mask using actual target if available, else keep all as valid
-        # Here we just keep all as valid for demo
-        vf_pred_masked = vf_pred.clone()  # no target available, keep predictions as-is
-
-    print("Predicted VF:", vf_pred_masked)
+        # For demo, just keep as-is
+        print("Predicted VF:", vf_pred)
