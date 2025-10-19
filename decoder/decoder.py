@@ -92,7 +92,7 @@ def masked_mse_loss(pred, target, eye_sides):
         [False, True, True, True, True, True, True, True, True],
         [False, False, True, True, True, True, True, True, False],
         [False, False, False, True, True, True, True, False, False],
-    ], dtype=torch.bool, device=pred.device)
+    ], dtype=torch.bool, device=device)
 
     mask_OS = torch.flip(mask_OD, dims=[1])
 
@@ -114,7 +114,7 @@ def masked_mse_loss(pred, target, eye_sides):
 def pretrain_decoder(vf_json, latent_dim=1024, epochs=10, batch_size=64, lr=1e-3, device='cpu'):
     dataset = VFOnlyDataset(vf_json)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    output_dim = dataset[0].shape[0]
+    output_dim = 72
 
     decoder = VFDecoder(latent_dim=latent_dim, output_dim=output_dim).to(device)
     optimizer = optim.Adam(decoder.parameters(), lr=lr)
