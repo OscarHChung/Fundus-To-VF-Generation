@@ -79,7 +79,7 @@ def masked_mse_loss_pretrain(pred, target, mask_value=100.0):
     return ((pred[mask] - target[mask]) ** 2).mean()
 
 def masked_mse_loss(pred, target, eye_sides):
-    """Masked MSE with original masking."""
+    """Masked MSE"""
     total_loss = 0.0
     count = 0
 
@@ -93,7 +93,8 @@ def masked_mse_loss(pred, target, eye_sides):
         [False, False, True, True, True, True, True, True, False],
         [False, False, False, True, True, True, True, False, False],
     ], dtype=torch.bool, device=pred.device)
-    mask_OS = mask_OD[:, ::-1]
+
+    mask_OS = torch.flip(mask_OD, dims=[1])
 
     for i in range(pred.shape[0]):
         eye_mask = mask_OD if eye_sides[i] == 'OD' else mask_OS
