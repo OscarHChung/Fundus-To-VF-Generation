@@ -36,10 +36,12 @@ class RetFoundEncoderWrapper(torch.nn.Module):
     def forward(self, x):
         """
         x: tensor [B, 3, 224, 224]
-        returns: latent [B, 512] (CLS token)
+        returns: latent [B, 1024] (CLS token)
         """
         with torch.no_grad():
             latent = self.model.forward_encoder(x, mask_ratio=0.75)[0]
+            if latent.dim() == 3:  # [B, num_patches, 1024]
+                latent = latent[:, 0, :]
         return latent
 
 encoder = RetFoundEncoderWrapper(model)
