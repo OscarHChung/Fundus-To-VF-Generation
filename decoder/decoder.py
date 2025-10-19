@@ -21,15 +21,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 # GRAPE dataset (fundus + VF pairs)
 class PairedDataset(Dataset):
     def __init__(self, json_path, fundus_dir, transform=None):
+        import numpy as np
         with open(json_path, "r") as f:
             data = json.load(f)
-
-        # Assuming entries look like {"FundusImage": "1_OD_1.jpg", "hvf": [...]}
         self.fundus_paths = [os.path.join(fundus_dir, entry["FundusImage"]) for entry in data]
-        self.vf_arrays = [
-            torch.tensor(np.array(entry["hvf"], dtype=float).flatten(), dtype=torch.float32)
-            for entry in data
-        ]
+        self.vf_arrays = [torch.tensor(np.array(entry["hvf"], dtype=float).flatten(), dtype=torch.float32) for entry in data]
+        self.eye_sides = [entry["Laterality"] for entry in data]  # <- NEW
         self.transform = transform
 
     def __len__(self):
@@ -38,12 +35,11 @@ class PairedDataset(Dataset):
     def __getitem__(self, idx):
         img_path = self.fundus_paths[idx]
         vf = self.vf_arrays[idx]
-
+        eye_side = self.eye_sides[idx]
         img = Image.open(img_path).convert("RGB")
         if self.transform:
             img = self.transform(img)
-
-        return img, vf
+        return img, vf, eye_side
 
 
 # UWHVF dataset (VF only)
