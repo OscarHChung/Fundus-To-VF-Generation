@@ -10,6 +10,9 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
+import sys, os
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # ===========================
 # 1. Datasets
@@ -64,7 +67,7 @@ class VFOnlyDataset(Dataset):
 # 2. Decoder Model
 # ===========================
 class VFDecoder(nn.Module):
-    def __init__(self, latent_dim=512, hidden_dim=1024, output_dim=54):
+    def __init__(self, latent_dim = 1024, hidden_dim=1024, output_dim=54):
         super().__init__()
         self.model = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
@@ -89,7 +92,7 @@ def masked_mse_loss(pred, target, mask_value=100.0):
 # ===========================
 # 4. Pretrain decoder on UWHVF
 # ===========================
-def pretrain_decoder(vf_json, latent_dim=512, epochs=10, batch_size=64, lr=1e-3, device=None):
+def pretrain_decoder(vf_json, latent_dim = 1024, epochs=10, batch_size=64, lr=1e-3, device=None):
     dataset = VFOnlyDataset(vf_json)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     output_dim = dataset[0].shape[0]
@@ -121,11 +124,7 @@ def pretrain_decoder(vf_json, latent_dim=512, epochs=10, batch_size=64, lr=1e-3,
 # 5. Fine-tune decoder with paired dataset
 # ===========================
 def finetune_decoder(decoder, paired_json, fundus_dir, encoder, epochs=20, batch_size=16, lr=1e-4, device=None):
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+    from encoder.retfound_encoder import retfound_transform as transform
 
     dataset = PairedDataset(paired_json, fundus_dir, transform=transform)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -159,10 +158,10 @@ def finetune_decoder(decoder, paired_json, fundus_dir, encoder, epochs=20, batch
 # 6. Run pipeline
 # ===========================
 if __name__ == "__main__":
-    from encoder.retfound_encoder import encoder  # make sure this import path matches your project structure
+    from encoder.retfound_encoder import encoder
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    latent_dim = 512
+    latent_dim = 1024
 
     # Paths
     base_dir = "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data"
