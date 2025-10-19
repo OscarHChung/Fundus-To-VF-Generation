@@ -164,19 +164,19 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     latent_dim = 512
 
-    # === Paths ===
+    # Paths
     base_dir = "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data"
     grape_json = os.path.join(base_dir, "vf_tests", "grape_new_vf_tests.json")
-    grape_fundus_dir = os.path.join(base_dir, "fundus", "grape_fundus_images")  # <-- JPG images
+    grape_fundus_dir = os.path.join(base_dir, "fundus", "grape_fundus_images")
     uwhvf_json = os.path.join(base_dir, "vf_tests", "uwhvf_vf_tests_standardized.json")
 
-    # === 1) Pretrain decoder on VF tests only ===
-    decoder = pretrain_decoder(uhwvf_json, latent_dim=latent_dim, epochs=10, device=device)
+    # 1) Pretrain decoder on VF tests only
+    decoder = pretrain_decoder(uwhvf_json, latent_dim=latent_dim, epochs=10, device=device)
 
-    # === 2) Fine-tune with GRAPE (fundus + VF pairs) ===
+    # 2) Fine-tune with GRAPE (fundus + VF pairs)
     decoder = finetune_decoder(decoder, grape_json, grape_fundus_dir, encoder, epochs=20, device=device)
 
-    # === 3) Example prediction ===
+    # 3) Example prediction
     from torchvision.transforms.functional import to_tensor
 
     sample_img_path = os.path.join(grape_fundus_dir, "1_OD_1.jpg")  # adjust as needed
