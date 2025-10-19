@@ -58,7 +58,7 @@ class VFOnlyDataset(Dataset):
 # 2. Decoder Model
 # ===========================
 class VFDecoder(nn.Module):
-    def __init__(self, latent_dim=1024, hidden_dim=1024, output_dim=54):
+    def __init__(self, latent_dim=1024, hidden_dim=1024, output_dim=72):
         super().__init__()
         self.model = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
@@ -78,35 +78,38 @@ def masked_mse_loss_pretrain(pred, target, mask_value=100.0):
     mask = target != mask_value
     return ((pred[mask] - target[mask]) ** 2).mean()
 
-def masked_mse_loss(pred, target, eye_sides):
-    """Masked MSE"""
-    total_loss = 0.0
-    count = 0
+def apply_mask_to_preds(preds, target, eye_sides, mask_value=100.0):
+    """
+    preds: [batch, n_points]
+    target: same shape
+    eye_sides: list of 'OD'/'OS'
+    """
+    preds = preds.clone()
+    target = target.clone()
+    batch_size, n_points = preds.shape
 
-    mask_OD = torch.tensor([
-        [False, False, False, True, True, True, True, False, False],
-        [False, False, True, True, True, True, True, True, False],
-        [False, True, True, True, True, True, True, True, True],
-        [True, True, True, True, True, True, True, False, True],
-        [True, True, True, True, True, True, True, False, True],
-        [False, True, True, True, True, True, True, True, True],
-        [False, False, True, True, True, True, True, True, False],
-        [False, False, False, True, True, True, True, False, False],
-    ], dtype=torch.bool, device=device)
+    # Example anatomical mask: first half = OD, second half = OS
+    half = n_points // 2
+    mask_OD = torch.ones(half, dtype=torch.bool, device=preds.device)
+    mask_OS = mask_OD.flip(dims=[0])
 
-    mask_OS = torch.flip(mask_OD, dims=[1])
+    for i in range(batch_size):
+        if eye_sides[i] == "OD":
+            mask = torch.cat([mask_OD, mask_OD])  # repeat if needed
+        else:
+            mask = torch.cat([mask_OS, mask_OS])
+        mask = mask & (target[i] != mask_value)  # also mask out 100 points
 
-    for i in range(pred.shape[0]):
-        eye_mask = mask_OD if eye_sides[i] == 'OD' else mask_OS
-        p = pred[i].reshape(8, 9)
-        t = target[i].reshape(8, 9)
-        mask_valid = (t != 100) & eye_mask
-        if mask_valid.sum() > 0:
-            loss = ((p[mask_valid] - t[mask_valid]) ** 2).mean()
-            total_loss += loss
-            count += 1
+        preds[i][~mask] = mask_value  # enforce masked positions
+    return preds
 
-    return total_loss / max(count, 1)
+def masked_mse_loss(preds, target, eye_sides, mask_value=100.0):
+    preds_masked = apply_mask_to_preds(preds, target, eye_sides, mask_value)
+    loss = ((preds_masked - target)**2)
+    valid = target != mask_value
+    if valid.sum() == 0:
+        return torch.tensor(0.0, device=preds.device), preds_masked
+    return loss[valid].mean(), preds_masked
 
 # ===========================
 # 4. Pretrain decoder on UWHVF
@@ -156,7 +159,8 @@ def finetune_decoder(decoder, dataset, encoder, epochs=20, batch_size=16, lr=1e-
             latent = encoder(fundus_imgs)
             preds = decoder(latent)
 
-            loss = masked_mse_loss(preds, vfs, eye_sides)
+            # masked loss + enforce mask
+            loss, preds_masked = masked_mse_loss(preds, vfs, eye_sides)
             loss.backward()
             optimizer.step()
 
@@ -206,4 +210,9 @@ if __name__ == "__main__":
     with torch.no_grad():
         latent = encoder(sample_img)
         vf_pred = decoder(latent)
-    print("Predicted VF:", vf_pred)
+
+        # Apply mask using actual target if available, else keep all as valid
+        # Here we just keep all as valid for demo
+        vf_pred_masked = vf_pred.clone()  # no target available, keep predictions as-is
+
+    print("Predicted VF:", vf_pred_masked)
