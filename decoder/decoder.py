@@ -84,9 +84,37 @@ class VFDecoder(nn.Module):
 # ===========================
 # 3. Loss Function
 # ===========================
-def masked_mse_loss(pred, target, mask_value=100.0):
-    mask = target != mask_value
-    return ((pred[mask] - target[mask]) ** 2).mean()
+def masked_mse_loss(pred, target, eye_side):
+    total_loss = 0.0
+    count = 0
+
+    mask_OD = torch.tensor([
+        [False, False, False, True, True, True, True, False, False],
+        [False, False, True, True, True, True, True, True, False],
+        [False, True, True, True, True, True, True, True, True],
+        [True, True, True, True, True, True, True, False, True],
+        [True, True, True, True, True, True, True, False, True],
+        [False, True, True, True, True, True, True, True, True],
+        [False, False, True, True, True, True, True, True, False],
+        [False, False, False, True, True, True, True, False, False],
+    ], dtype=torch.bool, device=pred.device)
+    mask_OS = mask_OD[:, ::-1]
+
+    for i in range(pred.shape[0]):
+        eye_mask = mask_OD if eye_side[i] == 'OD' else mask_OS
+
+        p = pred[i].reshape(8, 9)
+        t = target[i].reshape(8, 9)
+
+        # Ignore 100-valued targets
+        mask_valid = (t != 100) & eye_mask
+
+        if mask_valid.sum() > 0:
+            loss = ((p[mask_valid] - t[mask_valid]) ** 2).mean()
+            total_loss += loss
+            count += 1
+
+    return total_loss / max(count, 1)
 
 
 # ===========================
@@ -123,33 +151,33 @@ def pretrain_decoder(vf_json, latent_dim = 1024, epochs=10, batch_size=64, lr=1e
 # ===========================
 # 5. Fine-tune decoder with paired dataset
 # ===========================
-def finetune_decoder(decoder, paired_json, fundus_dir, encoder, epochs=20, batch_size=16, lr=1e-4, device=None):
-    from encoder.retfound_encoder import retfound_transform as transform
+def finetune_decoder(decoder, dataset, fundus_dir, encoder, epochs=20, batch_size=16, lr=1e-4, device='cpu'):
+    decoder.train()
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=lr)
 
-    dataset = PairedDataset(paired_json, fundus_dir, transform=transform)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    decoder = decoder.to(device)
-    encoder.eval()  # freeze encoder
-
-    optimizer = optim.Adam(decoder.parameters(), lr=lr)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     for epoch in range(epochs):
-        epoch_loss = 0.0
-        for imgs, vfs in loader:
-            imgs, vfs = imgs.to(device), vfs.to(device)
-            with torch.no_grad():
-                latent = encoder(imgs)
-            preds = decoder(latent)
-            loss = masked_mse_loss(preds, vfs)
+        total_loss = 0.0
+        for fundus_imgs, vfs, eye_sides in tqdm(loader, desc=f"[Finetune] Epoch {epoch+1}/{epochs}"):
+            fundus_imgs = fundus_imgs.to(device)
+            vfs = vfs.to(device)
 
             optimizer.zero_grad()
+
+            # forward encoder → decoder
+            latent = encoder(fundus_imgs)
+            preds = decoder(latent)
+
+            # compute masked anatomical loss
+            loss = masked_mse_loss(preds, vfs, eye_sides)
+
             loss.backward()
             optimizer.step()
-            epoch_loss += loss.item() * imgs.size(0)
+            total_loss += loss.item()
 
-        epoch_loss /= len(dataset)
-        print(f"[Finetune] Epoch {epoch+1}/{epochs}, Loss: {epoch_loss:.4f}")
+        avg_loss = total_loss / len(loader)
+        print(f"[Finetune] Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
 
     return decoder
 
@@ -178,7 +206,7 @@ if __name__ == "__main__":
     # 3) Example prediction
     from torchvision.transforms.functional import to_tensor
 
-    sample_img_path = os.path.join(grape_fundus_dir, "1_OD_1.jpg")  # adjust as needed
+    sample_img_path = os.path.join(grape_fundus_dir, "1_OD_1.jpg")
     sample_img = Image.open(sample_img_path).convert("RGB")
     sample_img = transforms.Resize((224, 224))(sample_img)
     sample_img = to_tensor(sample_img).unsqueeze(0).to(device)
