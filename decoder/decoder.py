@@ -11,6 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 import sys, os
+from tqdm import tqdm
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -80,6 +81,10 @@ class VFDecoder(nn.Module):
 # ===========================
 # 3. Loss Function
 # ===========================
+def masked_mse_loss_pretrain(pred, target, mask_value=100.0):
+    mask = target != mask_value
+    return ((pred[mask] - target[mask]) ** 2).mean()
+
 def masked_mse_loss(pred, target, eye_side):
     total_loss = 0.0
     count = 0
@@ -130,7 +135,7 @@ def pretrain_decoder(vf_json, latent_dim = 1024, epochs=10, batch_size=64, lr=1e
             vfs = vfs.to(device)
             latent = torch.randn(vfs.size(0), latent_dim).to(device)  # random latent for pretraining
             preds = decoder(latent)
-            loss = masked_mse_loss(preds, vfs)
+            loss = masked_mse_loss_pretrain(preds, vfs)
 
             optimizer.zero_grad()
             loss.backward()
