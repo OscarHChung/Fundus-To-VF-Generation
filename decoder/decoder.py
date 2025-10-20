@@ -18,7 +18,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 # ===========================
 # 1. Datasets
 # ===========================
-
 class PairedDataset(Dataset):
     def __init__(self, json_path, fundus_dir, transform=None):
         with open(json_path, "r") as f:
@@ -73,7 +72,6 @@ class VFDecoder(nn.Module):
 # ===========================
 # 3. Loss Functions
 # ===========================
-
 def masked_mse_loss_pretrain(pred, target, mask_value=100.0):
     """Pretraining: only mask out positions with target==mask_value"""
     mask = target != mask_value
@@ -193,7 +191,7 @@ if __name__ == "__main__":
     decoder = pretrain_decoder(uwhvf_json, latent_dim=latent_dim, epochs=10, device=device)
     decoder = finetune_decoder(decoder, paired_dataset, encoder, epochs=20, batch_size=16, device=device)
 
-    # Example prediction
+    # Example prediction: first fundus image
     sample_img_path = os.path.join(grape_fundus_dir, "1_OD_1.jpg")
     sample_img = Image.open(sample_img_path).convert("RGB")
     sample_img = transform(sample_img).unsqueeze(0).to(device)
@@ -201,5 +199,4 @@ if __name__ == "__main__":
     with torch.no_grad():
         latent = encoder(sample_img)
         vf_pred = decoder(latent)
-        # For demo, just keep as-is
         print("Predicted VF:", vf_pred)
