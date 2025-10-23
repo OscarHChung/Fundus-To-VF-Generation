@@ -1,5 +1,9 @@
-# train_decoder_with_grape.py
+# ==============================================
+# train_decoder_with_grape_debug.py
+# ==============================================
 # Trains the decoder with UWHVF VF tests first, then fine-tunes using GRAPE paired data (fundus + VF)
+# Adds full masking verification + print debugging.
+# ==============================================
 
 import os
 import json
@@ -12,6 +16,7 @@ from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
 import sys
+import matplotlib as plt
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -70,47 +75,68 @@ class VFDecoder(nn.Module):
         return self.model(latent)
 
 # ===========================
-# 3. Loss Functions
+# 3. Mask + Loss Functions
 # ===========================
+_mask_OD_np = np.array([
+    [False, False, False,  True,  True,  True,  True, False, False],
+    [False, False,  True,  True,  True,  True,  True,  True, False],
+    [False,  True,  True,  True,  True,  True,  True,  True,  True],
+    [True,  True,  True,  True,  True,  True,  True,  False,  True],
+    [True,  True,  True,  True,  True,  True,  True,  False,  True],
+    [False, True,  True,  True,  True,  True,  True,  True,  True],
+    [False, False,  True,  True,  True,  True,  True,  True,  False],
+    [False, False, False,  True,  True,  True,  True, False, False]
+], dtype=bool)
+
+_mask_OD_flat_np = _mask_OD_np.flatten()
+_mask_OS_flat_np = _mask_OD_flat_np[::-1].copy()
+
+# Now can convert to torch tensors
+_mask_OD_flat = torch.tensor(_mask_OD_flat_np, dtype=torch.bool)
+_mask_OS_flat = torch.tensor(_mask_OS_flat_np, dtype=torch.bool)
+
 def masked_mse_loss_pretrain(pred, target, mask_value=100.0):
-    """Pretraining: only mask out positions with target==mask_value"""
     mask = target != mask_value
     if mask.sum() == 0:
         return torch.tensor(0.0, device=pred.device)
     return ((pred[mask] - target[mask]) ** 2).mean()
 
 def apply_mask_to_preds(preds, target, eye_sides, mask_value=100.0):
-    """Fine-tuning: mask based on laterality + 100"""
-    preds = preds.clone()
-    target = target.clone()
-    batch_size, n_points = preds.shape
-
-    half = n_points // 2
-    mask_OD = torch.ones(half, dtype=torch.bool, device=preds.device)
-    mask_OS = mask_OD.flip(dims=[0])
-
-    for i in range(batch_size):
-        if eye_sides[i] == "OD":
-            mask = torch.cat([mask_OD, mask_OD])
+    preds_masked = preds.clone()
+    for i in range(preds.size(0)):
+        if eye_sides[i] == 'OD':
+            mask = _mask_OD_flat.clone()
         else:
-            mask = torch.cat([mask_OS, mask_OS])
-        mask = mask & (target[i] != mask_value)
-        preds[i][~mask] = mask_value
+            mask = _mask_OS_flat.clone()
 
-    return preds
+        if torch.all(target[i] == 0):
+            print(f"[DEBUG] Detected inference mode for {eye_sides[i]}")
+        else:
+            target_mask = target[i] != 0
+            mask = mask & target_mask
+
+        preds_masked[i][~mask] = mask_value
+
+        preds_example = preds_masked[i].view(8, 9).detach().cpu().numpy()
+    return preds_masked
+
 
 def masked_mse_loss(preds, target, eye_sides, mask_value=100.0):
     preds_masked = apply_mask_to_preds(preds, target, eye_sides, mask_value)
-    valid = target != mask_value
+    valid = (target != mask_value)
+    valid &= (preds_masked != mask_value)
+
     if valid.sum() == 0:
         return torch.tensor(0.0, device=preds.device), preds_masked
-    loss = ((preds_masked - target)[valid] ** 2).mean()
+
+    diff = preds_masked - target
+    loss = (diff[valid] ** 2).mean()
     return loss, preds_masked
 
 # ===========================
-# 4. Pretrain decoder on UWHVF
+# 4. Pretrain decoder
 # ===========================
-def pretrain_decoder(vf_json, latent_dim=1024, epochs=10, batch_size=64, lr=1e-3, device='cpu'):
+def pretrain_decoder(vf_json, latent_dim=1024, epochs=1, batch_size=4, lr=1e-3, device='cpu'):
     dataset = VFOnlyDataset(vf_json)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     output_dim = 72
@@ -129,7 +155,6 @@ def pretrain_decoder(vf_json, latent_dim=1024, epochs=10, batch_size=64, lr=1e-3
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
             epoch_loss += loss.item() * vfs.size(0)
 
         epoch_loss /= len(dataset)
@@ -138,9 +163,9 @@ def pretrain_decoder(vf_json, latent_dim=1024, epochs=10, batch_size=64, lr=1e-3
     return decoder
 
 # ===========================
-# 5. Fine-tune decoder on GRAPE
+# 5. Fine-tune decoder
 # ===========================
-def finetune_decoder(decoder, dataset, encoder, epochs=20, batch_size=16, lr=1e-4, device='cpu'):
+def finetune_decoder(decoder, dataset, encoder, epochs=1, batch_size=2, lr=1e-4, device='cpu'):
     decoder.train()
     optimizer = optim.Adam(decoder.parameters(), lr=lr)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -158,7 +183,6 @@ def finetune_decoder(decoder, dataset, encoder, epochs=20, batch_size=16, lr=1e-
             loss, preds_masked = masked_mse_loss(preds, vfs, eye_sides)
             loss.backward()
             optimizer.step()
-
             total_loss += loss.item()
 
         avg_loss = total_loss / len(loader)
@@ -170,7 +194,7 @@ def finetune_decoder(decoder, dataset, encoder, epochs=20, batch_size=16, lr=1e-
 # 6. Run pipeline
 # ===========================
 if __name__ == "__main__":
-    from encoder.retfound_encoder import encoder
+    from encoder.retfound_encoder import encoder  # ← your encoder module
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     latent_dim = 1024
@@ -183,15 +207,19 @@ if __name__ == "__main__":
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
     ])
 
     paired_dataset = PairedDataset(grape_json, grape_fundus_dir, transform=transform)
 
-    decoder = pretrain_decoder(uwhvf_json, latent_dim=latent_dim, epochs=10, device=device)
-    decoder = finetune_decoder(decoder, paired_dataset, encoder, epochs=20, batch_size=16, device=device)
+    print("\n========== PRETRAINING ==========")
+    decoder = pretrain_decoder(uwhvf_json, latent_dim=latent_dim, epochs=1, device=device)
 
-    # Example prediction: first fundus image
+    print("\n========== FINE-TUNING ==========")
+    decoder = finetune_decoder(decoder, paired_dataset, encoder, epochs=1, batch_size=2, device=device)
+
+    print("\n========== SAMPLE PREDICTION ==========")
     sample_img_path = os.path.join(grape_fundus_dir, "1_OD_1.jpg")
     sample_img = Image.open(sample_img_path).convert("RGB")
     sample_img = transform(sample_img).unsqueeze(0).to(device)
@@ -199,4 +227,16 @@ if __name__ == "__main__":
     with torch.no_grad():
         latent = encoder(sample_img)
         vf_pred = decoder(latent)
-        print("Predicted VF:", vf_pred)
+
+        # Apply masking test for both OD and OS
+        vf_masked_OD = apply_mask_to_preds(vf_pred.clone(), torch.full_like(vf_pred, 100.0), ["OD"])
+        vf_masked_OS = apply_mask_to_preds(vf_pred.clone(), torch.full_like(vf_pred, 100.0), ["OS"])
+
+        print("\n[TEST PRINT] Raw prediction shape:", vf_pred.shape)
+        print("[TEST PRINT] Masked OD shape:", vf_masked_OD.shape)
+        print("[TEST PRINT] Masked OS shape:", vf_masked_OS.shape)
+        print("\n[TEST PRINT] Masked OD (8x9 grid):")
+        print(vf_masked_OD.view(8, 9).cpu().numpy())
+        print("\n[TEST PRINT] Masked OS (8x9 grid):")
+        print(vf_masked_OS.view(8, 9).cpu().numpy())
+
