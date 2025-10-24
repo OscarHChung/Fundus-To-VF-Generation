@@ -5,6 +5,10 @@
 # Adds full masking verification + print debugging.
 # ==============================================
 
+# need to split
+# need to make visualization
+# need to confirm correctness
+
 import os
 import json
 import numpy as np
