@@ -28,7 +28,7 @@ def pretty_print_vf(vf_array, eye_side="OD", mask_value=100.0, decimals=1):
     Nicely prints an 8x9 visual field array with alignment and masking.
     """
     vf_array = vf_array.reshape(8, 9)
-    print(f"\n{'='*15} {eye_side} Prediction {'='*15}")
+    print(f"\n{'='*15} {eye_side} {'='*15}")
 
     for row in vf_array:
         row_str = ""
@@ -240,22 +240,46 @@ if __name__ == "__main__":
     decoder = finetune_decoder(decoder, paired_dataset, encoder, epochs=1, batch_size=2, device=device)
 
     print("\n========== SAMPLE PREDICTION ==========")
-    sample_img_path = os.path.join(grape_fundus_dir, "1_OD_1.jpg")
+    sample_img_name = "1_OD_1.jpg"
+    sample_img_path = os.path.join(grape_fundus_dir, sample_img_name)
+
+    # Detect eye from filename or metadata
+    if "OD" in sample_img_name:
+        eye_side = "OD"
+    elif "OS" in sample_img_name:
+        eye_side = "OS"
+    else:
+        raise ValueError("Cannot detect eye side from filename!")
+
+    # Load sample image
     sample_img = Image.open(sample_img_path).convert("RGB")
-    sample_img = transform(sample_img).unsqueeze(0).to(device)
+    sample_img_tensor = transform(sample_img).unsqueeze(0).to(device)
+
+    # Find corresponding VF from paired dataset
+    matching_idx = None
+    for idx, (_, _, side) in enumerate(paired_dataset):
+        if side == eye_side and os.path.basename(paired_dataset.fundus_paths[idx]) == sample_img_name:
+            matching_idx = idx
+            break
+
+    if matching_idx is None:
+        raise ValueError("No matching VF found for this sample image!")
+
+    actual_vf = paired_dataset.vf_arrays[matching_idx].numpy()
 
     with torch.no_grad():
-        latent = encoder(sample_img)
+        latent = encoder(sample_img_tensor)
         vf_pred = decoder(latent)
 
-        # Apply masking test for both OD and OS
-        vf_masked_OD = apply_mask_to_preds(vf_pred.clone(), torch.full_like(vf_pred, 100.0), ["OD"])
-        vf_masked_OS = apply_mask_to_preds(vf_pred.clone(), torch.full_like(vf_pred, 100.0), ["OS"])
+        # Apply mask to prediction for the correct eye only
+        vf_masked = apply_mask_to_preds(vf_pred.clone(),
+                                        torch.full_like(vf_pred, 100.0),
+                                        [eye_side])
 
-        print("\n[TEST PRINT] Raw prediction shape:", vf_pred.shape)
-        print("[TEST PRINT] Masked OD shape:", vf_masked_OD.shape)
-        print("[TEST PRINT] Masked OS shape:", vf_masked_OS.shape)
+        print(f"\n[Eye] {eye_side}")
 
-        # Pretty human-readable display
-        pretty_print_vf(vf_masked_OD.cpu().numpy(), eye_side="OD")
-        pretty_print_vf(vf_masked_OS.cpu().numpy(), eye_side="OS")
+        # Pretty-print prediction
+        pretty_print_vf(vf_masked.cpu().numpy(), eye_side=f"{eye_side} Predicted")
+
+        # Pretty-print actual VF for comparison
+        pretty_print_vf(actual_vf, eye_side=f"{eye_side} Actual")
