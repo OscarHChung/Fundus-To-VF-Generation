@@ -21,6 +21,27 @@ import matplotlib as plt
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # ===========================
+# Pretty print for VF output
+# ===========================
+def pretty_print_vf(vf_array, eye_side="OD", mask_value=100.0, decimals=1):
+    """
+    Nicely prints an 8x9 visual field array with alignment and masking.
+    """
+    vf_array = vf_array.reshape(8, 9)
+    print(f"\n{'='*15} {eye_side} Prediction {'='*15}")
+
+    for row in vf_array:
+        row_str = ""
+        for val in row:
+            if val == mask_value:
+                row_str += "   ·   "  # dot placeholder for masked
+            else:
+                row_str += f"{val:6.{decimals}f} "
+        print(row_str)
+    print("="*50)
+
+
+# ===========================
 # 1. Datasets
 # ===========================
 class PairedDataset(Dataset):
@@ -116,7 +137,6 @@ def apply_mask_to_preds(preds, target, eye_sides, mask_value=100.0):
             mask = mask & target_mask
 
         preds_masked[i][~mask] = mask_value
-
         preds_example = preds_masked[i].view(8, 9).detach().cpu().numpy()
     return preds_masked
 
@@ -235,8 +255,7 @@ if __name__ == "__main__":
         print("\n[TEST PRINT] Raw prediction shape:", vf_pred.shape)
         print("[TEST PRINT] Masked OD shape:", vf_masked_OD.shape)
         print("[TEST PRINT] Masked OS shape:", vf_masked_OS.shape)
-        print("\n[TEST PRINT] Masked OD (8x9 grid):")
-        print(vf_masked_OD.view(8, 9).cpu().numpy())
-        print("\n[TEST PRINT] Masked OS (8x9 grid):")
-        print(vf_masked_OS.view(8, 9).cpu().numpy())
 
+        # Pretty human-readable display
+        pretty_print_vf(vf_masked_OD.cpu().numpy(), eye_side="OD")
+        pretty_print_vf(vf_masked_OS.cpu().numpy(), eye_side="OS")
