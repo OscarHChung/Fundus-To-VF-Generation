@@ -229,8 +229,7 @@ if __name__ == "__main__":
 
     print("\n========== EVALUATING ==========")
     results = []
-    mae_sum = np.zeros(72)
-    mae_count = np.zeros(72)
+    all_mae_values = []
 
     decoder.eval()
     with torch.no_grad():
@@ -244,36 +243,32 @@ if __name__ == "__main__":
 
             valid_mask = (vf_true_np != 100.0) & (vf_pred_np != 100.0)
             abs_diff = np.abs(vf_true_np - vf_pred_np)
-            mae_sum[valid_mask] += abs_diff[valid_mask]
-            mae_count[valid_mask] += 1
+            mae_per_point = abs_diff  # store raw MAE for each test point
+            mae_valid = abs_diff[valid_mask].mean() if valid_mask.any() else np.nan
+            all_mae_values.append(mae_valid)
 
             results.append({
                 "id": img_id,
                 "eye_side": eye_side,
                 "actual_vf": vf_true_np.tolist(),
-                "predicted_vf": vf_pred_np.tolist()
+                "predicted_vf": vf_pred_np.tolist(),
+                "mae_per_point": mae_per_point.tolist(),
+                "mae_mean": float(mae_valid)
             })
 
     # Save JSON
-    output_json = os.path.join(base_dir, "predictions_vs_actuals.json")
+    output_json = os.path.join(base_dir, "predictions_vs_actuals_with_mae.json")
     with open(output_json, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"\n✅ Saved predictions and actuals to {output_json}")
+    print(f"\n✅ Saved predictions, actuals, and MAE values to {output_json}")
 
     # ===========================
-    # Compute and plot MAE heatmap
+    # Get average MAE
     # ===========================
-    mae_avg = np.zeros_like(mae_sum)
-    valid_points = mae_count > 0
-    mae_avg[valid_points] = mae_sum[valid_points] / mae_count[valid_points]
-    mae_avg[~valid_points] = np.nan
+    valid_mae_values = [m for m in all_mae_values if not np.isnan(m)]
+    if len(valid_mae_values) > 0:
+        overall_mae = np.mean(valid_mae_values)
+        print(f"\n Average MAE across all predictions: {overall_mae:.4f} dB")
+    else:
+        print("\n No valid MAE values found.")
 
-    mae_2d = mae_avg.reshape(8, 9)
-    mask_display = np.where(_mask_OD_np, mae_2d, np.nan)
-
-    plt.figure(figsize=(7, 5))
-    im = plt.imshow(mask_display, cmap='coolwarm', interpolation='nearest')
-    plt.colorbar(im, label='Mean Absolute Error (dB)')
-    plt.title('MAE at Each VF Test Point')
-    plt.axis('off')
-    plt.show()
