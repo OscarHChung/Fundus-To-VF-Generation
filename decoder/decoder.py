@@ -287,4 +287,3 @@ if __name__ == "__main__":
         # Print MAE
         mae = torch.mean(torch.abs(vf_masked - torch.tensor(actual_vf, dtype=vf_masked.dtype)))
         print(f"Mean Absolute Error ({eye_side}): {mae.item():.4f}")
-        
