@@ -1,9 +1,9 @@
 # ==============================================
-# train_decoder_with_grape_debug_savejson.py
+# train_decoder_with_grape_debug_savejson_heatmap.py
 # ==============================================
 # Trains the decoder with UWHVF VF tests first, then fine-tunes using GRAPE paired data (fundus + VF)
 # Now saves actual vs prediction results for each image into JSON
-# and plots MAE distribution across all VF test points.
+# and visualizes the MAE at each VF test point as a heatmap.
 # ==============================================
 
 import os
@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 
 # ===========================
 # Pretty print for VF output
@@ -153,9 +154,7 @@ def masked_mse_loss(preds, target, eye_sides, mask_value=100.0):
 def pretrain_decoder(vf_json, latent_dim=1024, epochs=1, batch_size=4, lr=1e-3, device='cpu'):
     dataset = VFOnlyDataset(vf_json)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    output_dim = 72
-
-    decoder = VFDecoder(latent_dim=latent_dim, output_dim=output_dim).to(device)
+    decoder = VFDecoder(latent_dim=latent_dim, output_dim=72).to(device)
     optimizer = optim.Adam(decoder.parameters(), lr=lr)
 
     for epoch in range(epochs):
@@ -169,10 +168,8 @@ def pretrain_decoder(vf_json, latent_dim=1024, epochs=1, batch_size=4, lr=1e-3, 
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item() * vfs.size(0)
-
         epoch_loss /= len(dataset)
         print(f"[Pretrain] Epoch {epoch+1}/{epochs}, Loss: {epoch_loss:.4f}")
-
     return decoder
 
 
@@ -230,9 +227,10 @@ if __name__ == "__main__":
     print("\n========== FINE-TUNING ==========")
     decoder = finetune_decoder(decoder, paired_dataset, encoder, epochs=1, batch_size=2, device=device)
 
-    print("\n========== SAVING PREDICTIONS ==========")
+    print("\n========== EVALUATING ==========")
     results = []
-    mae_all_points = []
+    mae_sum = np.zeros(72)
+    mae_count = np.zeros(72)
 
     decoder.eval()
     with torch.no_grad():
@@ -241,38 +239,41 @@ if __name__ == "__main__":
             vf_true_np = vf_true.numpy()
             latent = encoder(img_tensor)
             vf_pred = decoder(latent)
-
             vf_pred_masked = apply_mask_to_preds(vf_pred.clone(), vf_true.unsqueeze(0), [eye_side])
             vf_pred_np = vf_pred_masked.cpu().numpy().flatten()
 
-            # MAE per valid point
             valid_mask = (vf_true_np != 100.0) & (vf_pred_np != 100.0)
-            mae_points = np.abs(vf_true_np[valid_mask] - vf_pred_np[valid_mask])
-            mae_all_points.extend(mae_points.tolist())
-            mae_mean = float(np.mean(mae_points)) if len(mae_points) > 0 else None
+            abs_diff = np.abs(vf_true_np - vf_pred_np)
+            mae_sum[valid_mask] += abs_diff[valid_mask]
+            mae_count[valid_mask] += 1
 
             results.append({
                 "id": img_id,
                 "eye_side": eye_side,
                 "actual_vf": vf_true_np.tolist(),
-                "predicted_vf": vf_pred_np.tolist(),
-                "mae": mae_mean
+                "predicted_vf": vf_pred_np.tolist()
             })
 
-    # Save results JSON
+    # Save JSON
     output_json = os.path.join(base_dir, "predictions_vs_actuals.json")
     with open(output_json, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\n✅ Saved predictions and actuals to {output_json}")
 
     # ===========================
-    # Plot MAE distribution
+    # Compute and plot MAE heatmap
     # ===========================
-    mae_all_points = np.array(mae_all_points)
-    plt.figure(figsize=(8, 6))
-    plt.hist(mae_all_points, bins=30)
-    plt.title("Distribution of MAE Across All VF Points")
-    plt.xlabel("Mean Absolute Error (dB)")
-    plt.ylabel("Frequency")
-    plt.grid(True)
+    mae_avg = np.zeros_like(mae_sum)
+    valid_points = mae_count > 0
+    mae_avg[valid_points] = mae_sum[valid_points] / mae_count[valid_points]
+    mae_avg[~valid_points] = np.nan
+
+    mae_2d = mae_avg.reshape(8, 9)
+    mask_display = np.where(_mask_OD_np, mae_2d, np.nan)
+
+    plt.figure(figsize=(7, 5))
+    im = plt.imshow(mask_display, cmap='coolwarm', interpolation='nearest')
+    plt.colorbar(im, label='Mean Absolute Error (dB)')
+    plt.title('MAE at Each VF Test Point')
+    plt.axis('off')
     plt.show()
