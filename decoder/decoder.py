@@ -1,9 +1,6 @@
 # ==============================================
-# train_decoder_with_grape_debug_savejson_heatmap.py
-# ==============================================
 # Trains the decoder with UWHVF VF tests first, then fine-tunes using GRAPE paired data (fundus + VF)
-# Now saves actual vs prediction results for each image into JSON
-# and visualizes the MAE at each VF test point as a heatmap.
+# Saves actual vs prediction results into JSON with MAE computed only on valid points.
 # ==============================================
 
 import os
@@ -16,11 +13,9 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 
 # ===========================
 # Pretty print for VF output
@@ -241,10 +236,11 @@ if __name__ == "__main__":
             vf_pred_masked = apply_mask_to_preds(vf_pred.clone(), vf_true.unsqueeze(0), [eye_side])
             vf_pred_np = vf_pred_masked.cpu().numpy().flatten()
 
-            valid_mask = (vf_true_np != 100.0) & (vf_pred_np != 100.0)
-            abs_diff = np.abs(vf_true_np - vf_pred_np)
-            mae_per_point = abs_diff  # store raw MAE for each test point
-            mae_valid = abs_diff[valid_mask].mean() if valid_mask.any() else np.nan
+            # Masked MAE computation
+            valid_mask = vf_true_np != 100.0
+            abs_diff = np.full_like(vf_true_np, fill_value=np.nan, dtype=np.float32)
+            abs_diff[valid_mask] = np.abs(vf_true_np[valid_mask] - vf_pred_np[valid_mask])
+            mae_valid = np.nanmean(abs_diff) if valid_mask.any() else np.nan
             all_mae_values.append(mae_valid)
 
             results.append({
@@ -252,9 +248,10 @@ if __name__ == "__main__":
                 "eye_side": eye_side,
                 "actual_vf": vf_true_np.tolist(),
                 "predicted_vf": vf_pred_np.tolist(),
-                "mae_per_point": mae_per_point.tolist(),
+                "mae_per_point": abs_diff.tolist(),
                 "mae_mean": float(mae_valid)
             })
+            print(f"[{img_id}] valid_points={valid_mask.sum()}, mean_abs_diff={mae_valid:.3f}")
 
     # Save JSON
     output_json = os.path.join(base_dir, "predictions_vs_actuals_with_mae.json")
@@ -271,4 +268,3 @@ if __name__ == "__main__":
         print(f"\n Average MAE across all predictions: {overall_mae:.4f} dB")
     else:
         print("\n No valid MAE values found.")
-
