@@ -9,92 +9,62 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
 import sys
-
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from encoder.retfound_encoder import encoder
 
 # ===========================
-# Pretty print for VF output
-# ===========================
-def pretty_print_vf(vf_array, eye_side="OD", mask_value=100.0, decimals=1):
-    vf_array = vf_array.reshape(8, 9)
-    print(f"\n{'='*15} {eye_side} {'='*15}")
-    for row in vf_array:
-        row_str = ""
-        for val in row:
-            if val == mask_value:
-                row_str += "   ·   "
-            else:
-                row_str += f"{val:6.{decimals}f} "
-        print(row_str)
-    print("=" * 50)
-
-
-# ===========================
-# 1. Datasets
+# GRAPE Dataset
 # ===========================
 class PairedDataset(Dataset):
     def __init__(self, json_path, fundus_dir, transform=None):
         with open(json_path, "r") as f:
             data = json.load(f)
         self.entries = data
-        self.fundus_paths = [os.path.join(fundus_dir, entry["FundusImage"]) for entry in data]
-        self.vf_arrays = [torch.tensor(np.array(entry["hvf"], dtype=float).flatten(), dtype=torch.float32) for entry in data]
-        self.eye_sides = [entry["Laterality"] for entry in data]
-        self.ids = [entry.get("id", os.path.basename(entry["FundusImage"])) for entry in data]
+        self.fundus_paths = [os.path.join(fundus_dir, e["FundusImage"]) for e in data]
+        self.vf_arrays = [torch.tensor(np.array(e["hvf"], dtype=float).flatten(), dtype=torch.float32) for e in data]
+        self.eye_sides = [e["Laterality"] for e in data]
+        self.ids = [e.get("id", os.path.basename(e["FundusImage"])) for e in data]
         self.transform = transform
 
     def __len__(self):
         return len(self.fundus_paths)
 
     def __getitem__(self, idx):
-        img_path = self.fundus_paths[idx]
-        vf = self.vf_arrays[idx]
-        eye_side = self.eye_sides[idx]
-        img_id = self.ids[idx]
-        img = Image.open(img_path).convert("RGB")
+        img = Image.open(self.fundus_paths[idx]).convert("RGB")
         if self.transform:
             img = self.transform(img)
-        return img, vf, eye_side, img_id
-
-
-class VFOnlyDataset(Dataset):
-    def __init__(self, json_path):
-        with open(json_path, "r") as f:
-            data = json.load(f)
-        self.vf_arrays = [torch.tensor(np.array(entry["hvf"], dtype=float).flatten(), dtype=torch.float32) for entry in data]
-
-    def __len__(self):
-        return len(self.vf_arrays)
-
-    def __getitem__(self, idx):
-        return self.vf_arrays[idx]
+        return img, self.vf_arrays[idx], self.eye_sides[idx], self.ids[idx]
 
 
 # ===========================
-# 2. Decoder Model
+# Decoder
 # ===========================
 class VFDecoder(nn.Module):
-    def __init__(self, latent_dim=1024, hidden_dim=1024, output_dim=72):
+    def __init__(self, latent_dim=1024, hidden_dim=2048, output_dim=72, dropout=0.3):
         super().__init__()
         self.model = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, output_dim)
         )
 
-    def forward(self, latent):
-        return self.model(latent)
+    def forward(self, x):
+        return self.model(x)
 
 
 # ===========================
-# 3. Mask + Loss Functions
+# Masking
 # ===========================
 _mask_OD_np = np.array([
     [False, False, False,  True,  True,  True,  True, False, False],
@@ -105,107 +75,126 @@ _mask_OD_np = np.array([
     [False, True,  True,  True,  True,  True,  True,  True,  True],
     [False, False,  True,  True,  True,  True,  True,  True,  False],
     [False, False, False,  True,  True,  True,  True, False, False]
-], dtype=bool)
+])
+_mask_OD_flat = torch.tensor(_mask_OD_np.flatten(), dtype=torch.bool)
+_mask_OS_flat = torch.tensor(_mask_OD_np.flatten()[::-1].copy(), dtype=torch.bool)
 
-_mask_OD_flat_np = _mask_OD_np.flatten()
-_mask_OS_flat_np = _mask_OD_flat_np[::-1].copy()
-
-_mask_OD_flat = torch.tensor(_mask_OD_flat_np, dtype=torch.bool)
-_mask_OS_flat = torch.tensor(_mask_OS_flat_np, dtype=torch.bool)
-
-
-def masked_mse_loss_pretrain(pred, target, mask_value=100.0):
-    mask = target != mask_value
-    if mask.sum() == 0:
-        return torch.tensor(0.0, device=pred.device)
-    return ((pred[mask] - target[mask]) ** 2).mean()
-
-
-def apply_mask_to_preds(preds, target, eye_sides, mask_value=100.0):
+def apply_mask(preds, eye_sides, mask_value=100.0):
     preds_masked = preds.clone()
     for i in range(preds.size(0)):
-        if eye_sides[i] == 'OD':
-            mask = _mask_OD_flat.clone()
-        else:
-            mask = _mask_OS_flat.clone()
+        mask = _mask_OD_flat if eye_sides[i] == 'OD' else _mask_OS_flat
         preds_masked[i][~mask] = mask_value
     return preds_masked
 
 
-def masked_mse_loss(preds, target, eye_sides, mask_value=100.0):
-    preds_masked = apply_mask_to_preds(preds, target, eye_sides, mask_value)
-    valid = (target != mask_value)
+# ===========================
+# Loss Function
+# ===========================
+def masked_loss(preds, targets, eye_sides, mask_value=100.0):
+    preds_masked = apply_mask(preds, eye_sides, mask_value)
+    valid = (targets != mask_value)
     valid &= (preds_masked != mask_value)
     if valid.sum() == 0:
-        return torch.tensor(0.0, device=preds.device), preds_masked
-    diff = preds_masked - target
-    loss = (diff[valid] ** 2).mean()
-    return loss, preds_masked
+        return torch.tensor(0.0, device=preds.device)
+    mse = ((preds_masked[valid] - targets[valid]) ** 2).mean()
+    mae = torch.abs(preds_masked[valid] - targets[valid]).mean()
+    return 0.7 * mse + 0.3 * mae
 
 
 # ===========================
-# 4. Pretrain decoder
+# Training & Evaluation
 # ===========================
-def pretrain_decoder(vf_json, latent_dim=1024, epochs=1, batch_size=4, lr=1e-3, device='cpu'):
-    dataset = VFOnlyDataset(vf_json)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    decoder = VFDecoder(latent_dim=latent_dim, output_dim=72).to(device)
-    optimizer = optim.Adam(decoder.parameters(), lr=lr)
+def train_model(encoder, decoder, train_loader, val_loader, device, epochs=15, lr=1e-4):
+    optimizer = optim.Adam(decoder.parameters(), lr=lr, weight_decay=1e-5)
+    best_val_loss = float('inf')
+    patience, patience_counter = 3, 0
 
     for epoch in range(epochs):
-        epoch_loss = 0.0
-        for vfs in loader:
-            vfs = vfs.to(device)
-            latent = torch.randn(vfs.size(0), latent_dim).to(device)
-            preds = decoder(latent)
-            loss = masked_mse_loss_pretrain(preds, vfs)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item() * vfs.size(0)
-        epoch_loss /= len(dataset)
-        print(f"[Pretrain] Epoch {epoch+1}/{epochs}, Loss: {epoch_loss:.4f}")
-    return decoder
-
-
-# ===========================
-# 5. Fine-tune decoder
-# ===========================
-def finetune_decoder(decoder, dataset, encoder, epochs=1, batch_size=2, lr=1e-4, device='cpu'):
-    decoder.train()
-    optimizer = optim.Adam(decoder.parameters(), lr=lr)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    for epoch in range(epochs):
+        decoder.train()
         total_loss = 0.0
-        for fundus_imgs, vfs, eye_sides, _ in tqdm(loader, desc=f"[Finetune] Epoch {epoch+1}/{epochs}"):
-            fundus_imgs = fundus_imgs.to(device)
-            vfs = vfs.to(device)
-            optimizer.zero_grad()
-            latent = encoder(fundus_imgs)
+        for imgs, vfs, eye_sides, _ in tqdm(train_loader, desc=f"Train Epoch {epoch+1}/{epochs}"):
+            imgs, vfs = imgs.to(device), vfs.to(device)
+            latent = encoder(imgs)
             preds = decoder(latent)
-            loss, _ = masked_mse_loss(preds, vfs, eye_sides)
+            loss = masked_loss(preds, vfs, eye_sides)
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        avg_loss = total_loss / len(loader)
-        print(f"[Finetune] Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+        avg_train = total_loss / len(train_loader)
+
+        # Validation
+        decoder.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for imgs, vfs, eye_sides, _ in val_loader:
+                imgs, vfs = imgs.to(device), vfs.to(device)
+                latent = encoder(imgs)
+                preds = decoder(latent)
+                val_loss += masked_loss(preds, vfs, eye_sides).item()
+        avg_val = val_loss / len(val_loader)
+
+        print(f"Epoch {epoch+1}: Train={avg_train:.4f}, Val={avg_val:.4f}")
+
+        # Early stopping
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            patience_counter = 0
+            torch.save(decoder.state_dict(), "best_decoder.pt")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("Early stopping triggered.")
+                break
+
+    decoder.load_state_dict(torch.load("best_decoder.pt"))
     return decoder
 
 
+# =================================================
+# Evaluation of MAE per image / Saving data to JSON
+# =================================================
+def evaluate_model(encoder, decoder, dataset, device, save_path):
+    results, mae_all = [], []
+    decoder.eval()
+
+    with torch.no_grad():
+        for img, vf_true, eye_side, img_id in tqdm(dataset, desc="Testing"):
+            img_tensor = img.unsqueeze(0).to(device)
+            vf_true_np = vf_true.numpy()
+            latent = encoder(img_tensor)
+            vf_pred = decoder(latent)
+            vf_pred_masked = apply_mask(vf_pred.clone(), [eye_side])
+            vf_pred_np = vf_pred_masked.cpu().numpy().flatten()
+
+            valid_mask = vf_true_np != 100.0
+            mae = np.mean(np.abs(vf_true_np[valid_mask] - vf_pred_np[valid_mask])) if valid_mask.any() else np.nan
+            mae_all.append(mae)
+            results.append({
+                "id": img_id,
+                "eye_side": eye_side,
+                "actual_vf": vf_true_np.tolist(),
+                "predicted_vf": vf_pred_np.tolist(),
+                "mae_mean": float(mae)
+            })
+
+    with open(save_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    valid_mae = [m for m in mae_all if not np.isnan(m)]
+    print(f"\nAverage MAE across test set: {np.mean(valid_mae):.3f} dB")
+    return np.mean(valid_mae)
+
+
 # ===========================
-# 6. Run pipeline
+# Run Pipeline
 # ===========================
 if __name__ == "__main__":
-    from encoder.retfound_encoder import encoder
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    latent_dim = 1024
 
     base_dir = "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data"
     grape_json = os.path.join(base_dir, "vf_tests", "grape_new_vf_tests.json")
     grape_fundus_dir = os.path.join(base_dir, "fundus", "grape_fundus_images")
-    uwhvf_json = os.path.join(base_dir, "vf_tests", "uwhvf_vf_tests_standardized.json")
 
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
@@ -214,57 +203,19 @@ if __name__ == "__main__":
                              std=[0.229, 0.224, 0.225])
     ])
 
-    paired_dataset = PairedDataset(grape_json, grape_fundus_dir, transform=transform)
+    dataset = PairedDataset(grape_json, grape_fundus_dir, transform)
+    train_size = int(0.8 * len(dataset))
+    val_size = int(0.1 * len(dataset))
+    test_size = len(dataset) - train_size - val_size
+    train_set, val_set, test_set = random_split(dataset, [train_size, val_size, test_size])
 
-    print("\n========== PRETRAINING ==========")
-    decoder = pretrain_decoder(uwhvf_json, latent_dim=latent_dim, epochs=1, device=device)
+    train_loader = DataLoader(train_set, batch_size=4, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=4, shuffle=False)
 
-    print("\n========== FINE-TUNING ==========")
-    decoder = finetune_decoder(decoder, paired_dataset, encoder, epochs=1, batch_size=2, device=device)
+    decoder = VFDecoder().to(device)
 
-    print("\n========== EVALUATING ==========")
-    results = []
-    all_mae_values = []
+    print("\n=== Training ===")
+    decoder = train_model(encoder, decoder, train_loader, val_loader, device)
 
-    decoder.eval()
-    with torch.no_grad():
-        for img, vf_true, eye_side, img_id in tqdm(paired_dataset, desc="Evaluating"):
-            img_tensor = img.unsqueeze(0).to(device)
-            vf_true_np = vf_true.numpy()
-            latent = encoder(img_tensor)
-            vf_pred = decoder(latent)
-            vf_pred_masked = apply_mask_to_preds(vf_pred.clone(), vf_true.unsqueeze(0), [eye_side])
-            vf_pred_np = vf_pred_masked.cpu().numpy().flatten()
-
-            # Masked MAE computation
-            valid_mask = vf_true_np != 100.0
-            abs_diff = np.full_like(vf_true_np, fill_value=np.nan, dtype=np.float32)
-            abs_diff[valid_mask] = np.abs(vf_true_np[valid_mask] - vf_pred_np[valid_mask])
-            mae_valid = np.nanmean(abs_diff) if valid_mask.any() else np.nan
-            all_mae_values.append(mae_valid)
-
-            results.append({
-                "id": img_id,
-                "eye_side": eye_side,
-                "actual_vf": vf_true_np.tolist(),
-                "predicted_vf": vf_pred_np.tolist(),
-                "mae_per_point": abs_diff.tolist(),
-                "mae_mean": float(mae_valid)
-            })
-            print(f"[{img_id}] valid_points={valid_mask.sum()}, mean_abs_diff={mae_valid:.3f}")
-
-    # Save JSON
-    output_json = os.path.join(base_dir, "predictions_vs_actuals_with_mae.json")
-    with open(output_json, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"\n Saved predictions, actuals, and MAE values to {output_json}")
-
-    # ===========================
-    # Get average MAE
-    # ===========================
-    valid_mae_values = [m for m in all_mae_values if not np.isnan(m)]
-    if len(valid_mae_values) > 0:
-        overall_mae = np.mean(valid_mae_values)
-        print(f"\n Average MAE across all predictions: {overall_mae:.4f} dB")
-    else:
-        print("\n No valid MAE values found.")
+    print("\n=== Evaluating ===")
+    evaluate_model(encoder, decoder, test_set, device, save_path=os.path.join(base_dir, "predictions_vs_actuals_improved.json"))
