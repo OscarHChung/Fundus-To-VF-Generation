@@ -1,6 +1,9 @@
 # ==============================================
-# Trains the decoder with UWHVF VF tests first, then fine-tunes using GRAPE paired data (fundus + VF)
-# Saves actual vs prediction results into JSON with MAE computed only on valid points.
+# Two Phases of Decoder Training:
+# 1) Pre-train decoder on UWHVF VF-only data (learn VF structure)
+# 2) Fine-tune on GRAPE paired fundus+VF data (learn fundus→VF mapping)
+#
+# Also saves actual vs predicted results into JSON with MAEs
 # ==============================================
 
 import os
@@ -14,8 +17,27 @@ from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
 import sys
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from encoder.retfound_encoder import encoder
+
+
+# ===========================
+# UWHVF Dataset
+# ===========================
+class VFOnlyDataset(Dataset):
+    def __init__(self, json_path):
+        with open(json_path, "r") as f:
+            data = json.load(f)
+        self.vf_arrays = [torch.tensor(np.array(e["hvf"], dtype=float).flatten(), dtype=torch.float32) for e in data]
+        self.eye_sides = [e.get("Laterality", "OD") for e in data]  # Default to OD if not present
+
+    def __len__(self):
+        return len(self.vf_arrays)
+
+    def __getitem__(self, idx):
+        return self.vf_arrays[idx], self.eye_sides[idx]
+
 
 # ===========================
 # GRAPE Dataset
@@ -102,7 +124,35 @@ def masked_loss(preds, targets, eye_sides, mask_value=100.0):
 
 
 # ===========================
-# Training & Evaluation
+# 1: Pre-train Decoder on VF-only
+# ===========================
+def pretrain_decoder(decoder, vf_loader, device, epochs=10, lr=1e-4):
+    optimizer = optim.Adam(decoder.parameters(), lr=lr, weight_decay=1e-5)
+    loss_fn = nn.MSELoss()
+    decoder.train()
+
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for vf, eye_sides in tqdm(vf_loader, desc=f"Pretrain Epoch {epoch+1}/{epochs}"):
+            vf = vf.to(device)
+            batch_size = vf.size(0)
+            # Random latent vectors as input
+            latent = torch.randn(batch_size, 1024, device=device)
+            preds = decoder(latent)
+            loss = loss_fn(preds, vf)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Pretrain Epoch {epoch+1}: Loss={total_loss/len(vf_loader):.4f}")
+
+    torch.save(decoder.state_dict(), "decoder_pretrained.pt")
+    print("✅ Saved pretrained decoder weights.")
+    return decoder
+
+
+# ===========================
+# 2: Fine-tune on GRAPE paired data
 # ===========================
 def train_model(encoder, decoder, train_loader, val_loader, device, epochs=15, lr=1e-4):
     optimizer = optim.Adam(decoder.parameters(), lr=lr, weight_decay=1e-5)
@@ -123,7 +173,6 @@ def train_model(encoder, decoder, train_loader, val_loader, device, epochs=15, l
             total_loss += loss.item()
         avg_train = total_loss / len(train_loader)
 
-        # Validation
         decoder.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -133,27 +182,25 @@ def train_model(encoder, decoder, train_loader, val_loader, device, epochs=15, l
                 preds = decoder(latent)
                 val_loss += masked_loss(preds, vfs, eye_sides).item()
         avg_val = val_loss / len(val_loader)
+        print(f"Fine-tune Epoch {epoch+1}: Train={avg_train:.4f}, Val={avg_val:.4f}")
 
-        print(f"Epoch {epoch+1}: Train={avg_train:.4f}, Val={avg_val:.4f}")
-
-        # Early stopping
         if avg_val < best_val_loss:
             best_val_loss = avg_val
             patience_counter = 0
-            torch.save(decoder.state_dict(), "best_decoder.pt")
+            torch.save(decoder.state_dict(), "best_decoder_finetuned.pt")
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 print("Early stopping triggered.")
                 break
 
-    decoder.load_state_dict(torch.load("best_decoder.pt"))
+    decoder.load_state_dict(torch.load("best_decoder_finetuned.pt"))
     return decoder
 
 
-# =================================================
-# Evaluation of MAE per image / Saving data to JSON
-# =================================================
+# ===========================
+# Evaluation
+# ===========================
 def evaluate_model(encoder, decoder, dataset, device, save_path):
     results, mae_all = [], []
     decoder.eval()
@@ -193,6 +240,15 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     base_dir = "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data"
+
+    # --- Stage 1: VF-only Pretraining ---
+    uwhvf_json = os.path.join(base_dir, "vf_tests", "uwhvf_vf_tests_standardized.json")
+    vf_dataset = VFOnlyDataset(uwhvf_json)
+    vf_loader = DataLoader(vf_dataset, batch_size=8, shuffle=True)
+    decoder = VFDecoder().to(device)
+    decoder = pretrain_decoder(decoder, vf_loader, device)
+
+    # --- Stage 2: Fine-tuning on GRAPE paired data ---
     grape_json = os.path.join(base_dir, "vf_tests", "grape_new_vf_tests.json")
     grape_fundus_dir = os.path.join(base_dir, "fundus", "grape_fundus_images")
 
@@ -212,10 +268,8 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_set, batch_size=4, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=4, shuffle=False)
 
-    decoder = VFDecoder().to(device)
-
-    print("\n=== Training ===")
+    print("\n=== Fine-tuning on GRAPE Data ===")
     decoder = train_model(encoder, decoder, train_loader, val_loader, device)
 
-    print("\n=== Evaluating ===")
-    evaluate_model(encoder, decoder, test_set, device, save_path=os.path.join(base_dir, "predictions_vs_actuals_improved.json"))
+    print("\n=== Evaluating on GRAPE Test Set ===")
+    evaluate_model(encoder, decoder, test_set, device, save_path=os.path.join(base_dir, "predictions_vs_actuals.json"))
