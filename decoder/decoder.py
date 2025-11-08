@@ -197,7 +197,7 @@ def finetune_decoder(decoder, dataset, encoder, epochs=1, batch_size=2, lr=1e-4,
 # 6. Run pipeline
 # ===========================
 if __name__ == "__main__":
-    from encoder.retfound_encoder import encoder  # your encoder
+    from encoder.retfound_encoder import encoder
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     latent_dim = 1024
@@ -257,7 +257,7 @@ if __name__ == "__main__":
     output_json = os.path.join(base_dir, "predictions_vs_actuals_with_mae.json")
     with open(output_json, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"\n✅ Saved predictions, actuals, and MAE values to {output_json}")
+    print(f"\n Saved predictions, actuals, and MAE values to {output_json}")
 
     # ===========================
     # Get average MAE
