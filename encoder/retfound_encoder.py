@@ -1,13 +1,14 @@
-import sys
 import os
+import sys
 import torch
+import torch.nn as nn
 from torchvision import transforms
 from PIL import Image
 import argparse
 
-# ===========================
-# 1. Load RETFound Model
-# ===========================
+# =====================================================
+# 1. Load RETFound model
+# =====================================================
 current_dir = os.path.dirname(os.path.abspath(__file__))
 retfound_dir = os.path.join(current_dir, 'RETFound_MAE')
 sys.path.insert(0, retfound_dir)
@@ -20,35 +21,37 @@ checkpoint_path = os.path.join(current_dir, "RETFound_cfp_weights.pth")
 with torch.serialization.safe_globals([argparse.Namespace]):
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
-model = mae_vit_large_patch16_dec512d8b()
-model.load_state_dict(checkpoint['model'], strict=False)
-model.eval()  # freeze encoder by default
+# Instantiate base model
+base_model = mae_vit_large_patch16_dec512d8b()
+base_model.load_state_dict(checkpoint['model'], strict=False)
+base_model.eval()  # freeze by default
 
-# ===========================
+# =====================================================
 # 2. Encoder Wrapper
-# ===========================
-class RetFoundEncoderWrapper(torch.nn.Module):
-    def __init__(self, model):
+# =====================================================
+class RetFoundEncoderWrapper(nn.Module):
+    def __init__(self, model, latent_dim=1024):
         super().__init__()
         self.model = model
+        self.latent_dim = latent_dim
         self.model.eval()
 
     def forward(self, x):
         """
-        x: tensor [B, 3, 224, 224]
-        returns: latent [B, 1024] (CLS token)
+        x: tensor [B, 3, H, W]
+        returns: latent [B, latent_dim] (CLS token)
         """
+        x = x.to(next(self.model.parameters()).device)
         with torch.no_grad():
-            latent = self.model.forward_encoder(x, mask_ratio=0.75)[0]
-            if latent.dim() == 3:  # [B, num_patches, 1024]
-                latent = latent[:, 0, :]
+            latent = self.model.forward_encoder(x, mask_ratio=0.75)[0]  # [B, num_patches, latent_dim]
+            if latent.dim() == 3:
+                latent = latent[:, 0, :]  # take CLS token
         return latent
 
-encoder = RetFoundEncoderWrapper(model)
 
-# ===========================
+# =====================================================
 # 3. Preprocessing Transform
-# ===========================
+# =====================================================
 retfound_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
@@ -56,12 +59,5 @@ retfound_transform = transforms.Compose([
                          std=[0.229, 0.224, 0.225])
 ])
 
-# ===========================
-# 4. Example: Encode a single image
-# ===========================
-if __name__ == "__main__":
-    img_path = os.path.join(current_dir, "../data/fundus/fundus_example.png")
-    img = Image.open(img_path).convert("RGB")
-    x = retfound_transform(img).unsqueeze(0)
-    latent = encoder(x)
-    print("Latent vector shape:", latent.shape)
+# Instantiate encoder
+encoder = RetFoundEncoderWrapper(base_model)
