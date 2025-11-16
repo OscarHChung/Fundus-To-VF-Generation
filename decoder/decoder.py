@@ -10,9 +10,9 @@ from PIL import Image
 from tqdm import tqdm
 import numpy as np
 
-# =============================
+# ===========================
 # Device setup
-# =============================
+# ===========================
 def get_device():
     if torch.backends.mps.is_available():
         print("Using Apple Silicon MPS backend.")
@@ -26,9 +26,9 @@ def get_device():
 
 device = get_device()
 
-# =============================
-# Masking for OD and OS
-# =============================
+# ===========================
+# Masking
+# ===========================
 mask_OD = np.array([
     [False, False, False, True, True, True, True, False, False],
     [False, False, True, True, True, True, True, True, False],
@@ -39,21 +39,13 @@ mask_OD = np.array([
     [False, False, True, True, True, True, True, True, False],
     [False, False, False, True, True, True, True, False, False]
 ])
-
 mask_OD_flat = torch.tensor(mask_OD.flatten(), dtype=torch.bool)
 mask_OS_flat = torch.tensor(mask_OD.flatten()[::-1].copy(), dtype=torch.bool)
 
-def get_mask_by_laterality(laterality):
-    if laterality == "OD":
-        return mask_OD_flat.to(device)
-    else:
-        return mask_OS_flat.to(device)
-
-# =============================
+# ===========================
 # Datasets
-# =============================
+# ===========================
 class VFOnlyDataset(Dataset):
-    """VF-only dataset (UWHVF)"""
     def __init__(self, json_path):
         with open(json_path, "r") as f:
             self.data = json.load(f)
@@ -68,7 +60,6 @@ class VFOnlyDataset(Dataset):
         return vf_values, laterality
 
 class PairedDataset(Dataset):
-    """GRAPE fundus + VF paired dataset"""
     def __init__(self, json_path, img_dir, img_size=(224,224)):
         with open(json_path, "r") as f:
             self.data = json.load(f)
@@ -91,36 +82,48 @@ class PairedDataset(Dataset):
         laterality = item.get("Laterality", "OD")
         return img, vf_values, laterality
 
-# =============================
-# Decoder model
-# =============================
+# ===========================
+# Decoder Models
+# ===========================
 class SimpleDecoder(nn.Module):
-    def __init__(self, latent_dim=1024, out_dim=72):
+    def __init__(self, latent_dim=1024, out_dim=72, use_laterality=True):
         super().__init__()
+        self.use_laterality = use_laterality
+        input_dim = latent_dim + (1 if use_laterality else 0)
         self.net = nn.Sequential(
-            nn.Linear(latent_dim, 512),
+            nn.Linear(input_dim, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
             nn.ReLU(),
             nn.Linear(512, out_dim)
         )
 
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, latent, laterality=None):
+        # Encode laterality if given
+        if self.use_laterality:
+            if laterality is None:
+                raise ValueError("Laterality must be provided when use_laterality=True")
+            laterality = laterality.float().unsqueeze(1)  # [B, 1]
+            latent = torch.cat([latent, laterality], dim=1)
+        return self.net(latent)
 
-# =============================
-# Training function
-# =============================
-def train_decoder(encoder_model, grape_train_dataset, uwhvf_dataset,
-                  save_path="decoder.pt", latent_dim=1024, epochs=5, batch_size=16, lr=1e-4):
-    
-    # Determine decoder output dim from a sample VF
-    _, sample_vf, _ = grape_train_dataset[0]
+# ===========================
+# Training
+# ===========================
+def train_decoder(encoder_model, grape_dataset, uwhvf_dataset,
+                  save_path="decoder.pt", latent_dim=1024,
+                  epochs=5, batch_size=16, lr=1e-4, use_xgboost=False):
+
+    # Determine decoder output dim
+    _, sample_vf, _ = grape_dataset[0]
     decoder_out_dim = sample_vf.shape[0]
 
+    # Instantiate decoder
     decoder = SimpleDecoder(latent_dim=latent_dim, out_dim=decoder_out_dim).to(device)
     optimizer = optim.Adam(decoder.parameters(), lr=lr)
     loss_fn = nn.L1Loss()
 
-    grape_loader = DataLoader(grape_train_dataset, batch_size=batch_size, shuffle=True)
+    grape_loader = DataLoader(grape_dataset, batch_size=batch_size, shuffle=True)
     uwhvf_loader = DataLoader(uwhvf_dataset, batch_size=batch_size, shuffle=True)
 
     encoder_model.eval()
@@ -130,26 +133,42 @@ def train_decoder(encoder_model, grape_train_dataset, uwhvf_dataset,
         epoch_loss = 0
         total_batches = len(grape_loader) + len(uwhvf_loader)
 
-        # --- GRAPE paired dataset ---
+        # --- GRAPE paired training ---
         for img, vf_values, laterality in tqdm(grape_loader, desc=f"Epoch {epoch} (GRAPE)"):
             img, vf_values = img.to(device), vf_values.to(device)
-            mask = torch.stack([get_mask_by_laterality(lat) for lat in laterality])
+            mask = mask_OD_flat if laterality[0] == "OD" else mask_OS_flat
+            mask = mask.to(device)
+
+            # Encode laterality
+            laterality_tensor = torch.tensor([1 if l=="OD" else 0 for l in laterality], dtype=torch.float32).to(device)
+
             with torch.no_grad():
                 latent = encoder_model(img)
-            pred = decoder(latent)
-            loss = loss_fn(pred[~mask], vf_values[~mask])
+
+            pred = decoder(latent, laterality=laterality_tensor)
+            loss = loss_fn(pred[:, ~mask], vf_values[:, ~mask])
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
 
-        # --- UWHVF VF-only dataset ---
+            # Debug prints
+            print("Batch VF mean:", vf_values.mean().item(), "pred mean:", pred.mean().item(),
+                  "pred min/max:", pred.min().item(), pred.max().item())
+
+        # --- UWHVF VF-only training ---
         for vf_values, laterality in tqdm(uwhvf_loader, desc=f"Epoch {epoch} (UWHVF)"):
             vf_values = vf_values.to(device)
-            mask = torch.stack([get_mask_by_laterality(lat) for lat in laterality])
+            mask = mask_OD_flat if laterality[0] == "OD" else mask_OS_flat
+            mask = mask.to(device)
+            laterality_tensor = torch.tensor([1 if l=="OD" else 0 for l in laterality], dtype=torch.float32).to(device)
+
+            # Use random latent (just regularizing decoder to learn VF distribution)
             latent = torch.randn(vf_values.shape[0], latent_dim).to(device)
-            pred = decoder(latent)
-            loss = loss_fn(pred[~mask], vf_values[~mask])
+            pred = decoder(latent, laterality=laterality_tensor)
+            loss = loss_fn(pred[:, ~mask], vf_values[:, ~mask])
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -157,66 +176,73 @@ def train_decoder(encoder_model, grape_train_dataset, uwhvf_dataset,
 
         print(f"Epoch {epoch} MAE = {epoch_loss / total_batches:.4f}")
 
-        # Debug prints
-        with torch.no_grad():
-            print("Latent min/max/mean:", latent.min().item(), latent.max().item(), latent.mean().item())
-            print("Latent variance:", latent.var().item())
-            print("Prediction min/max/mean:", pred.min().item(), pred.max().item(), pred.mean().item())
-            print("Prediction variance:", pred.var().item())
-
     torch.save(decoder.state_dict(), save_path)
-    print(f"Decoder saved to {save_path}")
+    print(f"Decoder saved to: {save_path}")
     return decoder
 
-# =============================
+# ===========================
 # Evaluation
-# =============================
-def evaluate_decoder(encoder_model, decoder_model, test_dataset):
+# ===========================
+def evaluate_decoder(encoder_model, decoder_model, dataset, batch_size=16):
     decoder_model.eval()
     encoder_model.eval()
     loss_fn = nn.L1Loss()
-    loader = DataLoader(test_dataset, batch_size=16)
+    loader = DataLoader(dataset, batch_size=batch_size)
     total_loss = 0
 
     with torch.no_grad():
         for batch in loader:
-            img, vf_values, laterality = batch
-            img, vf_values = img.to(device), vf_values.to(device)
-            mask = torch.stack([get_mask_by_laterality(lat) for lat in laterality])
-            latent = encoder_model(img)
-            pred = decoder_model(latent)
-            total_loss += loss_fn(pred[~mask], vf_values[~mask]).item()
+            if isinstance(dataset, PairedDataset):
+                img, vf_values, laterality = batch
+                img, vf_values = img.to(device), vf_values.to(device)
+                laterality_tensor = torch.tensor([1 if l=="OD" else 0 for l in laterality], dtype=torch.float32).to(device)
+                latent = encoder_model(img)
+                pred = decoder_model(latent, laterality=laterality_tensor)
+            else:
+                vf_values, laterality = batch
+                vf_values = vf_values.to(device)
+                laterality_tensor = torch.tensor([1 if l=="OD" else 0 for l in laterality], dtype=torch.float32).to(device)
+                latent = torch.randn(vf_values.shape[0], 1024).to(device)
+                pred = decoder_model(latent, laterality=laterality_tensor)
+
+            # Apply mask
+            mask = mask_OD_flat if laterality[0] == "OD" else mask_OS_flat
+            mask = mask.to(device)
+            loss = loss_fn(pred[:, ~mask], vf_values[:, ~mask])
+            total_loss += loss.item()
+
+            # Debug print
+            print("Eval batch pred min/max/mean:", pred.min().item(), pred.max().item(), pred.mean().item())
 
     mae = total_loss / len(loader)
     print(f"Test MAE: {mae:.4f}")
     return mae
 
-# =============================
-# Run pipeline
-# =============================
+# ===========================
+# Main Pipeline
+# ===========================
 if __name__ == "__main__":
     base_dir = "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data"
     fundus_dir = os.path.join(base_dir, "fundus", "grape_fundus_images")
 
-    # --- Load datasets ---
+    # Load datasets
     grape_train = PairedDataset(os.path.join(base_dir, "vf_tests", "grape_train.json"), fundus_dir)
-    grape_test  = PairedDataset(os.path.join(base_dir, "vf_tests", "grape_test.json"), fundus_dir)
-    uwhvf_dataset = VFOnlyDataset(os.path.join(base_dir, "vf_tests", "uwhvf_vf_tests_standardized.json"))
+    grape_test = PairedDataset(os.path.join(base_dir, "vf_tests", "grape_test.json"), fundus_dir)
+    uwhvf_train = VFOnlyDataset(os.path.join(base_dir, "vf_tests", "uwhvf_vf_tests_standardized.json"))
 
-    # --- Import RETFound encoder ---
+    # Load encoder
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
     from encoder.retfound_encoder import encoder as RetEncoder
-
     enc_model = RetEncoder.to(device)
 
-    # --- Train decoder ---
+    # Train decoder
     dec_model = train_decoder(
         encoder_model=enc_model,
-        grape_train_dataset=grape_train,
-        uwhvf_dataset=uwhvf_dataset,
+        grape_dataset=grape_train,
+        uwhvf_dataset=uwhvf_train,
         save_path=os.path.join(base_dir, "decoder.pt"),
         epochs=5
     )
 
-    # --- Evaluate ---
+    # Evaluate
     evaluate_decoder(enc_model, dec_model, grape_test)
