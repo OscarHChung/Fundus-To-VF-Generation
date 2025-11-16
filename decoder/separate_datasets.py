@@ -1,8 +1,10 @@
 # SEPARATE ALL DATA INTO TRAINING AND TESTING
-# GRAPE => Training + Testing
-# UWHVF => Training + Testing
+#   GRAPE => Training + Testing
+#   UWHVF => Training + Testing
 # Method: shuffling indices/data randomly with fixed seed, then splitting
 # Note: GRAPE and UWHVF each have their own splits
+# UPDATE: Although it splits both datasets into training and testing, there is no use for UWHVF split
+#   datasets at the moment. We train on GRAPE (training) + UWHVF (all) and test on GRAPE (testing).
 
 import os
 import json
