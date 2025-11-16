@@ -58,7 +58,7 @@ def plot_mae_heatmap(all_preds, all_true, mask_flat, grid_shape=(8,9), save_dir=
 if __name__ == "__main__":
     # Example usage
     # Load from evaluation outputs
-    eval_results = torch.load("evaluation_outputs.pt")  # contains dict: {'all_preds':..., 'all_true':...}
+    eval_results = torch.load("decoder.pt")
     all_preds = eval_results['all_preds']
     all_true = eval_results['all_true']
     
