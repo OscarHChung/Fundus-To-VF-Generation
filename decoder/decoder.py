@@ -6,10 +6,16 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from PIL import Image
 import json
+import numpy as np
 from tqdm import tqdm
 
 # =====================================================
-# Dataset class with augmentation
+# Paths
+# =====================================================
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+# =====================================================
+# Dataset
 # =====================================================
 class PairedDataset(torch.utils.data.Dataset):
     def __init__(self, json_path, img_dir, transform=None):
@@ -27,156 +33,149 @@ class PairedDataset(torch.utils.data.Dataset):
         img = Image.open(img_path).convert('RGB')
         if self.transform:
             img = self.transform(img)
-        vf = torch.tensor(item['hvf'], dtype=torch.float32).view(-1)
+
+        # Use raw HVF values for MAE
+        vf = torch.tensor(np.array(item['hvf'], dtype=np.float32), dtype=torch.float32).view(-1)
         laterality = item.get('laterality', 'OD')
         return img, vf, laterality
-
-# =====================================================
-# Load RETFound
-# =====================================================
-current_dir = os.path.dirname(os.path.abspath(__file__))
-retfound_dir = os.path.join(current_dir, '../encoder/RETFound_MAE')
-sys.path.insert(0, retfound_dir)
-from models_mae import mae_vit_large_patch16_dec512d8b
-
-checkpoint_path = os.path.join(current_dir, "../encoder/RETFound_cfp_weights.pth")
-with torch.serialization.safe_globals([__import__('argparse').Namespace]):
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
-
-base_model = mae_vit_large_patch16_dec512d8b()
-base_model.load_state_dict(checkpoint['model'], strict=False)
-
-# Partial fine-tuning: last 4 blocks + norm layers
-for name, param in base_model.named_parameters():
-    if any(k in name for k in ['blocks.8', 'blocks.9', 'blocks.10', 'blocks.11', 'norm']):
-        param.requires_grad = True
-    else:
-        param.requires_grad = False
-base_model.train()
 
 # =====================================================
 # Encoder wrapper
 # =====================================================
 class RetFoundEncoderWrapper(nn.Module):
-    def __init__(self, model, latent_dim=1024):
+    def __init__(self, encoder_model):
         super().__init__()
-        self.model = model
-        self.latent_dim = latent_dim
+        self.encoder = encoder_model
 
     def forward(self, x):
-        latent = self.model.forward_encoder(x, mask_ratio=0.0)[0]
+        # Forward full image (mask_ratio=0.0)
+        latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
         if latent.dim() == 3:
-            latent = latent[:, 0, :]
+            latent = latent[:, 0, :]  # CLS token
         return latent
 
 # =====================================================
-# Upgraded Decoder
+# Improved Decoder
 # =====================================================
-class UpgradedDecoder(nn.Module):
-    def __init__(self, latent_dim=1024, output_dim=52, hidden_dims=[1024, 512, 256], dropout=0.2):
+class ImprovedDecoder(nn.Module):
+    def __init__(self, latent_dim=1024, output_dim=52):
         super().__init__()
-        layers = []
-        input_dim = latent_dim
-        for hdim in hidden_dims:
-            layers.append(nn.Linear(input_dim, hdim))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(dropout))
-            layers.append(nn.LayerNorm(hdim))
-            input_dim = hdim
-        layers.append(nn.Linear(input_dim, output_dim))
-        self.model = nn.Sequential(*layers)
+        self.model = nn.Sequential(
+            nn.Linear(latent_dim, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, output_dim)
+        )
 
     def forward(self, x):
         return self.model(x)
 
 # =====================================================
-# Transform + augmentation
+# Training function
 # =====================================================
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(10),
-    transforms.ColorJitter(brightness=0.1, contrast=0.1),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
-])
-
-# =====================================================
-# Training function with separate LR & gradient clipping
-# =====================================================
-def train_model(encoder, decoder, train_loader, val_loader, device, epochs=30, lr_encoder=1e-5, lr_decoder=1e-4):
+def train_decoder(encoder, decoder, train_loader, val_loader, device, epochs=30, lr=1e-4):
     encoder.to(device)
     decoder.to(device)
+    encoder.eval()  # Freeze encoder
 
-    optimizer = torch.optim.Adam([
-        {'params': encoder.parameters(), 'lr': lr_encoder},
-        {'params': decoder.parameters(), 'lr': lr_decoder}
-    ])
-    criterion = nn.L1Loss()
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=lr)
+    criterion = nn.L1Loss()  # MAE directly on real values
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
 
     best_val_mae = float('inf')
 
     for epoch in range(1, epochs + 1):
-        encoder.train()
         decoder.train()
-        train_loss = 0
-        for imgs, vfs, _ in tqdm(train_loader, desc=f"Epoch {epoch} [Train]"):
+        train_loss, train_mae = 0, 0
+
+        for imgs, vfs, _ in tqdm(train_loader, desc=f"[Epoch {epoch}] Training"):
             imgs, vfs = imgs.to(device), vfs.to(device)
+
             optimizer.zero_grad()
-            latents = encoder(imgs)
+            with torch.no_grad():
+                latents = encoder(imgs)
+
             preds = decoder(latents)
             loss = criterion(preds, vfs)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(decoder.parameters()), 1.0)
             optimizer.step()
+
             train_loss += loss.item() * imgs.size(0)
+            train_mae += torch.mean(torch.abs(preds - vfs)).item() * imgs.size(0)
+
         train_loss /= len(train_loader.dataset)
+        train_mae /= len(train_loader.dataset)
 
         # Validation
-        encoder.eval()
         decoder.eval()
-        val_loss = 0
+        val_loss, val_mae = 0, 0
         with torch.no_grad():
             for imgs, vfs, _ in val_loader:
                 imgs, vfs = imgs.to(device), vfs.to(device)
                 latents = encoder(imgs)
                 preds = decoder(latents)
+
                 loss = criterion(preds, vfs)
                 val_loss += loss.item() * imgs.size(0)
-        val_loss /= len(val_loader.dataset)
+                val_mae += torch.mean(torch.abs(preds - vfs)).item() * imgs.size(0)
 
-        print(f"[Epoch {epoch}] Train Loss={train_loss:.4f}, Val MAE={val_loss:.4f}")
-        if val_loss < best_val_mae:
-            best_val_mae = val_loss
+        val_loss /= len(val_loader.dataset)
+        val_mae /= len(val_loader.dataset)
+
+        scheduler.step(val_loss)
+
+        print(f"[Epoch {epoch}] Train Loss={train_loss:.4f}, Train MAE={train_mae:.4f}, "
+              f"Val Loss={val_loss:.4f}, Val MAE={val_mae:.4f}")
+
+        if val_mae < best_val_mae:
+            best_val_mae = val_mae
             torch.save({
-                'encoder_state': encoder.state_dict(),
-                'decoder_state': decoder.state_dict()
-            }, os.path.join(current_dir, "best_model_finetuned.pth"))
-            print(f"  New best model saved with Val MAE {best_val_mae:.4f}")
+                'decoder_state': decoder.state_dict(),
+                'val_mae': best_val_mae
+            }, os.path.join(current_dir, "best_decoder.pth"))
+            print(f"  New best decoder saved with Val MAE {best_val_mae:.4f}")
 
     print("Training complete. Best Val MAE:", best_val_mae)
-    return encoder, decoder
 
 # =====================================================
 # Main
 # =====================================================
-if __name__ == '__main__':
-    device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+if __name__ == "__main__":
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print("Using device:", device)
 
     base_dir = os.path.join(current_dir, "../data")
-    fundus_dir = os.path.join(base_dir, 'fundus', 'grape_fundus_images')
+    fundus_dir = os.path.join(base_dir, "fundus", "grape_fundus_images")
 
-    train_dataset = PairedDataset(os.path.join(base_dir, 'vf_tests', 'grape_train.json'), fundus_dir, transform)
-    val_dataset = PairedDataset(os.path.join(base_dir, 'vf_tests', 'grape_test.json'), fundus_dir, transform)
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
+
+    train_dataset = PairedDataset(os.path.join(base_dir, "vf_tests", "grape_train.json"), fundus_dir, transform)
+    val_dataset = PairedDataset(os.path.join(base_dir, "vf_tests", "grape_test.json"), fundus_dir, transform)
 
     train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=8)
 
-    encoder = RetFoundEncoderWrapper(base_model)
+    # Load best encoder
+    retfound_dir = os.path.join(current_dir, '../encoder/RETFound_MAE')
+    sys.path.insert(0, retfound_dir)
+    from models_mae import mae_vit_large_patch16_dec512d8b
+
+    encoder_model = mae_vit_large_patch16_dec512d8b()
+    encoder_ckpt = torch.load(os.path.join(current_dir, "../encoder/best_encoder_only.pth"), map_location="cpu")
+    encoder_model.load_state_dict(encoder_ckpt['encoder_state'], strict=False)
+    encoder = RetFoundEncoderWrapper(encoder_model)
+
+    # Initialize improved decoder
     output_dim = train_dataset[0][1].shape[0]
-    decoder = UpgradedDecoder(latent_dim=1024, output_dim=output_dim)
+    decoder = ImprovedDecoder(latent_dim=1024, output_dim=output_dim)
 
-    encoder, decoder = train_model(encoder, decoder, train_loader, val_loader, device, epochs=30)
-
+    # Train decoder
+    train_decoder(encoder, decoder, train_loader, val_loader, device, epochs=30, lr=1e-4)
