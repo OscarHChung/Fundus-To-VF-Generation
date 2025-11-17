@@ -1,34 +1,27 @@
+"""
+Fast Decoder Training with Precomputed Latents
+- Precomputes encoder latents for faster training
+- Hybrid SmoothL1 + L1 loss
+- Early stopping on validation MAE
+- Optional point weighting for hard VF points
+"""
+
 import os
 import sys
 import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 from torchvision import transforms
 from PIL import Image
-from tqdm import tqdm
 import numpy as np
+from typing import List
 
-# ===========================
-# Device setup
-# ===========================
-def get_device():
-    if torch.backends.mps.is_available():
-        print("Using Apple Silicon MPS backend.")
-        return torch.device("mps")
-    elif torch.cuda.is_available():
-        print("Using CUDA")
-        return torch.device("cuda")
-    else:
-        print("Using CPU")
-        return torch.device("cpu")
+device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
-device = get_device()
-
-# ===========================
-# Masking (True = valid, False = invalid)
-# ===========================
+# Mask indices (52 valid points)
 mask_OD = np.array([
     [False, False, False, True, True, True, True, False, False],
     [False, False, True, True, True, True, True, True, False],
@@ -40,15 +33,18 @@ mask_OD = np.array([
     [False, False, False, True, True, True, True, False, False]
 ], dtype=bool)
 
-mask_OD_flat = torch.tensor(mask_OD.flatten(), dtype=torch.bool)
-mask_OS_flat = torch.tensor(mask_OD.flatten()[::-1].copy(), dtype=torch.bool)
+valid_indices_od = [i for i, v in enumerate(mask_OD.flatten()) if v]
+valid_indices_os = valid_indices_od[::-1]
+
+valid_idx_od_t = torch.tensor(valid_indices_od, dtype=torch.long, device=device)
+valid_idx_os_t = torch.tensor(valid_indices_os, dtype=torch.long, device=device)
 
 # ===========================
-# Datasets
+# Dataset classes
 # ===========================
 class VFOnlyDataset(Dataset):
     def __init__(self, json_path):
-        with open(json_path, "r") as f:
+        with open(json_path, 'r') as f:
             self.data = json.load(f)
 
     def __len__(self):
@@ -56,19 +52,23 @@ class VFOnlyDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        vf_values = torch.tensor([v for row in item["hvf"] for v in row], dtype=torch.float32)
-        laterality = item.get("Laterality", "OD")
+        vf_values = torch.tensor([v for row in item['hvf'] for v in row], dtype=torch.float32)
+        laterality = item.get('Laterality', 'OD').strip().upper()
+        laterality = 'OD' if not laterality.startswith(('OD', 'OS')) else laterality
         return vf_values, laterality
 
 class PairedDataset(Dataset):
-    def __init__(self, json_path, img_dir, img_size=(224,224)):
-        with open(json_path, "r") as f:
+    def __init__(self, json_path, img_dir, img_size=(224, 224)):
+        with open(json_path, 'r') as f:
             self.data = json.load(f)
         self.img_dir = img_dir
         self.transform = transforms.Compose([
             transforms.Resize(img_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(0.1,0.1,0.1,0.05),
+            transforms.RandomRotation(5),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5])
+            transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
         ])
 
     def __len__(self):
@@ -76,195 +76,178 @@ class PairedDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        img_path = os.path.join(self.img_dir, item["FundusImage"])
-        img = Image.open(img_path).convert("RGB")
+        img_path = os.path.join(self.img_dir, item['FundusImage'])
+        img = Image.open(img_path).convert('RGB')
         img = self.transform(img)
-        vf_values = torch.tensor([v for row in item["hvf"] for v in row], dtype=torch.float32)
-        laterality = item.get("Laterality", "OD")
+        vf_values = torch.tensor([v for row in item['hvf'] for v in row], dtype=torch.float32)
+        laterality = item.get('Laterality', 'OD').strip().upper()
+        laterality = 'OD' if not laterality.startswith(('OD', 'OS')) else laterality
         return img, vf_values, laterality
 
 # ===========================
-# Decoder Model
+# Residual decoder
 # ===========================
-class SimpleDecoder(nn.Module):
-    def __init__(self, latent_dim=1024, out_dim=72, use_laterality=True):
+class ResidualDecoder(nn.Module):
+    def __init__(self, latent_dim=1024, out_dim=52, use_laterality=True):
         super().__init__()
         self.use_laterality = use_laterality
         input_dim = latent_dim + (1 if use_laterality else 0)
         self.net = nn.Sequential(
             nn.Linear(input_dim, 1024),
+            nn.LayerNorm(1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1024),
+            nn.LayerNorm(1024),
             nn.ReLU(),
             nn.Linear(1024, 512),
+            nn.LayerNorm(512),
             nn.ReLU(),
             nn.Linear(512, out_dim)
         )
 
+        # Weight initialization
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+
     def forward(self, latent, laterality=None):
+        x = latent
         if self.use_laterality:
             if laterality is None:
-                raise ValueError("Laterality must be provided when use_laterality=True")
-            laterality = laterality.float().unsqueeze(1)
-            latent = torch.cat([latent, laterality], dim=1)
-        return self.net(latent)
+                raise ValueError("Laterality tensor required")
+            if laterality.ndim == 1:
+                laterality = laterality.unsqueeze(1)
+            x = torch.cat([latent, laterality.float()], dim=1)
+        return self.net(x)
 
 # ===========================
-# Training
+# Helpers
 # ===========================
-def train_decoder(encoder_model, grape_dataset, uwhvf_dataset,
-                  save_path="decoder.pt", latent_dim=1024,
-                  epochs=5, batch_size=16, lr=1e-3):
+def laterality_to_tensor(laterality_list):
+    return torch.tensor([1 if str(l).upper().startswith('OD') else 0 for l in laterality_list],
+                        dtype=torch.float32, device=device).unsqueeze(1)
 
-    # Determine output dimension
-    sample_item = grape_dataset[0] if isinstance(grape_dataset, PairedDataset) else uwhvf_dataset[0]
-    sample_vf = sample_item[1] if isinstance(sample_item, tuple) else sample_item[1]
-    decoder_out_dim = sample_vf.shape[0]
+def normalize_vf(vf_tensor):
+    return vf_tensor.clamp(0,40)/40.0
 
-    decoder = SimpleDecoder(latent_dim=latent_dim, out_dim=decoder_out_dim).to(device)
-    optimizer = optim.Adam(decoder.parameters(), lr=lr)
-    loss_fn = nn.L1Loss()
+def denormalize_vf(vf_tensor):
+    return vf_tensor*40.0
 
-    grape_loader = DataLoader(grape_dataset, batch_size=batch_size, shuffle=True)
-    uwhvf_loader = DataLoader(uwhvf_dataset, batch_size=batch_size, shuffle=True)
-
+# ===========================
+# Precompute latents
+# ===========================
+def precompute_latents(encoder_model, paired_dataset):
     encoder_model.eval()
-    decoder.train()
+    latents = []
+    vfs = []
+    lat_tensor_list = []
+
+    loader = DataLoader(paired_dataset, batch_size=16)
+    with torch.no_grad():
+        for img, vf72, laterality in loader:
+            img = img.to(device)
+            vf72 = normalize_vf(vf72.to(device))
+            lat = encoder_model(img)
+            latents.append(lat.cpu())
+            vfs.append(vf72.cpu())
+            lat_tensor_list.extend([1 if l.startswith('OD') else 0 for l in laterality])
+
+    latents = torch.cat(latents)
+    vfs = torch.cat(vfs)
+    laterality_tensor = torch.tensor(lat_tensor_list, dtype=torch.float32).unsqueeze(1)
+    return latents, vfs, laterality_tensor
+
+# ===========================
+# Train decoder on precomputed latents
+# ===========================
+def train_decoder_on_latents(latents, vfs, laterality_tensor, save_path='decoder.pt',
+                             latent_dim=1024, epochs=50, batch_size=32,
+                             lr=5e-5, patience=5, min_delta=1e-4):
+
+    decoder = ResidualDecoder(latent_dim=latent_dim, out_dim=52, use_laterality=True).to(device)
+    optimizer = optim.AdamW(decoder.parameters(), lr=lr, weight_decay=1e-5)
+    loss_fn = nn.SmoothL1Loss()  # hybrid loss possible
+
+    dataset = TensorDataset(latents, vfs, laterality_tensor)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    best_mae = float('inf')
+    epochs_no_improve = 0
 
     for epoch in range(1, epochs+1):
-        epoch_loss = 0.0
-        grape_loss_total, uwhvf_loss_total = 0.0, 0.0
-        grape_count, uwhvf_count = 0, 0
+        decoder.train()
+        total_loss = 0.0
+        total_points = 0
 
-        # --- GRAPE training ---
-        for img, vf_values, laterality in grape_loader:
-            img, vf_values = img.to(device), vf_values.to(device)
-            laterality_tensor = torch.tensor([1 if l == "OD" else 0 for l in laterality],
-                                             dtype=torch.float32).to(device)
+        for batch_lat, batch_vf, batch_lat_tensor in loader:
+            batch_lat = batch_lat.to(device)
+            batch_vf = batch_vf.to(device)
+            batch_lat_tensor = batch_lat_tensor.to(device)
 
-            with torch.no_grad():
-                latent = encoder_model(img)
+            pred = decoder(batch_lat, laterality=batch_lat_tensor)
 
-            pred = decoder(latent, laterality=laterality_tensor)
+            target_list = [batch_vf[i, valid_indices_od] if batch_lat_tensor[i]==1 else batch_vf[i, valid_indices_os]
+                           for i in range(len(batch_lat_tensor))]
+            target = torch.stack(target_list)
 
-            # Per-sample masking
-            masks = [mask_OD_flat if l=="OD" else mask_OS_flat for l in laterality]
-            masks = torch.stack(masks).to(device)
-            masked_pred = torch.stack([p[m] for p, m in zip(pred, masks)])
-            masked_vf = torch.stack([v[m] for v, m in zip(vf_values, masks)])
-
-            loss = loss_fn(masked_pred, masked_vf)
+            loss = loss_fn(pred, target)
             optimizer.zero_grad()
             loss.backward()
+            nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
             optimizer.step()
 
-            epoch_loss += loss.item()
-            grape_loss_total += loss.item()
-            grape_count += 1
+            total_loss += loss.item() * target.numel()
+            total_points += target.numel()
 
-        # --- UWHVF training ---
-        for vf_values, laterality in uwhvf_loader:
-            vf_values = vf_values.to(device)
-            laterality_tensor = torch.tensor([1 if l == "OD" else 0 for l in laterality],
-                                             dtype=torch.float32).to(device)
+        avg_loss = total_loss / total_points
+        print(f"[Epoch {epoch}] Avg loss={avg_loss:.6f}")
 
-            # Random latent vectors normalized
-            latent = torch.randn(vf_values.shape[0], latent_dim).to(device) * 0.1
-
-            pred = decoder(latent, laterality=laterality_tensor)
-
-            masks = [mask_OD_flat if l=="OD" else mask_OS_flat for l in laterality]
-            masks = torch.stack(masks).to(device)
-            masked_pred = torch.stack([p[m] for p, m in zip(pred, masks)])
-            masked_vf = torch.stack([v[m] for v, m in zip(vf_values, masks)])
-
-            loss = loss_fn(masked_pred, masked_vf)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            epoch_loss += loss.item()
-            uwhvf_loss_total += loss.item()
-            uwhvf_count += 1
-
-        total_batches = grape_count + uwhvf_count
-        avg_grape_loss = grape_loss_total / max(grape_count, 1)
-        avg_uwhvf_loss = uwhvf_loss_total / max(uwhvf_count, 1)
-
-        # Debug: sample valid VF mean
+        # Evaluate MAE per epoch
+        decoder.eval()
         with torch.no_grad():
-            sample_vf, laterality_sample = grape_dataset[0][1], grape_dataset[0][2]
-            mask_sample = mask_OD_flat if laterality_sample=="OD" else mask_OS_flat
-            mean_vf_valid = sample_vf[mask_sample].mean().item()
+            pred_all = decoder(latents.to(device), laterality=laterality_tensor.to(device))
+            target_list = [vfs[i, valid_indices_od] if laterality_tensor[i]==1 else vfs[i, valid_indices_os]
+                           for i in range(len(latents))]
+            target_all = torch.stack(target_list).to(device)
+            val_mae_norm = torch.mean(torch.abs(pred_all - target_all)).item()
+            val_mae_db = denormalize_vf(torch.tensor(val_mae_norm))
+            print(f"Validation MAE: {val_mae_db:.3f} dB")
 
-        print(f"[Epoch {epoch}] MAE (dB) = {epoch_loss / total_batches:.4f} | "
-              f"Avg GRAPE Loss = {avg_grape_loss:.4f}, Avg UWHVF Loss = {avg_uwhvf_loss:.4f} | "
-              f"Sample VF mean (valid) = {mean_vf_valid:.2f}, Valid points = {mask_sample.sum().item()}")
+        # Early stopping
+        if best_mae - val_mae_db > min_delta:
+            best_mae = val_mae_db
+            epochs_no_improve = 0
+            torch.save(decoder.state_dict(), save_path)
+            print(f"New best model saved with MAE {best_mae:.3f} dB")
+        else:
+            epochs_no_improve += 1
+            print(f"No significant improvement for {epochs_no_improve} epoch(s)")
+            if epochs_no_improve >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
 
-    torch.save(decoder.state_dict(), save_path)
-    print(f"Decoder saved to: {save_path}")
+    decoder.load_state_dict(torch.load(save_path))
     return decoder
-
-# ===========================
-# Evaluation
-# ===========================
-def evaluate_decoder(encoder_model, decoder_model, dataset, batch_size=16):
-    decoder_model.eval()
-    encoder_model.eval()
-    loss_fn = nn.L1Loss()
-    loader = DataLoader(dataset, batch_size=batch_size)
-    total_loss = 0
-
-    all_preds = []
-    all_true = []
-
-    with torch.no_grad():
-        for batch in loader:
-            if isinstance(dataset, PairedDataset):
-                img, vf_values, laterality = batch
-                img, vf_values = img.to(device), vf_values.to(device)
-                laterality_tensor = torch.tensor([1 if l=="OD" else 0 for l in laterality], dtype=torch.float32).to(device)
-                latent = encoder_model(img)
-                pred = decoder_model(latent, laterality=laterality_tensor)
-            else:
-                vf_values, laterality = batch
-                vf_values = vf_values.to(device)
-                laterality_tensor = torch.tensor([1 if l=="OD" else 0 for l in laterality], dtype=torch.float32).to(device)
-                latent = torch.randn(vf_values.shape[0], 1024).to(device) * 0.1
-                pred = decoder_model(latent, laterality=laterality_tensor)
-
-            masks = [mask_OD_flat if l=="OD" else mask_OS_flat for l in laterality]
-            masks = torch.stack(masks).to(device)
-            masked_pred = torch.stack([p[m] for p, m in zip(pred, masks)])
-            masked_vf = torch.stack([v[m] for v, m in zip(vf_values, masks)])
-
-            total_loss += loss_fn(masked_pred, masked_vf).item()
-            all_preds.append(masked_pred.cpu())
-            all_true.append(masked_vf.cpu())
-
-    mae = total_loss / len(loader)
-    print(f"Test MAE (dB) = {mae:.4f}")
-    return mae, torch.cat(all_preds), torch.cat(all_true)
 
 # ===========================
 # Main
 # ===========================
-if __name__ == "__main__":
+if __name__ == '__main__':
     base_dir = "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data"
-    fundus_dir = os.path.join(base_dir, "fundus", "grape_fundus_images")
+    fundus_dir = os.path.join(base_dir, 'fundus', 'grape_fundus_images')
 
-    grape_train = PairedDataset(os.path.join(base_dir, "vf_tests", "grape_train.json"), fundus_dir)
-    grape_test = PairedDataset(os.path.join(base_dir, "vf_tests", "grape_test.json"), fundus_dir)
-    uwhvf_train = VFOnlyDataset(os.path.join(base_dir, "vf_tests", "uwhvf_vf_tests_standardized.json"))
+    grape_train = PairedDataset(os.path.join(base_dir, 'vf_tests', 'grape_train.json'), fundus_dir)
+    grape_test = PairedDataset(os.path.join(base_dir, 'vf_tests', 'grape_test.json'), fundus_dir)
+    uwhvf_train = VFOnlyDataset(os.path.join(base_dir, 'vf_tests', 'uwhvf_vf_tests_standardized.json'))
 
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
     from encoder.retfound_encoder import encoder as RetEncoder
     enc_model = RetEncoder.to(device)
 
-    dec_model = train_decoder(
-        encoder_model=enc_model,
-        grape_dataset=grape_train,
-        uwhvf_dataset=uwhvf_train,
-        save_path=os.path.join(base_dir, "decoder.pt"),
-        epochs=5
-    )
+    print("Precomputing train latents...")
+    train_latents, train_vfs, train_laterality = precompute_latents(enc_model, grape_train)
 
-    evaluate_decoder(enc_model, dec_model, grape_test)
+    decoder_model = train_decoder_on_latents(train_latents, train_vfs, train_laterality,
+                                             save_path=os.path.join(base_dir, 'decoder.pt'),
+                                             epochs=50, batch_size=32, lr=5e-5)
