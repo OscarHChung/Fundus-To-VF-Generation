@@ -1,3 +1,5 @@
 encoder/RETFound_cfp_weights.pth
 data/fundus/grape_fundus_images/*.jpg
 data/*.pt
+decoder/*.pth
+encoder/*.pth
