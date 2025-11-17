@@ -1,183 +1,218 @@
 import os
 import sys
+import json
+import numpy as np
+from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from PIL import Image
-import json
-import numpy as np
-from tqdm import tqdm
+import argparse
 
-# =====================================================
-# Dataset class
-# =====================================================
+# safe loading helper (RETFound checkpoint contains argparse.Namespace)
+torch.serialization.add_safe_globals([argparse.Namespace])
+
+# ---------- Configuration ----------
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.join(CURRENT_DIR, "../data")
+FUNDUS_DIR = os.path.join(BASE_DIR, "fundus", "grape_fundus_images")
+TRAIN_JSON = os.path.join(BASE_DIR, "vf_tests", "grape_train.json")
+VAL_JSON = os.path.join(BASE_DIR, "vf_tests", "grape_test.json")
+
+RETFOUND_DIR = os.path.join(CURRENT_DIR, "RETFound_MAE")
+RETFOUND_WEIGHTS = os.path.join(CURRENT_DIR, "RETFound_cfp_weights.pth")
+OUT_NBEST = os.path.join(CURRENT_DIR, "nbest_encoder.pth")
+
+DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+BATCH_SIZE = 8
+EPOCHS = 20
+UNFREEZE_LAST_N = 1   # Only unfreeze 1 block for slower improvement
+LR_ENCODER = 1e-6
+LR_HEAD = 1e-4
+
+PEARSON_MIN = 0.40
+PEARSON_MAX = 0.60  # Early stopping window to preserve latent richness
+
+# ---------- Dataset ----------
 class PairedDataset(torch.utils.data.Dataset):
     def __init__(self, json_path, img_dir, transform=None):
         with open(json_path, 'r') as f:
-            self.data = json.load(f)
+            self.items = json.load(f)
         self.img_dir = img_dir
         self.transform = transform
 
     def __len__(self):
-        return len(self.data)
+        return len(self.items)
 
     def __getitem__(self, idx):
-        item = self.data[idx]
+        item = self.items[idx]
         img_path = os.path.join(self.img_dir, item['FundusImage'])
         img = Image.open(img_path).convert('RGB')
         if self.transform:
             img = self.transform(img)
-        vf = torch.tensor(item['hvf'], dtype=torch.float32).view(-1)
-        laterality = item.get('laterality', 'OD')
-        return img, vf, laterality
+        hvf = np.array(item['hvf'], dtype=np.float32).reshape(-1)
+        hvf = torch.tensor(hvf, dtype=torch.float32)
+        laterality = item.get('Laterality', item.get('laterality', 'OD'))
+        return img, hvf, laterality
 
-# =====================================================
-# Load RETFound encoder
-# =====================================================
-current_dir = os.path.dirname(os.path.abspath(__file__))
-retfound_dir = os.path.join(current_dir, '../encoder/RETFound_MAE')
-sys.path.insert(0, retfound_dir)
+# ---------- Load RETFound ----------
+sys.path.insert(0, RETFOUND_DIR)
 from models_mae import mae_vit_large_patch16_dec512d8b
 
-checkpoint_path = os.path.join(current_dir, "../encoder/RETFound_cfp_weights.pth")
-with torch.serialization.safe_globals([__import__('argparse').Namespace]):
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+print("Loading RETFound base weights...")
+with torch.serialization.safe_globals([argparse.Namespace]):
+    base_ckpt = torch.load(RETFOUND_WEIGHTS, map_location="cpu")
 
 base_model = mae_vit_large_patch16_dec512d8b()
-base_model.load_state_dict(checkpoint['model'], strict=False)
+if isinstance(base_ckpt, dict) and 'model' in base_ckpt:
+    base_model.load_state_dict(base_ckpt['model'], strict=False)
+else:
+    base_model.load_state_dict(base_ckpt, strict=False)
+base_model.to(DEVICE)
+base_model.train()
 
-# =====================================================
-# Encoder wrapper
-# =====================================================
+# ---------- Encoder Wrapper ----------
 class RetFoundEncoderWrapper(nn.Module):
-    def __init__(self, model, latent_dim=1024, unfreeze_last_n=4):
+    def __init__(self, model):
         super().__init__()
         self.model = model
-        self.latent_dim = latent_dim
-
-        # Freeze all layers
-        for param in self.model.parameters():
-            param.requires_grad = False
-
-        # Unfreeze last n transformer blocks
-        for blk in self.model.blocks[-unfreeze_last_n:]:
-            for param in blk.parameters():
-                param.requires_grad = True
 
     def forward(self, x):
         latent = self.model.forward_encoder(x, mask_ratio=0.0)[0]
         if latent.dim() == 3:
-            latent = latent[:, 0, :]  # CLS token
+            latent = latent[:, 0, :]
         return latent
 
-# =====================================================
-# Regression head (MLP)
-# =====================================================
+# ---------- Regression Head ----------
 class RegressionHead(nn.Module):
-    def __init__(self, latent_dim=1024, output_dim=52):
+    def __init__(self, latent_dim=1024, hidden=512, out=72):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(latent_dim, 512),
+            nn.Linear(latent_dim, hidden),
             nn.ReLU(),
-            nn.Linear(512, output_dim)
+            nn.Linear(hidden, out)
         )
 
     def forward(self, x):
         return self.mlp(x)
 
-# =====================================================
-# Transform
-# =====================================================
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
-])
+# ---------- Utilities ----------
+def flatten_preds_targets(preds_list, targs_list):
+    preds = np.concatenate(preds_list, axis=0)
+    targs = np.concatenate(targs_list, axis=0)
+    return preds.flatten(), targs.flatten()
 
-# =====================================================
-# Training function (L1 only)
-# =====================================================
-def train_encoder_raw(encoder, head, train_loader, val_loader, device,
-                      epochs=10, lr_encoder=1e-5, lr_head=1e-4):
-    encoder.to(device)
-    head.to(device)
+def safe_pearson(x, y):
+    if x.std() == 0 or y.std() == 0:
+        return 0.0
+    r = np.corrcoef(x, y)[0,1]
+    return float(r) if not np.isnan(r) else 0.0
 
-    optimizer = torch.optim.Adam([
-        {'params': encoder.parameters(), 'lr': lr_encoder},
-        {'params': head.parameters(), 'lr': lr_head}
+# ---------- Training ----------
+def train_encoder():
+    # Strong augmentations to prevent memorization
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
     ])
-    criterion = nn.L1Loss()  # Raw MAE
-    best_checkpoint = None
 
-    for epoch in range(1, epochs + 1):
-        encoder.train()
+    train_ds = PairedDataset(TRAIN_JSON, FUNDUS_DIR, transform)
+    val_ds = PairedDataset(VAL_JSON, FUNDUS_DIR, transform)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    encoder = RetFoundEncoderWrapper(base_model)
+
+    # Freeze all, then unfreeze only last block(s)
+    for p in base_model.parameters():
+        p.requires_grad = False
+
+    if hasattr(base_model, "blocks") and UNFREEZE_LAST_N > 0:
+        for blk in base_model.blocks[-UNFREEZE_LAST_N:]:
+            for p in blk.parameters():
+                p.requires_grad = True
+        print(f"Unfrozen last {UNFREEZE_LAST_N} transformer block(s).")
+    else:
+        print("Warning: base_model has no attribute 'blocks'; no encoder layers unfrozen.")
+
+    head = RegressionHead(latent_dim=1024, hidden=512, out=72).to(DEVICE)
+
+    enc_params = [p for p in base_model.parameters() if p.requires_grad]
+    optim_groups = []
+    if len(enc_params) > 0:
+        optim_groups.append({"params": enc_params, "lr": LR_ENCODER})
+    optim_groups.append({"params": head.parameters(), "lr": LR_HEAD})
+    optimizer = torch.optim.AdamW(optim_groups, weight_decay=1e-5)
+    criterion = nn.L1Loss(reduction='mean')
+
+    best_saved = None
+
+    for epoch in range(1, EPOCHS+1):
+        base_model.train()
         head.train()
-        train_loss = 0
+        train_loss = 0.0
 
-        for imgs, vfs, _ in tqdm(train_loader, desc=f"[Epoch {epoch}] Train", leave=False):
-            imgs, vfs = imgs.to(device), vfs.to(device)
+        for imgs, hvf72, _ in tqdm(train_loader, desc=f"[Epoch {epoch}] Train", leave=False):
+            imgs = imgs.to(DEVICE)
+            hvf72 = hvf72.to(DEVICE)
             optimizer.zero_grad()
-            latents = encoder(imgs)
-            preds = head(latents)
-            loss = criterion(preds, vfs)
+            lat = encoder(imgs)
+            preds72 = head(lat)
+            loss = criterion(preds72, hvf72)
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * imgs.size(0)
+
         train_loss /= len(train_loader.dataset)
 
         # Validation
-        encoder.eval()
+        base_model.eval()
         head.eval()
-        val_loss = 0
-        all_preds = []
-        all_targets = []
+        val_loss = 0.0
+        preds_list, targs_list = [], []
+
         with torch.no_grad():
-            for imgs, vfs, _ in val_loader:
-                imgs, vfs = imgs.to(device), vfs.to(device)
-                latents = encoder(imgs)
-                preds = head(latents)
-                val_loss += criterion(preds, vfs).item() * imgs.size(0)
-                all_preds.append(preds.cpu().numpy())
-                all_targets.append(vfs.cpu().numpy())
+            for imgs, hvf72, _ in val_loader:
+                imgs = imgs.to(DEVICE)
+                hvf72 = hvf72.to(DEVICE)
+                lat = encoder(imgs)
+                preds72 = head(lat)
+                val_loss += criterion(preds72, hvf72).item() * imgs.size(0)
+                preds_list.append(preds72.cpu().numpy())
+                targs_list.append(hvf72.cpu().numpy())
+
         val_loss /= len(val_loader.dataset)
-        all_preds = np.concatenate(all_preds, axis=0)
-        all_targets = np.concatenate(all_targets, axis=0)
-        pearson = np.corrcoef(all_preds.flatten(), all_targets.flatten())[0,1]
+        flat_p, flat_t = flatten_preds_targets(preds_list, targs_list)
+        pearson = safe_pearson(flat_p, flat_t)
 
-        print(f"[Epoch {epoch}] Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, Pearson={pearson:.4f}")
+        print(f"[Epoch {epoch}] Train MAE={train_loss:.4f}, Val MAE={val_loss:.4f}, Pearson={pearson:.4f}")
 
-        # Save encoder when Pearson in moderate range
-        if 0.55 <= pearson <= 0.75:
-            torch.save({
-                'encoder_state': encoder.state_dict(),
-                'head_state': head.state_dict(),
-                'pearson': pearson
-            }, os.path.join(current_dir, f"moderate_encoder_epoch{epoch}.pth"))
-            print(f"  Saved moderate Pearson encoder at epoch {epoch} (Pearson={pearson:.4f})")
+        # Save checkpoint only if Pearson in target window
+        if PEARSON_MIN <= pearson <= PEARSON_MAX:
+            save_dict = {
+                "encoder_state": base_model.state_dict(),
+                "head_state": head.state_dict(),
+                "pearson": pearson,
+                "epoch": epoch
+            }
+            torch.save(save_dict, OUT_NBEST)
+            torch.save(save_dict, os.path.join(CURRENT_DIR, f"moderate_encoder_epoch{epoch}.pth"))
+            best_saved = OUT_NBEST
+            print(f"  Saved moderate encoder to {OUT_NBEST} (Pearson={pearson:.4f})")
 
-    print("Fine-tuning complete.")
+        # Early stopping: stop if Pearson exceeds upper bound
+        if pearson > PEARSON_MAX:
+            print(f"Pearson {pearson:.4f} > {PEARSON_MAX}, stopping fine-tuning to preserve latent richness.")
+            break
 
-# =====================================================
-# Main
-# =====================================================
-if __name__ == '__main__':
-    device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
-    print("Using device:", device)
+    print("Done. nbest saved at:", best_saved)
 
-    base_dir = os.path.join(current_dir, "../data")
-    fundus_dir = os.path.join(base_dir, 'fundus', 'grape_fundus_images')
-
-    train_dataset = PairedDataset(os.path.join(base_dir, 'vf_tests', 'grape_train.json'), fundus_dir, transform)
-    val_dataset = PairedDataset(os.path.join(base_dir, 'vf_tests', 'grape_test.json'), fundus_dir, transform)
-
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=8)
-
-    encoder = RetFoundEncoderWrapper(base_model, latent_dim=1024, unfreeze_last_n=4)
-    output_dim = train_dataset[0][1].shape[0]
-    head = RegressionHead(latent_dim=1024, output_dim=output_dim)
-
-    train_encoder_raw(encoder, head, train_loader, val_loader, device,
-                      epochs=15, lr_encoder=1e-5, lr_head=1e-4)
+if __name__ == "__main__":
+    print("Device:", DEVICE)
+    train_encoder()
