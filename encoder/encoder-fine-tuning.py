@@ -32,8 +32,8 @@ UNFREEZE_LAST_N = 1   # Only unfreeze 1 block for slower improvement
 LR_ENCODER = 1e-6
 LR_HEAD = 1e-4
 
-PEARSON_MIN = 0.50
-PEARSON_MAX = 0.75  # Early stopping window to preserve latent richness
+PEARSON_MIN = 0.70
+PEARSON_MAX = 0.85  # Early stopping window to preserve latent richness
 
 # ---------- Dataset ----------
 class PairedDataset(torch.utils.data.Dataset):
