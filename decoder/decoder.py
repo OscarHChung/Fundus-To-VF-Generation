@@ -1,9 +1,6 @@
+#!/usr/bin/env python3
 """
-Fast Decoder Training with Precomputed Latents
-- Precomputes encoder latents for faster training
-- Hybrid SmoothL1 + L1 loss
-- Early stopping on validation MAE
-- Optional point weighting for hard VF points
+Decoder Training Script - Masked MAE + Curriculum Learning + Early Stopping
 """
 
 import os
@@ -12,16 +9,30 @@ import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, TensorDataset
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 import numpy as np
 from typing import List
 
-device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+# ===========================
+# Device
+# ===========================
+def get_device():
+    if torch.backends.mps.is_available():
+        print("Using Apple Silicon MPS backend.")
+        return torch.device("mps")
+    elif torch.cuda.is_available():
+        print("Using CUDA")
+        return torch.device("cuda")
+    else:
+        print("Using CPU")
+        return torch.device("cpu")
+device = get_device()
 
+# ===========================
 # Mask indices (52 valid points)
+# ===========================
 mask_OD = np.array([
     [False, False, False, True, True, True, True, False, False],
     [False, False, True, True, True, True, True, True, False],
@@ -33,14 +44,15 @@ mask_OD = np.array([
     [False, False, False, True, True, True, True, False, False]
 ], dtype=bool)
 
-valid_indices_od = [i for i, v in enumerate(mask_OD.flatten()) if v]
-valid_indices_os = valid_indices_od[::-1]
-
+mask_od_flat = mask_OD.flatten()
+valid_indices_od: List[int] = [i for i, v in enumerate(mask_od_flat) if v]
+mask_os_flat = mask_od_flat[::-1].copy()
+valid_indices_os: List[int] = [i for i, v in enumerate(mask_os_flat) if v]
 valid_idx_od_t = torch.tensor(valid_indices_od, dtype=torch.long, device=device)
 valid_idx_os_t = torch.tensor(valid_indices_os, dtype=torch.long, device=device)
 
 # ===========================
-# Dataset classes
+# Datasets
 # ===========================
 class VFOnlyDataset(Dataset):
     def __init__(self, json_path):
@@ -64,9 +76,6 @@ class PairedDataset(Dataset):
         self.img_dir = img_dir
         self.transform = transforms.Compose([
             transforms.Resize(img_size),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(0.1,0.1,0.1,0.05),
-            transforms.RandomRotation(5),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
         ])
@@ -85,31 +94,22 @@ class PairedDataset(Dataset):
         return img, vf_values, laterality
 
 # ===========================
-# Residual decoder
+# Decoder
 # ===========================
-class ResidualDecoder(nn.Module):
+class Decoder52(nn.Module):
     def __init__(self, latent_dim=1024, out_dim=52, use_laterality=True):
         super().__init__()
         self.use_laterality = use_laterality
         input_dim = latent_dim + (1 if use_laterality else 0)
         self.net = nn.Sequential(
             nn.Linear(input_dim, 1024),
-            nn.LayerNorm(1024),
             nn.ReLU(),
             nn.Linear(1024, 1024),
-            nn.LayerNorm(1024),
             nn.ReLU(),
             nn.Linear(1024, 512),
-            nn.LayerNorm(512),
             nn.ReLU(),
             nn.Linear(512, out_dim)
         )
-
-        # Weight initialization
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight)
-                nn.init.zeros_(m.bias)
 
     def forward(self, latent, laterality=None):
         x = latent
@@ -129,106 +129,137 @@ def laterality_to_tensor(laterality_list):
                         dtype=torch.float32, device=device).unsqueeze(1)
 
 def normalize_vf(vf_tensor):
-    return vf_tensor.clamp(0,40)/40.0
+    return vf_tensor.clamp(0, 40) / 40.0
 
 def denormalize_vf(vf_tensor):
-    return vf_tensor*40.0
+    return vf_tensor * 40.0
+
+def masked_mae(pred, target, laterality_list):
+    masked_targets = []
+    masked_preds = []
+    for i, lat in enumerate(laterality_list):
+        idx = valid_indices_od if str(lat).upper().startswith('OD') else valid_indices_os
+        masked_targets.append(target[i, idx])
+        masked_preds.append(pred[i, :len(idx)])
+    masked_targets = torch.stack(masked_targets)
+    masked_preds = torch.stack(masked_preds)
+    mae = torch.mean(torch.abs(masked_preds - masked_targets))
+    return mae
 
 # ===========================
-# Precompute latents
+# Curriculum Learning Scheduler
 # ===========================
-def precompute_latents(encoder_model, paired_dataset):
+def smooth_vf(vf_tensor, factor=0.5):
+    """Smooth VF map for curriculum learning (coarse to fine)."""
+    return vf_tensor * factor + vf_tensor.mean(dim=1, keepdim=True) * (1 - factor)
+
+# ===========================
+# Training
+# ===========================
+def train_decoder(encoder_model, train_dataset, val_dataset,
+                  save_path='decoder.pt', latent_dim=1024,
+                  epochs=50, batch_size=8, lr=1e-4,
+                  early_stop_patience=5, curriculum=True):
+
+    decoder = Decoder52(latent_dim=latent_dim, out_dim=52, use_laterality=True).to(device)
+    optimizer = optim.Adam(decoder.parameters(), lr=lr)
+    loss_fn = nn.L1Loss(reduction='none')
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+
+    best_val_mae = float('inf')
+    no_improve_epochs = 0
+
     encoder_model.eval()
-    latents = []
-    vfs = []
-    lat_tensor_list = []
-
-    loader = DataLoader(paired_dataset, batch_size=16)
-    with torch.no_grad():
-        for img, vf72, laterality in loader:
-            img = img.to(device)
-            vf72 = normalize_vf(vf72.to(device))
-            lat = encoder_model(img)
-            latents.append(lat.cpu())
-            vfs.append(vf72.cpu())
-            lat_tensor_list.extend([1 if l.startswith('OD') else 0 for l in laterality])
-
-    latents = torch.cat(latents)
-    vfs = torch.cat(vfs)
-    laterality_tensor = torch.tensor(lat_tensor_list, dtype=torch.float32).unsqueeze(1)
-    return latents, vfs, laterality_tensor
-
-# ===========================
-# Train decoder on precomputed latents
-# ===========================
-def train_decoder_on_latents(latents, vfs, laterality_tensor, save_path='decoder.pt',
-                             latent_dim=1024, epochs=50, batch_size=32,
-                             lr=5e-5, patience=5, min_delta=1e-4):
-
-    decoder = ResidualDecoder(latent_dim=latent_dim, out_dim=52, use_laterality=True).to(device)
-    optimizer = optim.AdamW(decoder.parameters(), lr=lr, weight_decay=1e-5)
-    loss_fn = nn.SmoothL1Loss()  # hybrid loss possible
-
-    dataset = TensorDataset(latents, vfs, laterality_tensor)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    best_mae = float('inf')
-    epochs_no_improve = 0
+    decoder.train()
 
     for epoch in range(1, epochs+1):
-        decoder.train()
         total_loss = 0.0
         total_points = 0
 
-        for batch_lat, batch_vf, batch_lat_tensor in loader:
-            batch_lat = batch_lat.to(device)
-            batch_vf = batch_vf.to(device)
-            batch_lat_tensor = batch_lat_tensor.to(device)
+        for img, vf72, laterality in train_loader:
+            img = img.to(device)
+            vf72 = normalize_vf(vf72.to(device))
+            lat_tensor = laterality_to_tensor(laterality)
 
-            pred = decoder(batch_lat, laterality=batch_lat_tensor)
+            with torch.no_grad():
+                latent = encoder_model(img)
 
-            target_list = [batch_vf[i, valid_indices_od] if batch_lat_tensor[i]==1 else batch_vf[i, valid_indices_os]
-                           for i in range(len(batch_lat_tensor))]
-            target = torch.stack(target_list)
+            if curriculum:
+                vf72_curr = smooth_vf(vf72, factor=max(0.3, 1.0 - epoch/epochs))
+            else:
+                vf72_curr = vf72
 
-            loss = loss_fn(pred, target)
+            pred = decoder(latent, laterality=lat_tensor)
+
+            # Masked loss
+            masked_targets = []
+            masked_preds = []
+            for i, lat in enumerate(laterality):
+                idx = valid_indices_od if str(lat).upper().startswith('OD') else valid_indices_os
+                masked_targets.append(vf72_curr[i, idx])
+                masked_preds.append(pred[i, :len(idx)])
+            masked_targets = torch.stack(masked_targets)
+            masked_preds = torch.stack(masked_preds)
+
+            loss = torch.mean(torch.abs(masked_preds - masked_targets))
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
             optimizer.step()
 
-            total_loss += loss.item() * target.numel()
-            total_points += target.numel()
+            total_loss += loss.item() * masked_targets.numel()
+            total_points += masked_targets.numel()
 
-        avg_loss = total_loss / total_points
-        print(f"[Epoch {epoch}] Avg loss={avg_loss:.6f}")
+        avg_train_loss = total_loss / total_points
 
-        # Evaluate MAE per epoch
-        decoder.eval()
-        with torch.no_grad():
-            pred_all = decoder(latents.to(device), laterality=laterality_tensor.to(device))
-            target_list = [vfs[i, valid_indices_od] if laterality_tensor[i]==1 else vfs[i, valid_indices_os]
-                           for i in range(len(latents))]
-            target_all = torch.stack(target_list).to(device)
-            val_mae_norm = torch.mean(torch.abs(pred_all - target_all)).item()
-            val_mae_db = denormalize_vf(torch.tensor(val_mae_norm))
-            print(f"Validation MAE: {val_mae_db:.3f} dB")
-
-        # Early stopping
-        if best_mae - val_mae_db > min_delta:
-            best_mae = val_mae_db
-            epochs_no_improve = 0
+        # Validation
+        val_mae = evaluate_decoder(encoder_model, decoder, val_loader)
+        if val_mae < best_val_mae - 1e-3:
+            best_val_mae = val_mae
             torch.save(decoder.state_dict(), save_path)
-            print(f"New best model saved with MAE {best_mae:.3f} dB")
+            no_improve_epochs = 0
+            new_best_str = f"  New best model saved with MAE {best_val_mae:.3f} dB"
         else:
-            epochs_no_improve += 1
-            print(f"No significant improvement for {epochs_no_improve} epoch(s)")
-            if epochs_no_improve >= patience:
-                print(f"Early stopping at epoch {epoch}")
-                break
+            no_improve_epochs += 1
+            new_best_str = ""
 
-    decoder.load_state_dict(torch.load(save_path))
+        print(f"[Epoch {epoch}] Train loss={avg_train_loss:.4f}, Validation MAE={val_mae:.3f} dB{new_best_str}")
+
+        if no_improve_epochs >= early_stop_patience:
+            print(f"Stopping early after {no_improve_epochs} epochs with marginal improvement.")
+            break
+
     return decoder
+
+# ===========================
+# Evaluation
+# ===========================
+def evaluate_decoder(encoder_model, decoder_model, loader):
+    decoder_model.eval()
+    encoder_model.eval()
+    total_mae = 0.0
+    total_samples = 0
+
+    with torch.no_grad():
+        for img, vf72, laterality in loader:
+            img = img.to(device)
+            vf72 = normalize_vf(vf72.to(device))
+            lat_tensor = laterality_to_tensor(laterality)
+
+            latent = encoder_model(img)
+            pred = decoder_model(latent, laterality=lat_tensor)
+
+            batch_mae = masked_mae(pred, vf72, laterality)
+            total_mae += batch_mae.item() * len(laterality)
+            total_samples += len(laterality)
+
+    if total_samples == 0:
+        raise ValueError("No samples in evaluation loader!")
+
+    avg_mae = total_mae / total_samples
+    return avg_mae
 
 # ===========================
 # Main
@@ -237,17 +268,24 @@ if __name__ == '__main__':
     base_dir = "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data"
     fundus_dir = os.path.join(base_dir, 'fundus', 'grape_fundus_images')
 
-    grape_train = PairedDataset(os.path.join(base_dir, 'vf_tests', 'grape_train.json'), fundus_dir)
-    grape_test = PairedDataset(os.path.join(base_dir, 'vf_tests', 'grape_test.json'), fundus_dir)
-    uwhvf_train = VFOnlyDataset(os.path.join(base_dir, 'vf_tests', 'uwhvf_vf_tests_standardized.json'))
+    train_dataset = PairedDataset(os.path.join(base_dir, 'vf_tests', 'grape_train.json'), fundus_dir)
+    val_dataset = PairedDataset(os.path.join(base_dir, 'vf_tests', 'grape_test.json'), fundus_dir)
 
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
     from encoder.retfound_encoder import encoder as RetEncoder
     enc_model = RetEncoder.to(device)
 
-    print("Precomputing train latents...")
-    train_latents, train_vfs, train_laterality = precompute_latents(enc_model, grape_train)
+    # Sanity check encoder output
+    with torch.no_grad():
+        s_img, _, _ = train_dataset[0]
+        z = enc_model(s_img.unsqueeze(0).to(device))
+        print('Encoder latent shape:', z.shape)
 
-    decoder_model = train_decoder_on_latents(train_latents, train_vfs, train_laterality,
-                                             save_path=os.path.join(base_dir, 'decoder.pt'),
-                                             epochs=50, batch_size=32, lr=5e-5)
+    decoder_model = train_decoder(enc_model, train_dataset, val_dataset,
+                                  save_path=os.path.join(base_dir, 'decoder.pt'),
+                                  epochs=50, batch_size=8, lr=1e-4,
+                                  early_stop_patience=5,
+                                  curriculum=True)
+
+    final_mae = evaluate_decoder(enc_model, decoder_model, DataLoader(val_dataset, batch_size=8))
+    print(f"Final Test Set Average MAE: {final_mae:.3f} dB")
