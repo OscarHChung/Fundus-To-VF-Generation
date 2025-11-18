@@ -16,15 +16,31 @@ sys.path.insert(0, retfound_dir)
 from models_mae import mae_vit_large_patch16_dec512d8b
 
 checkpoint_path = os.path.join(current_dir, "RETFound_cfp_weights.pth")
+finetuned_path = os.path.join(current_dir, "best_encoder_finetuned.pth")
 
-# Safe loading for checkpoints containing argparse.Namespace
+# Load base model first
 with torch.serialization.safe_globals([argparse.Namespace]):
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
-# Instantiate base model
 base_model = mae_vit_large_patch16_dec512d8b()
 base_model.load_state_dict(checkpoint['model'], strict=False)
-base_model.eval()  # freeze by default
+
+# Load fine-tuned weights if available
+if os.path.exists(finetuned_path):
+    print(f"✓ Loading fine-tuned encoder from {finetuned_path}")
+    finetuned_checkpoint = torch.load(finetuned_path, map_location='cpu')
+    
+    # Load only the encoder state (not the prediction head)
+    if 'encoder_state' in finetuned_checkpoint:
+        base_model.load_state_dict(finetuned_checkpoint['encoder_state'], strict=False)
+        print(f"  Fine-tuned MAE: {finetuned_checkpoint['val_mae']:.3f} dB")
+        print(f"  Fine-tuned Corr: {finetuned_checkpoint['val_corr']:.3f}")
+    else:
+        print("  Warning: Could not find 'encoder_state' in checkpoint")
+else:
+    print(f"✓ Using base RETFound weights (fine-tuned checkpoint not found)")
+
+base_model.eval()  # Set to eval mode
 
 # =====================================================
 # 2. Encoder Wrapper
@@ -43,7 +59,7 @@ class RetFoundEncoderWrapper(nn.Module):
         """
         x = x.to(next(self.model.parameters()).device)
         with torch.no_grad():
-            latent = self.model.forward_encoder(x, mask_ratio=0.75)[0]  # [B, num_patches, latent_dim]
+            latent = self.model.forward_encoder(x, mask_ratio=0.0)[0]  # No masking for inference
             if latent.dim() == 3:
                 latent = latent[:, 0, :]  # take CLS token
         return latent
