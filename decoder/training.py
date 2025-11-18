@@ -38,7 +38,7 @@ BASE_DIR = os.path.join(CURRENT_DIR, "..")
 FUNDUS_DIR = os.path.join(BASE_DIR, "data", "fundus", "grape_fundus_images")
 TRAIN_JSON = os.path.join(BASE_DIR, "data", "vf_tests", "grape_train.json")
 VAL_JSON = os.path.join(BASE_DIR, "data", "vf_tests", "grape_test.json")
-BEST_SAVE = os.path.join(CURRENT_DIR, "best_fast_model.pth")
+BEST_SAVE = os.path.join(CURRENT_DIR, "best_decoder_with_pretraining.pth")
 
 # ============== Mask ==============
 mask_OD = np.array([
