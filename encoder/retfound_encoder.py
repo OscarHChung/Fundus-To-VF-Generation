@@ -28,15 +28,20 @@ base_model.load_state_dict(checkpoint['model'], strict=False)
 # Load fine-tuned weights if available
 if os.path.exists(finetuned_path):
     print(f"✓ Loading fine-tuned encoder from {finetuned_path}")
-    finetuned_checkpoint = torch.load(finetuned_path, map_location='cpu')
-    
-    # Load only the encoder state (not the prediction head)
-    if 'encoder_state' in finetuned_checkpoint:
-        base_model.load_state_dict(finetuned_checkpoint['encoder_state'], strict=False)
-        print(f"  Fine-tuned MAE: {finetuned_checkpoint['val_mae']:.3f} dB")
-        print(f"  Fine-tuned Corr: {finetuned_checkpoint['val_corr']:.3f}")
-    else:
-        print("  Warning: Could not find 'encoder_state' in checkpoint")
+    try:
+        # Try with weights_only=False for compatibility with numpy types
+        finetuned_checkpoint = torch.load(finetuned_path, map_location='cpu', weights_only=False)
+        
+        # Load only the encoder state (not the prediction head)
+        if 'encoder_state' in finetuned_checkpoint:
+            base_model.load_state_dict(finetuned_checkpoint['encoder_state'], strict=False)
+            print(f"  Fine-tuned MAE: {finetuned_checkpoint['val_mae']:.3f} dB")
+            print(f"  Fine-tuned Corr: {finetuned_checkpoint['val_corr']:.3f}")
+        else:
+            print("  Warning: Could not find 'encoder_state' in checkpoint")
+    except Exception as e:
+        print(f"  Warning: Could not load fine-tuned weights: {e}")
+        print("  Falling back to base RETFound weights")
 else:
     print(f"✓ Using base RETFound weights (fine-tuned checkpoint not found)")
 
