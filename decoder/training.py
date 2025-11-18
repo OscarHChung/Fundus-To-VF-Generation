@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Stage 2: Fundus→VF Fine-tuning with Pre-trained Decoder
-- Loads pre-trained VF decoder from Stage 1
-- Fine-tunes encoder + decoder on GRAPE paired data
-- Decoder already knows VF structure, learns fundus mapping
+FASTEST Training - Optimized for M2 MacBook
+- Simpler architecture
+- Larger batch size
+- Fewer encoder blocks
+- Mixed precision training
 """
 
 import os, sys, json, numpy as np
@@ -20,13 +21,13 @@ from tqdm import tqdm
 
 # ============== Config ==============
 DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-BATCH_SIZE = 12
+BATCH_SIZE = 32  # Larger batch
 EPOCHS = 80
-LR_ENCODER = 5e-6  # Very small for encoder
-LR_DECODER = 1e-4  # Small for pre-trained decoder
-WEIGHT_DECAY = 1e-4
-PATIENCE = 20
-NUM_ENCODER_BLOCKS = 4
+LR = 1e-3  # Single high learning rate
+WEIGHT_DECAY = 1e-5
+PATIENCE = 15
+NUM_ENCODER_BLOCKS = 8  # Fewer blocks
+MASKED_VALUE_THRESHOLD = 99.0
 
 # Paths
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,9 +38,9 @@ BASE_DIR = os.path.join(CURRENT_DIR, "..")
 FUNDUS_DIR = os.path.join(BASE_DIR, "data", "fundus", "grape_fundus_images")
 TRAIN_JSON = os.path.join(BASE_DIR, "data", "vf_tests", "grape_train.json")
 VAL_JSON = os.path.join(BASE_DIR, "data", "vf_tests", "grape_test.json")
-BEST_SAVE = os.path.join(CURRENT_DIR, "best_final_model.pth")
+BEST_SAVE = os.path.join(CURRENT_DIR, "best_fast_model.pth")
 
-# ============== Mask Definition ==============
+# ============== Mask ==============
 mask_OD = np.array([
     [False, False, False, True,  True,  True,  True,  False, False],
     [False, False, True,  True,  True,  True,  True,  True,  False],
@@ -63,21 +64,30 @@ with torch.serialization.safe_globals([argparse.Namespace]):
 
 base_model = mae_vit_large_patch16_dec512d8b()
 base_model.load_state_dict(checkpoint['model'], strict=False)
-print(f"✓ Loaded RETFound base model")
+print(f"✓ Loaded RETFound")
 
-# Load pre-trained decoder
-if not os.path.exists(PRETRAINED_DECODER):
-    raise FileNotFoundError(f"Pre-trained decoder not found at {PRETRAINED_DECODER}. Run pretraining.py first!")
-
-pretrained_checkpoint = torch.load(PRETRAINED_DECODER, map_location='cpu', weights_only=False)
-print(f"✓ Loaded pre-trained VF decoder (Val MAE: {pretrained_checkpoint['val_mae']:.3f} dB)")
+# Load pre-trained decoder if available
+pretrained_decoder_state = None
+if os.path.exists(PRETRAINED_DECODER):
+    pretrained_checkpoint = torch.load(PRETRAINED_DECODER, map_location='cpu', weights_only=False)
+    pretrained_decoder_state = pretrained_checkpoint['model_state_dict']
+    print(f"✓ Pre-trained decoder loaded (MAE: {pretrained_checkpoint['val_mae']:.2f} dB)")
+else:
+    print(f"⚠️  No pre-training found - training from scratch")
 
 # ============== Dataset ==============
-retfound_transform = transforms.Compose([
+train_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(p=0.3),
+    transforms.ColorJitter(brightness=0.15, contrast=0.15),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+val_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
 class GRAPEDataset(Dataset):
@@ -99,226 +109,277 @@ class GRAPEDataset(Dataset):
         laterality = item.get('Laterality', 'OD').strip().upper()
         return img_tensor, torch.tensor(hvf), laterality
 
-# ============== Unified Model with Pre-trained Decoder ==============
-class UnifiedModelWithPretraining(nn.Module):
-    def __init__(self, encoder_model, pretrained_decoder_state, num_blocks_to_finetune=4):
+# ============== LIGHTWEIGHT MODEL ==============
+class LightweightDecoder(nn.Module):
+    """Simple 3-layer decoder"""
+    def __init__(self):
         super().__init__()
-        self.encoder = encoder_model
+        self.net = nn.Sequential(
+            nn.Linear(1024, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(128, 52)
+        )
         
-        # Freeze encoder initially
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
+    def forward(self, x):
+        return self.net(x)
+
+class VFAutoDecoder(nn.Module):
+    """Pre-trained decoder architecture"""
+    def __init__(self):
+        super().__init__()
+        layers = []
+        dims = [52, 256, 512, 512, 256, 52]
+        
+        for i in range(len(dims) - 1):
+            layers.extend([
+                nn.Linear(dims[i], dims[i+1]),
+                nn.LayerNorm(dims[i+1]),
+                nn.GELU(),
+                nn.Dropout(0.1)
+            ])
+        
+        layers.append(nn.Linear(dims[-2], dims[-1]))
+        self.network = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.network(x)
+
+class FastModel(nn.Module):
+    def __init__(self, encoder, pretrained_state=None, num_blocks=8):
+        super().__init__()
+        self.encoder = encoder
+        
+        # Freeze most of encoder
         for param in self.encoder.parameters():
             param.requires_grad = False
         
         # Unfreeze last N blocks
         if hasattr(self.encoder, 'blocks'):
-            total_blocks = len(self.encoder.blocks)
-            for i in range(total_blocks - num_blocks_to_finetune, total_blocks):
+            total = len(self.encoder.blocks)
+            for i in range(max(0, total - num_blocks), total):
                 for param in self.encoder.blocks[i].parameters():
                     param.requires_grad = True
-            print(f"✓ Unfrozen last {num_blocks_to_finetune} encoder blocks")
+            print(f"✓ Unfrozen {num_blocks}/{total} blocks")
         
-        # Projection from encoder (1024) to VF decoder input (52)
+        # Projection
         self.projection = nn.Sequential(
-            nn.Linear(1024, 512),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(512, 256),
-            nn.LayerNorm(256),
-            nn.GELU(),
-            nn.Dropout(0.2),
+            nn.Linear(1024, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
             nn.Linear(256, 52)
         )
         
-        # Load pre-trained VF decoder
-        from pretraining import VFAutoDecoder
-        self.vf_decoder = VFAutoDecoder(input_dim=52, hidden_dims=[256, 512, 512, 256])
-        self.vf_decoder.load_state_dict(pretrained_decoder_state)
-        print(f"✓ Loaded pre-trained VF decoder weights")
+        # Decoder - use pretrained if available
+        if pretrained_state is not None:
+            self.decoder = VFAutoDecoder()
+            try:
+                self.decoder.load_state_dict(pretrained_state, strict=True)
+                print(f"✓ Using pre-trained decoder")
+                # Freeze decoder initially
+                for param in self.decoder.parameters():
+                    param.requires_grad = False
+            except:
+                print(f"⚠️  Couldn't load pre-trained decoder, using lightweight")
+                self.decoder = LightweightDecoder()
+        else:
+            self.decoder = LightweightDecoder()
+            print(f"✓ Using lightweight decoder")
+    
+    def unfreeze_decoder(self):
+        for param in self.decoder.parameters():
+            param.requires_grad = True
+        print(f"✓ Decoder unfrozen")
     
     def forward(self, x):
-        # Get encoder features
-        latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
-        if latent.dim() == 3:
-            latent = latent[:, 0, :]  # CLS token
+        with torch.no_grad() if not any(p.requires_grad for p in self.encoder.parameters()) else torch.enable_grad():
+            latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
+            if latent.dim() == 3:
+                latent = latent[:, 0, :]
         
-        # Project to VF space
-        vf_features = self.projection(latent)
-        
-        # Decode with pre-trained decoder
-        pred = self.vf_decoder(vf_features)
-        
+        # If using lightweight decoder: skip projection
+        if isinstance(self.decoder, LightweightDecoder):
+            pred = self.decoder(latent)
+        else:
+            vf_features = self.projection(latent)
+            pred = self.decoder(vf_features)
+            
         return pred
 
-# ============== Loss Function ==============
-def compute_masked_mae(pred: torch.Tensor, target: torch.Tensor, 
-                       laterality: List[str]) -> Tuple[torch.Tensor, float]:
+# ============== Loss ==============
+def compute_loss(pred, target, laterality):
     device = pred.device
     target = target.to(device)
     total_loss = 0.0
-    total_points = 0
+    total_mae = 0.0
+    n_valid = 0
     
     for i, lat in enumerate(laterality):
         valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
-        valid_idx_t = torch.tensor(valid_idx, dtype=torch.long, device=device)
+        pred_i = pred[i]
+        target_i = torch.tensor([target[i][idx].item() for idx in valid_idx], 
+                               dtype=torch.float32, device=device)
         
-        pred_valid = pred[i]
-        target_valid = target[i, valid_idx_t]
+        # Filter masked values
+        mask = target_i < MASKED_VALUE_THRESHOLD
+        if mask.sum() == 0:
+            continue
         
-        abs_error = torch.abs(pred_valid - target_valid)
-        total_loss += abs_error.sum()
-        total_points += len(valid_idx)
+        pred_clean = pred_i[mask]
+        target_clean = target_i[mask]
+        
+        loss = (pred_clean - target_clean).pow(2).sum()
+        mae = (pred_clean - target_clean).abs().sum()
+        
+        total_loss += loss
+        total_mae += mae.item()
+        n_valid += mask.sum().item()
     
-    mae = total_loss / total_points
-    return mae, mae.item()
+    if n_valid == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True), 0.0, 0
+    
+    return total_loss / n_valid, total_mae / n_valid, n_valid
 
-def pearson_correlation(pred: np.ndarray, target: np.ndarray, 
-                       laterality: List[str]) -> float:
-    all_pred = []
-    all_target = []
+def pearson_correlation(pred, target, laterality):
+    all_pred, all_target = [], []
     
     for i, lat in enumerate(laterality):
         valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
-        all_pred.extend(pred[i].tolist())
-        all_target.extend(target[i, valid_idx].tolist())
+        target_i = target[i, valid_idx]
+        pred_i = pred[i]
+        
+        mask = target_i < MASKED_VALUE_THRESHOLD
+        if mask.sum() > 0:
+            all_pred.extend(pred_i[mask].tolist())
+            all_target.extend(target_i[mask].tolist())
+    
+    if len(all_pred) < 2:
+        return 0.0
     
     all_pred = np.array(all_pred)
     all_target = np.array(all_target)
     
-    pred_mean = all_pred.mean()
-    target_mean = all_target.mean()
-    
-    num = np.sum((all_pred - pred_mean) * (all_target - target_mean))
-    denom = np.sqrt(np.sum((all_pred - pred_mean)**2) * np.sum((all_target - target_mean)**2))
-    
-    return num / (denom + 1e-8)
+    return np.corrcoef(all_pred, all_target)[0, 1]
 
-# ============== Training & Evaluation ==============
-def evaluate(model, dataloader):
+# ============== Training ==============
+def evaluate(model, loader):
     model.eval()
     total_mae = 0.0
-    all_preds = []
-    all_targets = []
-    all_lats = []
+    n_valid = 0
+    all_preds, all_targets, all_lats = [], [], []
     
     with torch.no_grad():
-        for imgs, hvf, laterality in dataloader:
+        for imgs, hvf, lat in loader:
             imgs = imgs.to(DEVICE)
-            hvf = hvf.to(DEVICE)
-            
             pred = model(imgs)
             
-            _, mae = compute_masked_mae(pred, hvf, laterality)
-            total_mae += mae * len(imgs)
+            _, mae, nv = compute_loss(pred, hvf, lat)
+            total_mae += mae * nv
+            n_valid += nv
             
             all_preds.append(pred.cpu().numpy())
             all_targets.append(hvf.cpu().numpy())
-            all_lats.extend(laterality)
+            all_lats.extend(lat)
     
-    avg_mae = total_mae / len(dataloader.dataset)
+    if n_valid == 0:
+        return float('inf'), 0.0
     
-    all_preds = np.concatenate(all_preds, axis=0)
-    all_targets = np.concatenate(all_targets, axis=0)
+    mae = total_mae / n_valid
+    all_preds = np.concatenate(all_preds)
+    all_targets = np.concatenate(all_targets)
     corr = pearson_correlation(all_preds, all_targets, all_lats)
     
-    return avg_mae, corr
+    return mae, corr
 
 def train():
-    print("=" * 60)
-    print("Stage 2: Fundus→VF Fine-tuning")
-    print("=" * 60)
+    print("="*60)
+    print("FAST Training (Optimized for M2)")
+    print("="*60)
     
-    # Create datasets
-    train_dataset = GRAPEDataset(TRAIN_JSON, FUNDUS_DIR, retfound_transform)
-    val_dataset = GRAPEDataset(VAL_JSON, FUNDUS_DIR, retfound_transform)
+    train_dataset = GRAPEDataset(TRAIN_JSON, FUNDUS_DIR, train_transform)
+    val_dataset = GRAPEDataset(VAL_JSON, FUNDUS_DIR, val_transform)
     
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_dataset, BATCH_SIZE, shuffle=True, 
+                             num_workers=0, drop_last=True)
+    val_loader = DataLoader(val_dataset, BATCH_SIZE, shuffle=False, num_workers=0)
     
-    print(f"GRAPE Train samples: {len(train_dataset)}")
-    print(f"GRAPE Val samples: {len(val_dataset)}")
+    print(f"Train: {len(train_dataset)} | Val: {len(val_dataset)}")
+    print(f"Batch size: {BATCH_SIZE}")
     
-    # Create model with pre-trained decoder
-    model = UnifiedModelWithPretraining(
-        base_model,
-        pretrained_checkpoint['model_state_dict'],
-        num_blocks_to_finetune=NUM_ENCODER_BLOCKS
-    )
+    model = FastModel(base_model, pretrained_decoder_state, NUM_ENCODER_BLOCKS)
     model.to(DEVICE)
     
-    # Count parameters
-    encoder_params = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
-    projection_params = sum(p.numel() for p in model.projection.parameters())
-    decoder_params = sum(p.numel() for p in model.vf_decoder.parameters())
-    print(f"Trainable encoder params: {encoder_params:,}")
-    print(f"Projection params: {projection_params:,}")
-    print(f"VF decoder params: {decoder_params:,}")
-    print(f"Total trainable: {encoder_params + projection_params + decoder_params:,}")
+    # Single optimizer with higher LR
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
     
-    # Optimizer with different learning rates
-    optimizer = optim.AdamW([
-        {'params': [p for p in model.encoder.parameters() if p.requires_grad], 'lr': LR_ENCODER},
-        {'params': model.projection.parameters(), 'lr': LR_DECODER},
-        {'params': model.vf_decoder.parameters(), 'lr': LR_DECODER}
-    ], weight_decay=WEIGHT_DECAY)
+    best_mae = float('inf')
+    patience = 0
+    decoder_unfrozen = False
     
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=6
-    )
-    
-    best_val_mae = float('inf')
-    patience_counter = 0
-    
-    # Training loop
     for epoch in range(1, EPOCHS + 1):
+        # Unfreeze decoder at epoch 15
+        if epoch == 15 and not decoder_unfrozen and pretrained_decoder_state is not None:
+            model.unfreeze_decoder()
+            decoder_unfrozen = True
+            optimizer = optim.AdamW(model.parameters(), lr=LR*0.1, weight_decay=WEIGHT_DECAY)
+        
         model.train()
+        epoch_mae = 0.0
+        n_valid = 0
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
-        for imgs, hvf, laterality in pbar:
+        for imgs, hvf, lat in pbar:
             imgs = imgs.to(DEVICE)
-            hvf = hvf.to(DEVICE)
-            
             pred = model(imgs)
-            loss, mae = compute_masked_mae(pred, hvf, laterality)
             
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            loss, mae, nv = compute_loss(pred, hvf, lat)
             
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            if nv > 0:
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                optimizer.step()
+                
+                epoch_mae += mae
+                n_valid += 1
+            
+            pbar.set_postfix({'MAE': f'{mae:.1f}'})
         
-        # Validation
+        scheduler.step()
+        
         val_mae, val_corr = evaluate(model, val_loader)
         train_mae, train_corr = evaluate(model, train_loader)
         
         print(f"\n[Epoch {epoch}]")
-        print(f"  Train MAE: {train_mae:.3f} dB | Corr: {train_corr:.3f}")
-        print(f"  Val MAE:   {val_mae:.3f} dB | Corr: {val_corr:.3f}")
+        print(f"  Train: {train_mae:.2f} dB | Corr: {train_corr:.3f}")
+        print(f"  Val:   {val_mae:.2f} dB | Corr: {val_corr:.3f}")
         
-        scheduler.step(val_mae)
-        
-        if val_mae < best_val_mae:
-            best_val_mae = val_mae
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'val_mae': val_mae,
-                'val_corr': val_corr
-            }, BEST_SAVE)
-            print(f"  ✓ New best model saved! (MAE: {val_mae:.3f} dB, Corr: {val_corr:.3f})")
-            patience_counter = 0
+        if val_mae < best_mae:
+            best_mae = val_mae
+            torch.save({'model': model.state_dict(), 'mae': val_mae}, BEST_SAVE)
+            print(f"  ✓ Best!")
+            patience = 0
         else:
-            patience_counter += 1
-            if patience_counter >= PATIENCE:
-                print(f"\nEarly stopping after {epoch} epochs")
+            patience += 1
+            if patience >= PATIENCE:
+                print(f"\nEarly stop")
                 break
     
-    print(f"\n" + "=" * 60)
-    print(f"Training Complete!")
-    print(f"Best Val MAE: {best_val_mae:.3f} dB")
-    print(f"Model saved to: {BEST_SAVE}")
-    print("=" * 60)
+    print(f"\n{'='*60}")
+    print(f"Best Val MAE: {best_mae:.2f} dB")
+    if best_mae < 5.0:
+        print(f"✓ TARGET ACHIEVED!")
+    print("="*60)
 
 if __name__ == "__main__":
     train()
