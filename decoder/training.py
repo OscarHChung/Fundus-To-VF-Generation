@@ -45,8 +45,8 @@ CHECKPOINT_PATH = os.path.join(CURRENT_DIR, "..", "encoder", "RETFound_cfp_weigh
 PRETRAINED_DECODER = os.path.join(CURRENT_DIR, "pretrained_vf_decoder.pth")
 BASE_DIR = os.path.join(CURRENT_DIR, "..")
 FUNDUS_DIR = os.path.join(BASE_DIR, "data", "fundus", "grape_fundus_images")
-TRAIN_JSON = os.path.join(BASE_DIR, "data", "vf_tests", "grape_new_train.json")  # Updated path
-VAL_JSON = os.path.join(BASE_DIR, "data", "vf_tests", "grape_new_test.json")  # Updated path
+TRAIN_JSON = os.path.join(BASE_DIR, "data", "vf_tests", "grape_train.json")
+VAL_JSON = os.path.join(BASE_DIR, "data", "vf_tests", "grape_test.json")
 BEST_SAVE = os.path.join(CURRENT_DIR, "best_multi_image_model.pth")
 INFERENCE_SAVE = os.path.join(CURRENT_DIR, "inference_model.pth")
 

@@ -1,11 +1,3 @@
-# SEPARATE ALL DATA INTO TRAINING AND TESTING
-#   GRAPE => Training + Testing
-#   UWHVF => Training + Testing
-# Method: shuffling indices/data randomly with fixed seed, then splitting
-# Note: GRAPE and UWHVF each have their own splits
-# UPDATE: Although it splits both datasets into training and testing, there is no use for UWHVF split
-#   datasets at the moment. We train on GRAPE (training) + UWHVF (all) and test on GRAPE (testing).
-
 import os
 import json
 import random
@@ -13,32 +5,19 @@ from torch.utils.data import Dataset
 
 
 # ===========================
-# Dataset Classes
+# GRAPE Dataset Class
 # ===========================
-class VFOnlyDataset(Dataset):
-    """UWHVF Dataset containing VF tests-only."""
-
-    def __init__(self, json_path):
-        with open(json_path, "r") as f:
-            data = json.load(f)
-        
-        # Store as list or dict
-        self.data = data if isinstance(data, list) else list(data.values())
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return self.data[idx]
-
-
-class PairedDataset(Dataset):
-    """GRAPE Dataset for paired fundus image + VF tests."""
+class GrapeDataset(Dataset):
+    """
+    GRAPE Dataset after expansion.
+    Each entry now has:
+        "FundusImage": [list of image filenames]
+    """
 
     def __init__(self, json_path, fundus_dir):
         with open(json_path, "r") as f:
             data = json.load(f)
-        
+
         # Store as list or dict
         self.data = data if isinstance(data, list) else list(data.values())
         self.fundus_dir = fundus_dir
@@ -51,20 +30,20 @@ class PairedDataset(Dataset):
 
 
 # ===========================
-# Splitting + Saving
+# Splitting helpers
 # ===========================
 def split_indices(n, test_ratio=0.2, seed=42):
-    """Returns train indices, test indices."""
+    """Returns (train_idx, test_idx)."""
     rng = random.Random(seed)
     idx = list(range(n))
     rng.shuffle(idx)
-    
+
     test_size = int(n * test_ratio)
-    return idx[test_size:], idx[:test_size]   # train, test
+    return idx[test_size:], idx[:test_size]
 
 
 def save_split(dataset, train_idx, test_idx, save_dir, prefix):
-    """Writes JSON files for training and testing splits."""
+    """Save train/test JSON files."""
     train_list = [dataset[i] for i in train_idx]
     test_list = [dataset[i] for i in test_idx]
 
@@ -81,38 +60,37 @@ def save_split(dataset, train_idx, test_idx, save_dir, prefix):
     print(f"Saved: {test_path} ({len(test_list)} samples)")
 
 
-def separate_datasets(uwhvf_path, grape_path, grape_fundus_dir, save_base):
-    """Loads, splits, saves, and returns dataset objects."""
+# ===========================
+# Main Pipeline
+# ===========================
+def split_grape_dataset(grape_json, grape_fundus_dir, save_base):
+    """
+    Loads updated GRAPE dataset (with list-of-images),
+    splits train/test, saves results.
+    """
+    grape_dataset = GrapeDataset(grape_json, grape_fundus_dir)
 
-    # --- Load ---
-    uwhvf_full = VFOnlyDataset(uwhvf_path)
-    grape_full = PairedDataset(grape_path, grape_fundus_dir)
+    train_idx, test_idx = split_indices(len(grape_dataset))
 
-    # --- Split ---
-    uwhvf_train_idx, uwhvf_test_idx = split_indices(len(uwhvf_full))
-    grape_train_idx, grape_test_idx = split_indices(len(grape_full))
-
-    # --- Save inside data/vf_tests/ ---
     save_dir = os.path.join(save_base, "vf_tests")
-    save_split(uwhvf_full, uwhvf_train_idx, uwhvf_test_idx, save_dir, "uwhvf")
-    save_split(grape_full, grape_train_idx, grape_test_idx, save_dir, "grape")
+    os.makedirs(save_dir, exist_ok=True)
 
-    return uwhvf_full, grape_full
+    save_split(grape_dataset, train_idx, test_idx, save_dir, "grape")
+
+    return grape_dataset
 
 
 # ===========================
-# Run Pipeline
+# Run
 # ===========================
 if __name__ == "__main__":
     base_dir = "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data"
 
-    uwhvf_json = os.path.join(base_dir, "vf_tests", "uwhvf_vf_tests_standardized.json")
     grape_json = os.path.join(base_dir, "vf_tests", "grape_new_vf_tests.json")
     grape_fundus_dir = os.path.join(base_dir, "fundus", "grape_fundus_images")
 
-    separate_datasets(
-        uwhvf_path=uwhvf_json,
-        grape_path=grape_json,
+    split_grape_dataset(
+        grape_json=grape_json,
         grape_fundus_dir=grape_fundus_dir,
         save_base=base_dir
     )
