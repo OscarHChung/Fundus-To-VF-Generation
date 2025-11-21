@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Complete Training Script for Multi-Image Dataset
+Complete Training Script for Multi-Image Dataset - FIXED
 Target: Sub-3 MAE
 
 Key improvements:
-1. Handles multiple fundus images per eye
-2. Uses all images during training (data augmentation)
-3. Averages predictions from multiple images during validation
-4. Optimized for larger effective dataset
+1. Handles multiple fundus images per eye (variable count)
+2. Custom collate function for batching
+3. Uses all images during training
+4. Averages predictions during validation
 """
 
 import os, sys, json, numpy as np
@@ -25,18 +25,14 @@ from tqdm import tqdm
 
 # ============== Config ==============
 DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-BATCH_SIZE = 32  # Can be larger now with more data
+BATCH_SIZE = 32
 EPOCHS = 200
 LR = 2e-3
 WEIGHT_DECAY = 1e-4
 PATIENCE = 40
 NUM_ENCODER_BLOCKS = 10
 MASKED_VALUE_THRESHOLD = 99.0
-DROPOUT_RATE = 0.35  # Less aggressive since we have more data
-
-# Multi-image strategy
-USE_MULTI_IMAGE_AVERAGE = True  # Average predictions from multiple images
-SAMPLE_STRATEGY = 'all'  # 'all' or 'random' - use all images or sample one per epoch
+DROPOUT_RATE = 0.35
 
 # Paths
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -49,9 +45,6 @@ TRAIN_JSON = os.path.join(BASE_DIR, "data", "vf_tests", "grape_train.json")
 VAL_JSON = os.path.join(BASE_DIR, "data", "vf_tests", "grape_test.json")
 BEST_SAVE = os.path.join(CURRENT_DIR, "best_multi_image_model.pth")
 INFERENCE_SAVE = os.path.join(CURRENT_DIR, "inference_model.pth")
-
-print(f"Using training data: {TRAIN_JSON}")
-print(f"Using validation data: {VAL_JSON}")
 
 # ============== Mask ==============
 mask_OD = np.array([
@@ -79,7 +72,6 @@ base_model = mae_vit_large_patch16_dec512d8b()
 base_model.load_state_dict(checkpoint['model'], strict=False)
 print(f"✓ Loaded RETFound")
 
-# Load pre-trained decoder
 pretrained_decoder_state = None
 if os.path.exists(PRETRAINED_DECODER):
     try:
@@ -107,14 +99,9 @@ val_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# ============== Multi-Image Dataset ==============
+# ============== Dataset ==============
 class MultiImageDataset(Dataset):
-    """
-    Dataset that handles multiple fundus images per eye
-    
-    For training: Returns one random image per eye per epoch
-    For validation: Can return all images for averaging
-    """
+    """Dataset that handles multiple fundus images per eye"""
     def __init__(self, json_path: str, fundus_dir: str, transform, mode='train'):
         with open(json_path, 'r') as f:
             self.data = json.load(f)
@@ -122,7 +109,7 @@ class MultiImageDataset(Dataset):
         self.transform = transform
         self.mode = mode
         
-        # Expand dataset - create one entry per image
+        # Expand dataset for training
         self.samples = []
         for item in self.data:
             images = item['FundusImage'] if isinstance(item['FundusImage'], list) else [item['FundusImage']]
@@ -130,33 +117,37 @@ class MultiImageDataset(Dataset):
             laterality = item.get('Laterality', 'OD').strip().upper()
             patient_id = item.get('PatientID', 0)
             
-            for img_path in images:
+            if self.mode == 'train':
+                # Training: create one sample per image
+                for img_path in images:
+                    self.samples.append({
+                        'image': img_path,
+                        'hvf': hvf,
+                        'laterality': laterality,
+                        'patient_id': patient_id
+                    })
+            else:
+                # Validation: keep all images together
                 self.samples.append({
-                    'image': img_path,
+                    'images': images,
                     'hvf': hvf,
                     'laterality': laterality,
-                    'patient_id': patient_id,
-                    'n_images': len(images)
+                    'patient_id': patient_id
                 })
         
-        print(f"  Loaded {len(self.data)} eyes with {len(self.samples)} total images")
-        
-        # Group by patient_id and laterality for validation averaging
-        self.grouped_samples = defaultdict(list)
-        for idx, sample in enumerate(self.samples):
-            key = (sample['patient_id'], sample['laterality'])
-            self.grouped_samples[key].append(idx)
+        if self.mode == 'train':
+            print(f"  Train: {len(self.data)} eyes → {len(self.samples)} images")
+        else:
+            print(f"  Val: {len(self.data)} eyes with {sum(len(s['images']) for s in self.samples)} images")
     
     def __len__(self):
-        if self.mode == 'train':
-            return len(self.samples)
-        else:
-            return len(self.grouped_samples)  # One entry per eye
+        return len(self.samples)
     
     def __getitem__(self, idx):
+        sample = self.samples[idx]
+        
         if self.mode == 'train':
             # Training: return single image
-            sample = self.samples[idx]
             img_path = os.path.join(self.fundus_dir, sample['image'])
             img = Image.open(img_path).convert('RGB')
             img_tensor = self.transform(img)
@@ -166,29 +157,29 @@ class MultiImageDataset(Dataset):
         
         else:
             # Validation: return all images for this eye
-            keys = list(self.grouped_samples.keys())
-            key = keys[idx]
-            indices = self.grouped_samples[key]
-            
             images = []
-            hvf = None
-            laterality = None
-            
-            for i in indices:
-                sample = self.samples[i]
-                img_path = os.path.join(self.fundus_dir, sample['image'])
-                img = Image.open(img_path).convert('RGB')
+            for img_path in sample['images']:
+                img_full_path = os.path.join(self.fundus_dir, img_path)
+                img = Image.open(img_full_path).convert('RGB')
                 img_tensor = self.transform(img)
                 images.append(img_tensor)
-                
-                if hvf is None:
-                    hvf = np.array(sample['hvf'], dtype=np.float32).flatten()
-                    laterality = sample['laterality']
             
-            # Stack images
-            images = torch.stack(images)  # [N, 3, 224, 224]
+            hvf = np.array(sample['hvf'], dtype=np.float32).flatten()
             
-            return images, torch.tensor(hvf), laterality
+            # Stack images: [N, 3, 224, 224]
+            images = torch.stack(images)
+            
+            return images, torch.tensor(hvf), sample['laterality']
+
+# Custom collate for validation (handles variable number of images)
+def val_collate_fn(batch):
+    """Custom collate that handles variable number of images per eye"""
+    # batch is a list of (images_tensor, hvf, laterality)
+    # images_tensor has shape [N_i, 3, 224, 224] where N_i varies
+    
+    # We can't batch variable-length sequences, so batch_size must be 1 for validation
+    # Or we process one at a time
+    return batch[0]  # Return single sample
 
 # ============== Model ==============
 class VFAutoDecoder(nn.Module):
@@ -214,11 +205,9 @@ class MultiImageModel(nn.Module):
         super().__init__()
         self.encoder = encoder
         
-        # Freeze encoder
         for param in self.encoder.parameters():
             param.requires_grad = False
         
-        # Unfreeze last N blocks
         if hasattr(self.encoder, 'blocks'):
             total = len(self.encoder.blocks)
             for i in range(max(0, total - num_blocks), total):
@@ -226,7 +215,6 @@ class MultiImageModel(nn.Module):
                     param.requires_grad = True
             print(f"✓ Unfrozen {num_blocks}/{total} encoder blocks")
         
-        # Projection
         self.projection = nn.Sequential(
             nn.Linear(1024, 512),
             nn.ReLU(inplace=True),
@@ -243,7 +231,6 @@ class MultiImageModel(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         
-        # Decoder
         self.use_pretrained = False
         if pretrained_state is not None:
             self.decoder = VFAutoDecoder()
@@ -266,17 +253,15 @@ class MultiImageModel(nn.Module):
             )
             print(f"✓ Simple decoder")
     
-    def forward(self, x):
+    def forward(self, x, average_multi=True):
         """
         Args:
-            x: Either [B, 3, 224, 224] for single images
-               or [B, N, 3, 224, 224] for multiple images per eye
+            x: [B, 3, 224, 224] for training
+               [N, 3, 224, 224] for validation (multiple images)
+            average_multi: If True, average predictions from multiple images
         """
-        if x.dim() == 5:
-            # Multiple images: [B, N, 3, 224, 224]
-            B, N = x.shape[0], x.shape[1]
-            x = x.view(B * N, *x.shape[2:])  # [B*N, 3, 224, 224]
-            
+        if x.dim() == 4:
+            # Standard case: [B or N, 3, 224, 224]
             latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
             if latent.dim() == 3:
                 latent = latent[:, 0, :]
@@ -284,26 +269,27 @@ class MultiImageModel(nn.Module):
             vf_features = self.projection(latent)
             pred = self.decoder(vf_features)
             
-            # Reshape and average
-            pred = pred.view(B, N, -1)  # [B, N, 52]
-            pred = pred.mean(dim=1)  # [B, 52]
+            # If multiple images and we want average
+            if average_multi and pred.shape[0] > 1:
+                pred = pred.mean(dim=0, keepdim=True)  # [1, 52]
             
             return pred
         else:
-            # Single image: [B, 3, 224, 224]
-            latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
-            if latent.dim() == 3:
-                latent = latent[:, 0, :]
-            
-            vf_features = self.projection(latent)
-            pred = self.decoder(vf_features)
-            
-            return pred
+            raise ValueError(f"Unexpected input shape: {x.shape}")
 
 # ============== Loss & Metrics ==============
 def compute_loss(pred, target, laterality):
     device = pred.device
     target = target.to(device)
+    
+    # Handle single sample case
+    if isinstance(laterality, str):
+        laterality = [laterality]
+    if pred.dim() == 1:
+        pred = pred.unsqueeze(0)
+    if target.dim() == 1:
+        target = target.unsqueeze(0)
+    
     total_loss = 0.0
     total_mae = 0.0
     n_valid = 0
@@ -333,6 +319,15 @@ def compute_loss(pred, target, laterality):
 
 def pearson_correlation(pred, target, laterality):
     all_pred, all_target = [], []
+    
+    # Handle single sample
+    if isinstance(laterality, str):
+        laterality = [laterality]
+    if pred.dim() == 1:
+        pred = pred.unsqueeze(0)
+    if target.dim() == 1:
+        target = target.unsqueeze(0)
+    
     for i, lat in enumerate(laterality):
         valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
         target_i = target[i, valid_idx]
@@ -352,9 +347,12 @@ def evaluate(model, loader):
     all_preds, all_targets, all_lats = [], [], []
     
     with torch.no_grad():
-        for imgs, hvf, lat in loader:
+        for sample in loader:
+            imgs, hvf, lat = sample
             imgs = imgs.to(DEVICE)
-            pred = model(imgs)
+            
+            # Forward with averaging
+            pred = model(imgs, average_multi=True)
             
             _, mae, nv = compute_loss(pred, hvf, lat)
             total_mae += mae * nv
@@ -362,7 +360,7 @@ def evaluate(model, loader):
             
             all_preds.append(pred.cpu().numpy())
             all_targets.append(hvf.cpu().numpy())
-            all_lats.extend(lat)
+            all_lats.append(lat)
     
     if n_valid == 0:
         return float('inf'), 0.0
@@ -370,7 +368,16 @@ def evaluate(model, loader):
     mae = total_mae / n_valid
     all_preds = np.concatenate(all_preds)
     all_targets = np.concatenate(all_targets)
-    corr = pearson_correlation(all_preds, all_targets, all_lats)
+    
+    # Flatten laterality list
+    flat_lats = []
+    for lat in all_lats:
+        if isinstance(lat, list):
+            flat_lats.extend(lat)
+        else:
+            flat_lats.append(lat)
+    
+    corr = pearson_correlation(torch.tensor(all_preds), torch.tensor(all_targets), flat_lats)
     
     return mae, corr
 
@@ -380,17 +387,16 @@ def train():
     print("Multi-Image Training for Sub-3 MAE")
     print("="*60)
     
-    # Load datasets
     train_dataset = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, train_transform, mode='train')
     val_dataset = MultiImageDataset(VAL_JSON, FUNDUS_DIR, val_transform, mode='val')
     
     train_loader = DataLoader(train_dataset, BATCH_SIZE, shuffle=True, 
                              num_workers=0, drop_last=True)
-    val_loader = DataLoader(val_dataset, BATCH_SIZE, shuffle=False, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, 
+                           num_workers=0, collate_fn=val_collate_fn)
     
-    print(f"Strategy: Use all images during training, average during validation")
+    print(f"Strategy: Train on all images, average predictions during validation")
     
-    # Create model
     model = MultiImageModel(base_model, pretrained_decoder_state, NUM_ENCODER_BLOCKS, DROPOUT_RATE)
     model.to(DEVICE)
     
@@ -399,14 +405,12 @@ def train():
     dec_params = sum(p.numel() for p in model.decoder.parameters())
     print(f"Trainable: Enc={enc_params:,}, Proj={proj_params:,}, Dec={dec_params:,}")
     
-    # Optimizer
     optimizer = optim.AdamW([
         {'params': [p for p in model.encoder.parameters() if p.requires_grad], 'lr': LR * 0.1},
         {'params': model.projection.parameters(), 'lr': LR},
         {'params': model.decoder.parameters(), 'lr': LR * 0.5}
     ], weight_decay=WEIGHT_DECAY)
     
-    # OneCycleLR for fast convergence
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=[LR * 0.1, LR, LR * 0.5],
@@ -424,7 +428,7 @@ def train():
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
         for imgs, hvf, lat in pbar:
             imgs = imgs.to(DEVICE)
-            pred = model(imgs)
+            pred = model(imgs, average_multi=False)
             
             loss, mae, nv = compute_loss(pred, hvf, lat)
             
@@ -441,13 +445,15 @@ def train():
         val_mae, val_corr = evaluate(model, val_loader)
         
         if epoch % 5 == 0:
-            train_mae, train_corr = evaluate(model, train_loader)
+            train_mae, _ = evaluate(model, DataLoader(
+                MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, val_transform, mode='val'),
+                batch_size=1, shuffle=False, collate_fn=val_collate_fn
+            ))
             print(f"\n[Epoch {epoch}]")
-            print(f"  Train: {train_mae:.2f} dB | Corr: {train_corr:.3f}")
+            print(f"  Train: {train_mae:.2f} dB")
             print(f"  Val:   {val_mae:.2f} dB | Corr: {val_corr:.3f}")
         
         if val_mae < best_mae:
-            improvement = best_mae - val_mae
             best_mae = val_mae
             
             torch.save({
@@ -466,7 +472,7 @@ def train():
             }, INFERENCE_SAVE)
             
             if epoch % 5 == 0:
-                print(f"  ✓ Best! Improved {improvement:.2f} dB")
+                print(f"  ✓ Best!")
             
             patience = 0
         else:
@@ -482,7 +488,7 @@ def train():
     if best_mae < 3.0:
         print(f"✓✓✓ SUB-3 MAE ACHIEVED!")
     elif best_mae < 3.5:
-        print(f"✓✓ Close to sub-3!")
+        print(f"✓✓ Close to sub-3 (gap: {best_mae - 3.0:.2f} dB)")
     elif best_mae < 4.0:
         print(f"✓ Sub-4 achieved")
     

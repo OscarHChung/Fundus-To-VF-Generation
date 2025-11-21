@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Stage 1: VF Auto-encoder Pre-training
+Stage 1: VF Auto-encoder Pre-training - ENHANCED
 - Train decoder to reconstruct VF from corrupted/masked VF
 - Uses 28,943 UWHVF samples (VF only, no images)
 - Learns VF spatial structure and relationships
 - Pre-trained decoder will be used in Stage 2
+- Enhanced with better architecture and training strategy
 """
 
 import os, json, numpy as np
@@ -19,11 +20,12 @@ from tqdm import tqdm
 # ============== Config ==============
 DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 BATCH_SIZE = 128  # Large batch since no images
-EPOCHS = 50
+EPOCHS = 100  # Increased epochs
 LR = 1e-3
 WEIGHT_DECAY = 1e-4
-PATIENCE = 10
-CORRUPTION_RATIO = 0.3  # Mask 30% of points
+PATIENCE = 15
+CORRUPTION_RATIO = 0.35  # Increased from 0.3
+MASKED_VALUE_THRESHOLD = 99.0
 
 # Paths
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -50,14 +52,39 @@ valid_indices_os: List[int] = list(reversed(valid_indices_od))
 
 # ============== Dataset ==============
 class VFDataset(Dataset):
-    """Dataset for VF auto-encoder training."""
-    def __init__(self, json_path: str, corruption_ratio: float = 0.3):
+    """Enhanced dataset for VF auto-encoder training with multiple corruption strategies."""
+    def __init__(self, json_path: str, corruption_ratio: float = 0.35):
         with open(json_path, 'r') as f:
             self.data = json.load(f)
         self.corruption_ratio = corruption_ratio
     
     def __len__(self):
         return len(self.data)
+    
+    def corrupt_vf(self, hvf_valid):
+        """Apply multiple corruption strategies"""
+        corrupted = hvf_valid.copy()
+        n_corrupt = int(len(corrupted) * self.corruption_ratio)
+        
+        # Strategy 1: Random masking (50% of corruptions)
+        n_random = n_corrupt // 2
+        random_indices = np.random.choice(len(corrupted), n_random, replace=False)
+        corrupted[random_indices] = 0.0
+        
+        # Strategy 2: Add noise (30% of corruptions)
+        n_noise = int(n_corrupt * 0.3)
+        noise_indices = np.random.choice(len(corrupted), n_noise, replace=False)
+        noise = np.random.randn(n_noise) * 3.0  # Gaussian noise
+        corrupted[noise_indices] = np.clip(corrupted[noise_indices] + noise, 0, 40)
+        
+        # Strategy 3: Regional dropout (20% of corruptions)
+        # Simulate loss of quadrants
+        if np.random.rand() < 0.2:
+            quadrant_size = len(corrupted) // 4
+            quadrant_start = np.random.randint(0, len(corrupted) - quadrant_size)
+            corrupted[quadrant_start:quadrant_start + quadrant_size] = 0.0
+        
+        return corrupted
     
     def __getitem__(self, idx):
         item = self.data[idx]
@@ -70,61 +97,112 @@ class VFDataset(Dataset):
         # Extract only valid values (52 points)
         hvf_valid = hvf[valid_idx]
         
-        # Create corrupted version by masking random points
-        corrupted = hvf_valid.copy()
-        n_corrupt = int(len(corrupted) * self.corruption_ratio)
-        corrupt_indices = np.random.choice(len(corrupted), n_corrupt, replace=False)
-        corrupted[corrupt_indices] = 0.0  # Mask with zeros
+        # Filter out already masked values
+        mask = hvf_valid < MASKED_VALUE_THRESHOLD
+        hvf_clean = hvf_valid.copy()
+        hvf_clean[~mask] = 0.0  # Set invalid values to 0
         
-        return torch.tensor(corrupted), torch.tensor(hvf_valid), laterality
+        # Create corrupted version
+        corrupted = self.corrupt_vf(hvf_clean)
+        
+        return torch.tensor(corrupted), torch.tensor(hvf_clean), laterality
 
-# ============== VF Decoder ==============
+# ============== Enhanced VF Decoder ==============
 class VFAutoDecoder(nn.Module):
-    """Auto-encoder decoder for VF reconstruction."""
-    def __init__(self, input_dim: int = 52, hidden_dims: List[int] = [256, 512, 512, 256]):
+    """Enhanced auto-encoder decoder with attention mechanism."""
+    def __init__(self, input_dim: int = 52):
         super().__init__()
         
-        layers = []
-        prev_dim = input_dim
+        # Encoder (compress)
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            
+            nn.Linear(256, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(0.1),
+        )
         
-        # Encoder part (compress)
-        for hidden_dim in hidden_dims[:len(hidden_dims)//2]:
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.GELU(),
-                nn.Dropout(0.1)
-            ])
-            prev_dim = hidden_dim
+        # Bottleneck with self-attention
+        self.attention = nn.MultiheadAttention(512, num_heads=8, dropout=0.1, batch_first=True)
+        self.norm1 = nn.LayerNorm(512)
         
-        # Decoder part (expand)
-        for hidden_dim in hidden_dims[len(hidden_dims)//2:]:
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.GELU(),
-                nn.Dropout(0.1)
-            ])
-            prev_dim = hidden_dim
+        # Decoder (expand)
+        self.decoder = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            
+            nn.Linear(256, input_dim)
+        )
         
-        # Output layer
-        layers.append(nn.Linear(prev_dim, input_dim))
-        
-        self.network = nn.Sequential(*layers)
+        # Residual connection weight
+        self.residual_weight = nn.Parameter(torch.tensor(0.1))
     
     def forward(self, x):
-        return self.network(x)
+        # Encoder
+        encoded = self.encoder(x)  # [B, 512]
+        
+        # Self-attention (treat each feature as a sequence element)
+        encoded_seq = encoded.unsqueeze(1)  # [B, 1, 512]
+        attn_out, _ = self.attention(encoded_seq, encoded_seq, encoded_seq)
+        attn_out = attn_out.squeeze(1)  # [B, 512]
+        encoded = self.norm1(encoded + attn_out)
+        
+        # Decoder
+        decoded = self.decoder(encoded)
+        
+        # Residual connection with input
+        output = decoded + self.residual_weight * x
+        
+        return output
 
-# ============== Loss Function ==============
-def compute_mae(pred: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, float]:
-    """Simple MAE loss."""
-    mae = torch.mean(torch.abs(pred - target))
+# ============== Loss Functions ==============
+def compute_mae(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None) -> Tuple[torch.Tensor, float]:
+    """MAE loss with optional masking."""
+    if mask is not None:
+        # Only compute loss on valid (non-masked) values
+        valid_pred = pred[mask]
+        valid_target = target[mask]
+        if valid_pred.numel() == 0:
+            return torch.tensor(0.0, device=pred.device, requires_grad=True), 0.0
+        mae = torch.mean(torch.abs(valid_pred - valid_target))
+    else:
+        mae = torch.mean(torch.abs(pred - target))
+    
     return mae, mae.item()
+
+def compute_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+    """MSE loss with optional masking."""
+    if mask is not None:
+        valid_pred = pred[mask]
+        valid_target = target[mask]
+        if valid_pred.numel() == 0:
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+        return torch.mean((valid_pred - valid_target) ** 2)
+    return torch.mean((pred - target) ** 2)
 
 def pearson_correlation(pred: np.ndarray, target: np.ndarray) -> float:
     """Compute Pearson correlation."""
     pred_flat = pred.flatten()
     target_flat = target.flatten()
+    
+    # Filter out zeros (masked values)
+    mask = (target_flat > 0) & (target_flat < MASKED_VALUE_THRESHOLD)
+    if mask.sum() < 2:
+        return 0.0
+    
+    pred_flat = pred_flat[mask]
+    target_flat = target_flat[mask]
     
     pred_mean = pred_flat.mean()
     target_mean = target_flat.mean()
@@ -139,6 +217,7 @@ def evaluate(model, dataloader):
     """Evaluate model on dataset."""
     model.eval()
     total_mae = 0.0
+    total_samples = 0
     all_preds = []
     all_targets = []
     
@@ -149,13 +228,20 @@ def evaluate(model, dataloader):
             
             pred = model(corrupted)
             
-            _, mae = compute_mae(pred, target)
-            total_mae += mae * len(corrupted)
+            # Create mask for valid values
+            mask = (target > 0) & (target < MASKED_VALUE_THRESHOLD)
+            
+            _, mae = compute_mae(pred, target, mask)
+            
+            # Weight by number of valid points
+            n_valid = mask.sum(dim=1).float()
+            total_mae += mae * corrupted.size(0)
+            total_samples += corrupted.size(0)
             
             all_preds.append(pred.cpu().numpy())
             all_targets.append(target.cpu().numpy())
     
-    avg_mae = total_mae / len(dataloader.dataset)
+    avg_mae = total_mae / total_samples if total_samples > 0 else float('inf')
     
     all_preds = np.concatenate(all_preds, axis=0)
     all_targets = np.concatenate(all_targets, axis=0)
@@ -166,7 +252,7 @@ def evaluate(model, dataloader):
 def train():
     """Main training loop."""
     print("=" * 60)
-    print("Stage 1: VF Auto-encoder Pre-training")
+    print("Stage 1: Enhanced VF Auto-encoder Pre-training")
     print("=" * 60)
     
     # Load datasets
@@ -186,17 +272,29 @@ def train():
     print(f"UWHVF Train samples: {len(train_dataset):,}")
     print(f"UWHVF Val samples: {len(val_dataset):,}")
     print(f"Corruption ratio: {CORRUPTION_RATIO * 100}%")
+    print(f"Strategies: Random masking, Gaussian noise, Regional dropout")
     
     # Create model
-    model = VFAutoDecoder(input_dim=52, hidden_dims=[256, 512, 512, 256])
+    model = VFAutoDecoder(input_dim=52)
     model.to(DEVICE)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    # Optimizer
+    # Optimizer with warmup
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=3
+    
+    # Cosine annealing with warmup
+    warmup_epochs = 5
+    scheduler_warmup = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.1, total_iters=warmup_epochs
+    )
+    scheduler_cosine = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=EPOCHS - warmup_epochs, eta_min=LR * 0.01
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer, 
+        schedulers=[scheduler_warmup, scheduler_cosine],
+        milestones=[warmup_epochs]
     )
     
     best_val_mae = float('inf')
@@ -206,6 +304,8 @@ def train():
     for epoch in range(1, EPOCHS + 1):
         model.train()
         epoch_loss = 0.0
+        epoch_mae = 0.0
+        n_batches = 0
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
         for corrupted, target, _ in pbar:
@@ -215,8 +315,13 @@ def train():
             # Forward pass
             pred = model(corrupted)
             
-            # Compute loss
-            loss, mae = compute_mae(pred, target)
+            # Create mask for valid values
+            mask = (target > 0) & (target < MASKED_VALUE_THRESHOLD)
+            
+            # Combined loss: MSE + MAE
+            mse_loss = compute_mse(pred, target, mask)
+            mae_loss, mae_val = compute_mae(pred, target, mask)
+            loss = 0.7 * mse_loss + 0.3 * mae_loss
             
             # Backward pass
             optimizer.zero_grad()
@@ -225,18 +330,26 @@ def train():
             optimizer.step()
             
             epoch_loss += loss.item()
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            epoch_mae += mae_val
+            n_batches += 1
+            
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'mae': f'{mae_val:.3f}'
+            })
+        
+        scheduler.step()
         
         # Validation
         val_mae, val_corr = evaluate(model, val_loader)
         train_mae, train_corr = evaluate(model, train_loader)
         
+        avg_epoch_mae = epoch_mae / n_batches if n_batches > 0 else 0
+        
         print(f"\n[Epoch {epoch}]")
         print(f"  Train MAE: {train_mae:.3f} dB | Corr: {train_corr:.3f}")
         print(f"  Val MAE:   {val_mae:.3f} dB | Corr: {val_corr:.3f}")
-        
-        # Learning rate scheduling
-        scheduler.step(val_mae)
+        print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
         
         # Save best model
         if val_mae < best_val_mae:
@@ -245,7 +358,8 @@ def train():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'val_mae': val_mae,
-                'val_corr': val_corr
+                'val_corr': val_corr,
+                'corruption_ratio': CORRUPTION_RATIO
             }, PRETRAINED_DECODER_SAVE)
             print(f"  ✓ New best model saved! (MAE: {val_mae:.3f} dB, Corr: {val_corr:.3f})")
             patience_counter = 0
