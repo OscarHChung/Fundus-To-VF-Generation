@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-Stage 1: VF Auto-encoder Pre-training - ENHANCED
+Stage 1: VF Auto-encoder Pre-training - MPS OPTIMIZED
 - Train decoder to reconstruct VF from corrupted/masked VF
 - Uses 28,943 UWHVF samples (VF only, no images)
-- Learns VF spatial structure and relationships
-- Pre-trained decoder will be used in Stage 2
-- Enhanced with better architecture and training strategy
+- MPS-friendly: no hangs, explicit operations
 """
 
 import os, json, numpy as np
@@ -18,13 +16,15 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 # ============== Config ==============
-DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-BATCH_SIZE = 128  # Large batch since no images
-EPOCHS = 100  # Increased epochs
+DEVICE = torch.device("cpu")
+print(f"Using device: CPU (for stability)")
+
+BATCH_SIZE = 256  # Larger batch on CPU
+EPOCHS = 80  # Fewer epochs since simpler architecture
 LR = 1e-3
 WEIGHT_DECAY = 1e-4
-PATIENCE = 15
-CORRUPTION_RATIO = 0.35  # Increased from 0.3
+PATIENCE = 12
+CORRUPTION_RATIO = 0.35
 MASKED_VALUE_THRESHOLD = 99.0
 
 # Paths
@@ -109,61 +109,39 @@ class VFDataset(Dataset):
 
 # ============== Enhanced VF Decoder ==============
 class VFAutoDecoder(nn.Module):
-    """Enhanced auto-encoder decoder with attention mechanism."""
+    """Simplified decoder without attention (MPS-friendly and matches training)"""
     def __init__(self, input_dim: int = 52):
         super().__init__()
         
-        # Encoder (compress)
-        self.encoder = nn.Sequential(
+        self.network = nn.Sequential(
             nn.Linear(input_dim, 256),
             nn.LayerNorm(256),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.15),
             
             nn.Linear(256, 512),
             nn.LayerNorm(512),
             nn.GELU(),
-            nn.Dropout(0.1),
-        )
-        
-        # Bottleneck with self-attention
-        self.attention = nn.MultiheadAttention(512, num_heads=8, dropout=0.1, batch_first=True)
-        self.norm1 = nn.LayerNorm(512)
-        
-        # Decoder (expand)
-        self.decoder = nn.Sequential(
+            nn.Dropout(0.15),
+            
             nn.Linear(512, 512),
             nn.LayerNorm(512),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.15),
             
             nn.Linear(512, 256),
             nn.LayerNorm(256),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.15),
             
             nn.Linear(256, input_dim)
         )
         
-        # Residual connection weight
         self.residual_weight = nn.Parameter(torch.tensor(0.1))
     
     def forward(self, x):
-        # Encoder
-        encoded = self.encoder(x)  # [B, 512]
-        
-        # Self-attention (treat each feature as a sequence element)
-        encoded_seq = encoded.unsqueeze(1)  # [B, 1, 512]
-        attn_out, _ = self.attention(encoded_seq, encoded_seq, encoded_seq)
-        attn_out = attn_out.squeeze(1)  # [B, 512]
-        encoded = self.norm1(encoded + attn_out)
-        
-        # Decoder
-        decoded = self.decoder(encoded)
-        
-        # Residual connection with input
-        output = decoded + self.residual_weight * x
-        
+        output = self.network(x)
+        output = output + self.residual_weight * x
         return output
 
 # ============== Loss Functions ==============
