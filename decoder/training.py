@@ -23,19 +23,28 @@ from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
 
-# ============== Config ==============
-DEVICE = torch.device("cpu")
-print(f"✓ Using CPU (stable)")
+# ============== MPS Configuration ==============
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
 
-BATCH_SIZE = 32
-EPOCHS = 300  # More epochs
-LR = 2e-3
-WEIGHT_DECAY = 3e-4  # Stronger regularization
-PATIENCE = 60  # More patience
-NUM_ENCODER_BLOCKS = 10  # Fewer blocks to reduce overfitting
+# ============== Config ==============
+if torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+    print(f"✓ Using MPS (Apple Silicon GPU)")
+else:
+    DEVICE = torch.device("cpu")
+    print(f"⚠️  MPS not available, using CPU")
+
+BATCH_SIZE = 16  # Much smaller - forces more updates
+EPOCHS = 400  # Even more epochs
+LR = 1.5e-3  # Slightly lower
+WEIGHT_DECAY = 5e-4  # Much stronger regularization
+PATIENCE = 80  # More patience
+NUM_ENCODER_BLOCKS = 6  # MUCH fewer blocks - critical for small dataset
 MASKED_VALUE_THRESHOLD = 99.0
-DROPOUT_RATE = 0.4  # Higher dropout
+DROPOUT_RATE = 0.5  # Very high dropout
 USE_TTA = True  # Test-Time Augmentation
+NUM_TTA_AUGS = 4  # More TTA augmentations
 
 # Paths
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -103,16 +112,30 @@ val_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# TTA transforms (for validation)
-tta_transforms = [
-    val_transform,  # Original
-    transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.functional.hflip,
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ]),
-]
+# TTA transforms (for validation) - MORE AUGMENTATIONS
+def get_tta_transforms():
+    """Create 4 different augmented views"""
+    return [
+        val_transform,  # Original
+        transforms.Compose([  # Horizontal flip
+            transforms.Resize((224, 224)),
+            transforms.Lambda(lambda img: transforms.functional.hflip(img)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]),
+        transforms.Compose([  # Brightness +10%
+            transforms.Resize((224, 224)),
+            transforms.ColorJitter(brightness=0.1),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]),
+        transforms.Compose([  # Brightness -10%
+            transforms.Resize((224, 224)),
+            transforms.ColorJitter(brightness=-0.1),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]),
+    ]
 
 # ============== Dataset ==============
 class MultiImageDataset(Dataset):
@@ -152,7 +175,7 @@ class MultiImageDataset(Dataset):
         else:
             print(f"  Val: {len(self.data)} eyes with {sum(len(s['images']) for s in self.samples)} images")
             if use_tta:
-                print(f"  TTA: Enabled (2x augmentations per image)")
+                print(f"  TTA: Enabled ({NUM_TTA_AUGS}x augmentations per image)")
     
     def __len__(self):
         return len(self.samples)
@@ -170,17 +193,17 @@ class MultiImageDataset(Dataset):
         
         else:
             all_augmented_images = []
+            tta_transforms_list = get_tta_transforms()
             
             for img_path in sample['images']:
                 img_full_path = os.path.join(self.fundus_dir, img_path)
                 img = Image.open(img_full_path).convert('RGB')
                 
                 if self.use_tta:
-                    # Apply TTA: original + horizontal flip
-                    img_orig = val_transform(img)
-                    img_flip = transforms.functional.hflip(img)
-                    img_flip = val_transform(img_flip)
-                    all_augmented_images.extend([img_orig, img_flip])
+                    # Apply all TTA transforms
+                    for tta_transform in tta_transforms_list:
+                        img_aug = tta_transform(img)
+                        all_augmented_images.append(img_aug)
                 else:
                     img_tensor = self.transform(img)
                     all_augmented_images.append(img_tensor)
@@ -397,7 +420,7 @@ def evaluate(model, loader):
 # ============== Training ==============
 def train():
     print("="*60)
-    print("TTA + Ensemble Training for Sub-3 MAE")
+    print("EXTREME Anti-Overfitting + TTA for Sub-3 MAE")
     print("="*60)
     
     train_dataset = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, train_transform, mode='train', use_tta=False)
@@ -408,7 +431,7 @@ def train():
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, 
                            num_workers=0, collate_fn=val_collate_fn)
     
-    print(f"Strategy: Heavy regularization + TTA during validation")
+    print(f"Strategy: EXTREME regularization + 4x TTA + Small capacity")
     
     model = MultiImageModel(base_model, pretrained_decoder_state, NUM_ENCODER_BLOCKS, DROPOUT_RATE)
     model.to(DEVICE)
@@ -419,20 +442,20 @@ def train():
     print(f"Trainable: Enc={enc_params:,}, Proj={proj_params:,}, Dec={dec_params:,}")
     
     optimizer = optim.AdamW([
-        {'params': [p for p in model.encoder.parameters() if p.requires_grad], 'lr': LR * 0.05, 'weight_decay': WEIGHT_DECAY * 3},
-        {'params': model.projection.parameters(), 'lr': LR, 'weight_decay': WEIGHT_DECAY},
-        {'params': model.decoder.parameters(), 'lr': LR * 0.15 if model.use_pretrained else LR * 0.3, 'weight_decay': WEIGHT_DECAY * 0.5}
+        {'params': [p for p in model.encoder.parameters() if p.requires_grad], 'lr': LR * 0.03, 'weight_decay': WEIGHT_DECAY * 5},  # Very low LR, very high WD
+        {'params': model.projection.parameters(), 'lr': LR, 'weight_decay': WEIGHT_DECAY * 2},
+        {'params': model.decoder.parameters(), 'lr': LR * 0.1 if model.use_pretrained else LR * 0.2, 'weight_decay': WEIGHT_DECAY}
     ])
     
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=[LR * 0.05, LR, LR * 0.15 if model.use_pretrained else LR * 0.3],
+        max_lr=[LR * 0.03, LR, LR * 0.1 if model.use_pretrained else LR * 0.2],
         epochs=EPOCHS,
         steps_per_epoch=len(train_loader),
-        pct_start=0.15,
+        pct_start=0.2,  # Longer warmup
         anneal_strategy='cos',
-        div_factor=25,
-        final_div_factor=1000
+        div_factor=30,
+        final_div_factor=2000  # Very aggressive decay
     )
     
     best_mae = float('inf')
@@ -451,7 +474,7 @@ def train():
             if nv > 0:
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.5)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Tighter clipping
                 optimizer.step()
                 scheduler.step()
             

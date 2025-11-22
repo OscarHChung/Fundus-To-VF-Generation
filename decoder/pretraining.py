@@ -16,8 +16,16 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 # ============== Config ==============
-DEVICE = torch.device("cpu")
-print(f"Using device: CPU (for stability)")
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
+
+# ============== Config ==============
+if torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+    print(f"✓ Using MPS (Apple Silicon GPU)")
+else:
+    DEVICE = torch.device("cpu")
+    print(f"⚠️  MPS not available, using CPU")
 
 BATCH_SIZE = 256  # Larger batch on CPU
 EPOCHS = 80  # Fewer epochs since simpler architecture
