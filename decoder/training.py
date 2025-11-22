@@ -27,24 +27,24 @@ from tqdm import tqdm
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
 
-# ============== Config ==============
+# Force MPS
 if torch.backends.mps.is_available():
     DEVICE = torch.device("mps")
     print(f"✓ Using MPS (Apple Silicon GPU)")
 else:
     DEVICE = torch.device("cpu")
-    print(f"⚠️  MPS not available, using CPU")
+    print(f"⚠️  MPS not available, falling back to CPU")
 
-BATCH_SIZE = 16  # Much smaller - forces more updates
-EPOCHS = 400  # Even more epochs
-LR = 1.5e-3  # Slightly lower
-WEIGHT_DECAY = 5e-4  # Much stronger regularization
-PATIENCE = 80  # More patience
-NUM_ENCODER_BLOCKS = 6  # MUCH fewer blocks - critical for small dataset
+BATCH_SIZE = 32  # Larger batch = faster on MPS
+EPOCHS = 250
+LR = 2e-3
+WEIGHT_DECAY = 2e-4  # Moderate regularization
+PATIENCE = 50
+NUM_ENCODER_BLOCKS = 8  # Sweet spot for this dataset size
 MASKED_VALUE_THRESHOLD = 99.0
-DROPOUT_RATE = 0.5  # Very high dropout
+DROPOUT_RATE = 0.35  # Moderate dropout
 USE_TTA = True  # Test-Time Augmentation
-NUM_TTA_AUGS = 4  # More TTA augmentations
+NUM_TTA_AUGS = 4
 
 # Paths
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -123,15 +123,15 @@ def get_tta_transforms():
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ]),
-        transforms.Compose([  # Brightness +10%
+        transforms.Compose([  # Slight rotation
             transforms.Resize((224, 224)),
-            transforms.ColorJitter(brightness=0.1),
+            transforms.RandomRotation(5),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ]),
-        transforms.Compose([  # Brightness -10%
+        transforms.Compose([  # Color jitter
             transforms.Resize((224, 224)),
-            transforms.ColorJitter(brightness=-0.1),
+            transforms.ColorJitter(brightness=0.15, contrast=0.15),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ]),
@@ -420,7 +420,7 @@ def evaluate(model, loader):
 # ============== Training ==============
 def train():
     print("="*60)
-    print("EXTREME Anti-Overfitting + TTA for Sub-3 MAE")
+    print("Balanced TTA Training for Sub-3 MAE")
     print("="*60)
     
     train_dataset = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, train_transform, mode='train', use_tta=False)
@@ -442,20 +442,20 @@ def train():
     print(f"Trainable: Enc={enc_params:,}, Proj={proj_params:,}, Dec={dec_params:,}")
     
     optimizer = optim.AdamW([
-        {'params': [p for p in model.encoder.parameters() if p.requires_grad], 'lr': LR * 0.03, 'weight_decay': WEIGHT_DECAY * 5},  # Very low LR, very high WD
-        {'params': model.projection.parameters(), 'lr': LR, 'weight_decay': WEIGHT_DECAY * 2},
-        {'params': model.decoder.parameters(), 'lr': LR * 0.1 if model.use_pretrained else LR * 0.2, 'weight_decay': WEIGHT_DECAY}
+        {'params': [p for p in model.encoder.parameters() if p.requires_grad], 'lr': LR * 0.08, 'weight_decay': WEIGHT_DECAY * 2},
+        {'params': model.projection.parameters(), 'lr': LR, 'weight_decay': WEIGHT_DECAY},
+        {'params': model.decoder.parameters(), 'lr': LR * 0.2 if model.use_pretrained else LR * 0.3, 'weight_decay': WEIGHT_DECAY * 0.5}
     ])
     
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=[LR * 0.03, LR, LR * 0.1 if model.use_pretrained else LR * 0.2],
+        max_lr=[LR * 0.08, LR, LR * 0.2 if model.use_pretrained else LR * 0.3],
         epochs=EPOCHS,
         steps_per_epoch=len(train_loader),
-        pct_start=0.2,  # Longer warmup
+        pct_start=0.12,
         anneal_strategy='cos',
-        div_factor=30,
-        final_div_factor=2000  # Very aggressive decay
+        div_factor=20,
+        final_div_factor=500
     )
     
     best_mae = float('inf')
@@ -474,7 +474,7 @@ def train():
             if nv > 0:
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Tighter clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
                 optimizer.step()
                 scheduler.step()
             
