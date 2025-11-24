@@ -46,11 +46,11 @@ BATCH_SIZE = 24  # Smaller for gradient accumulation
 ACCUM_STEPS = 2  # Effective batch size = 48
 EPOCHS = 300
 LR = 2.5e-3
-WEIGHT_DECAY = 1.5e-4
+WEIGHT_DECAY = 3e-4
 PATIENCE = 70
-NUM_ENCODER_BLOCKS = 10  # Back to 10
+NUM_ENCODER_BLOCKS = 6
 MASKED_VALUE_THRESHOLD = 99.0
-DROPOUT_RATE = 0.3
+DROPOUT_RATE = 0.45
 USE_TTA = True
 NUM_TTA_AUGS = 8  # Much more TTA
 USE_SWA = True  # Stochastic Weight Averaging
@@ -59,7 +59,7 @@ LABEL_SMOOTH = 0.1  # Regression label smoothing
 USE_OUTLIER_CLIPPING = True  # Clip extreme predictions
 OUTLIER_CLIP_RANGE = (0, 35)  # Clip predictions to valid VF range
 USE_ROBUST_LOSS = True  # Use Huber loss (less sensitive to outliers)
-USE_MIXUP = True  # Mixup on last 50% of training
+USE_MIXUP = False 
 MIXUP_ALPHA = 0.2
 
 # Paths
