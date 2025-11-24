@@ -132,14 +132,12 @@ class RandAugment:
 
 train_transform = transforms.Compose([
     transforms.Resize((224, 224)),
-    RandAugment(),  # Strong augmentation
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomRotation(20),
-    transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-    transforms.RandomGrayscale(p=0.15),
+    transforms.RandomHorizontalFlip(p=0.3),  # Reduced from 0.5
+    transforms.RandomRotation(10),  # Reduced from 20
+    transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),  # Reduced
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    transforms.RandomErasing(p=0.2, scale=(0.02, 0.1))  # Cutout
+    # Remove RandomErasing and RandAugment for now
 ])
 
 val_transform = transforms.Compose([
@@ -296,12 +294,15 @@ class VFAutoDecoder(nn.Module):
             nn.GELU(),
             nn.Dropout(0.2),
             
-            nn.Linear(512, 256),
-            nn.LayerNorm(256),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            
             nn.Linear(256, input_dim)
+        )
+        
+        # Add zero-prediction gate
+        self.zero_gate = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, input_dim),
+            nn.Sigmoid()  # 0-1 probability of being "detectable"
         )
         
         self.residual_weight = nn.Parameter(torch.tensor(0.1))
@@ -309,6 +310,11 @@ class VFAutoDecoder(nn.Module):
     def forward(self, x):
         output = self.network(x)
         output = output + self.residual_weight * x
+        
+        # Apply zero gate
+        detectability = self.zero_gate(x)
+        output = output * detectability  # Zeros out predictions for undetectable locations
+        
         return output
 
 class MultiImageModel(nn.Module):
@@ -367,7 +373,22 @@ class MultiImageModel(nn.Module):
             vf_features = self.projection(latent)
             pred = self.decoder(vf_features)
             
-            # Clip predictions to valid VF range to reduce outliers
+            # Post-process predictions
+            def post_process_predictions(pred, threshold=1.5):
+                """
+                Apply domain-specific post-processing to predictions.
+                - Clip very low predictions to 0 (undetectable)
+                - Round predictions to nearest 0.5 dB (closer to real VF granularity)
+                """
+                # Clip predictions below threshold to 0
+                pred = torch.where(pred < threshold, torch.zeros_like(pred), pred)
+                
+                # Optional: Round to nearest 0.5 dB to match VF test precision
+                # pred = torch.round(pred * 2) / 2
+                
+                return pred
+            pred = post_process_predictions(pred, threshold=1.5)
+            
             if USE_OUTLIER_CLIPPING:
                 pred = torch.clamp(pred, OUTLIER_CLIP_RANGE[0], OUTLIER_CLIP_RANGE[1])
             
@@ -411,27 +432,44 @@ def compute_loss(pred, target, laterality, smooth=0.0):
         pred_clean = pred[i][mask]
         target_clean = target_valid[mask]
 
-        # ======== ADDED BLOCK (PERIPHERAL WEIGHTING) ========
-        peripheral_locs = [4, 10, 34, 42, 48, 49]
+        # ======== FIXED PERIPHERAL WEIGHTING ========
+        worst_locs = [27, 0, 36, 51, 42, 48, 4, 10, 49, 34]  # From your error analysis
         weights = torch.ones_like(pred_clean)
-        for idx, loc_idx in enumerate(mask.nonzero(as_tuple=False).squeeze()):
-            if loc_idx in peripheral_locs:
-                weights[idx] = 0.7  # Less weight on problematic peripheral vision
-        # ====================================================
 
-        # Label smoothing for regression
-        if smooth > 0:
-            mean_val = target_clean.mean()
-            target_clean = (1 - smooth) * target_clean + smooth * mean_val
+        masked_positions = mask.nonzero(as_tuple=False).squeeze()
+        if masked_positions.dim() == 0:
+            masked_positions = masked_positions.unsqueeze(0)
+
+        for idx, pos in enumerate(masked_positions):
+            actual_location = valid_idx[pos.item()]
+            if actual_location in worst_locs:
+                weights[idx] = 1.5  # 50% more weight on problematic locations
+        # ================================================
+
+        def zero_inflated_loss(pred, target, zero_weight=2.0):
+            """
+            Loss that gives extra weight to correctly predicting zero values.
+            """
+            # Standard loss
+            base_loss = F.huber_loss(pred, target, reduction='none', delta=2.0)
+            
+            # Extra penalty for missing zeros
+            zero_mask = (target == 0.0)
+            zero_penalty = zero_mask.float() * (pred.abs() * zero_weight)
+            
+            # Combine
+            total_loss = base_loss + zero_penalty
+            
+            return total_loss
         
-        # Use Huber loss (robust to outliers) or Smooth L1
+        # Apply weights to loss
         if USE_ROBUST_LOSS:
-            # Huber loss with delta=2.0 (less sensitive to large errors)
-            loss = F.huber_loss(pred_clean, target_clean, reduction='sum', delta=2.0)
+            loss = zero_inflated_loss(pred_clean, target_clean, zero_weight=1.5).sum()
         else:
-            loss = F.smooth_l1_loss(pred_clean, target_clean, reduction='sum', beta=1.0)
-        
-        mae = (pred_clean - target_clean).abs().sum()
+            loss = F.smooth_l1_loss(pred_clean, target_clean, reduction='none', beta=1.0)
+            loss = (loss * weights).sum()
+
+        mae = ((pred_clean - target_clean).abs() * weights).sum()
         
         total_loss += loss
         total_mae += mae.item()
@@ -879,9 +917,12 @@ def train():
     print(f"Trainable: Enc={enc_params:,}, Proj={proj_params:,}, Dec={dec_params:,}")
     
     optimizer = optim.AdamW([
-        {'params': [p for p in model.encoder.parameters() if p.requires_grad], 'lr': LR * 0.06, 'weight_decay': WEIGHT_DECAY * 2},
-        {'params': model.projection.parameters(), 'lr': LR, 'weight_decay': WEIGHT_DECAY},
-        {'params': model.decoder.parameters(), 'lr': LR * 0.2 if model.use_pretrained else LR * 0.35, 'weight_decay': WEIGHT_DECAY * 0.5}
+        {'params': [p for p in model.encoder.parameters() if p.requires_grad], 
+        'lr': LR * 0.03, 'weight_decay': WEIGHT_DECAY * 2},  # Reduced from 0.06
+        {'params': model.projection.parameters(), 
+        'lr': LR * 0.5, 'weight_decay': WEIGHT_DECAY},  # Reduced from 1.0
+        {'params': model.decoder.parameters(), 
+        'lr': LR * 0.1, 'weight_decay': WEIGHT_DECAY * 0.5}  # Reduced
     ])
     
     # Cosine annealing with warm restarts
