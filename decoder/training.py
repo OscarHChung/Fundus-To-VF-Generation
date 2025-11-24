@@ -410,7 +410,15 @@ def compute_loss(pred, target, laterality, smooth=0.0):
         
         pred_clean = pred[i][mask]
         target_clean = target_valid[mask]
-        
+
+        # ======== ADDED BLOCK (PERIPHERAL WEIGHTING) ========
+        peripheral_locs = [4, 10, 34, 42, 48, 49]
+        weights = torch.ones_like(pred_clean)
+        for idx, loc_idx in enumerate(mask.nonzero(as_tuple=False).squeeze()):
+            if loc_idx in peripheral_locs:
+                weights[idx] = 0.7  # Less weight on problematic peripheral vision
+        # ====================================================
+
         # Label smoothing for regression
         if smooth > 0:
             mean_val = target_clean.mean()
