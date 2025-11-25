@@ -398,7 +398,7 @@ def mixup_criterion(pred, y_a, y_b, lam, laterality_a, laterality_b):
     return lam * loss_a + (1 - lam) * loss_b, lam * mae_a + (1 - lam) * mae_b, max(nv_a, nv_b)
 
 # ============== Loss & Metrics ==============
-def compute_loss(pred, target, laterality, smooth=0.0):
+def compute_loss(pred, target, laterality, smooth=0.0, epoch=0):
     device = pred.device
     target = target.to(device)
     
@@ -424,10 +424,21 @@ def compute_loss(pred, target, laterality, smooth=0.0):
         pred_clean = pred[i][mask]
         target_clean = target_valid[mask]
 
-        # ======== LOCATION WEIGHTING ========
-        worst_locs = [27, 0, 36, 51, 42, 48, 4, 10, 49, 34]
-        weights = torch.ones_like(pred_clean)
+        # ======== ADAPTIVE LOCATION WEIGHTING ========
+        # Phase 1: Focus on historically worst locations
+        if epoch <= 30:
+            worst_locs = [18, 20, 26, 34, 42, 48]  # Current worst from epoch 10
+            weight_multiplier = 1.3  # Moderate weight
+        # Phase 2: Uniform weighting for balance
+        elif epoch <= 80:
+            worst_locs = []
+            weight_multiplier = 1.0
+        # Phase 3: Focus on peripheral locations
+        else:
+            worst_locs = [0, 4, 10, 34, 42, 48, 49, 51]
+            weight_multiplier = 1.2
         
+        weights = torch.ones_like(pred_clean)
         masked_positions = mask.nonzero(as_tuple=False).squeeze()
         if masked_positions.dim() == 0:
             masked_positions = masked_positions.unsqueeze(0)
@@ -435,29 +446,29 @@ def compute_loss(pred, target, laterality, smooth=0.0):
         for idx, pos in enumerate(masked_positions):
             actual_location = valid_idx[pos.item()]
             if actual_location in worst_locs:
-                weights[idx] = 1.5  # 50% more weight
-        # ====================================
+                weights[idx] = weight_multiplier
+        # =============================================
 
         # Label smoothing
         if smooth > 0:
             mean_val = target_clean.mean()
             target_clean = (1 - smooth) * target_clean + smooth * mean_val
         
-        # ======== ZERO-INFLATED LOSS ========
+        # ======== BALANCED ZERO-INFLATED LOSS ========
         if USE_ROBUST_LOSS:
             base_loss = F.huber_loss(pred_clean, target_clean, reduction='none', delta=2.0)
             
-            # Extra penalty for missing zeros (important!)
+            # Moderate zero penalty
             zero_mask = (target_clean == 0.0)
-            zero_penalty = zero_mask.float() * (pred_clean.abs() * 1.5)
+            zero_penalty = zero_mask.float() * (pred_clean.abs() * 0.5)  # Reduced penalty
             
             loss = ((base_loss + zero_penalty) * weights).sum()
         else:
             loss = F.smooth_l1_loss(pred_clean, target_clean, reduction='none', beta=1.0)
             loss = (loss * weights).sum()
-        # ====================================
+        # =============================================
         
-        mae = ((pred_clean - target_clean).abs() * weights).sum()
+        mae = ((pred_clean - target_clean).abs()).sum()  # Don't weight MAE metric
         
         total_loss += loss
         total_mae += mae.item()
@@ -952,7 +963,7 @@ def train():
                 loss, mae, nv = mixup_criterion(pred, hvf_a, hvf_b, lam, lat_a, lat_b)
             else:
                 pred = model(imgs, average_multi=False)
-                loss, mae, nv = compute_loss(pred, hvf, lat, smooth=LABEL_SMOOTH)
+                loss, mae, nv = compute_loss(pred, hvf, lat, smooth=LABEL_SMOOTH, epoch=epoch)
             
             if nv > 0:
                 loss = loss / ACCUM_STEPS
