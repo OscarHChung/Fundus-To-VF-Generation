@@ -54,7 +54,7 @@ DROPOUT_RATE = 0.45
 USE_TTA = True
 NUM_TTA_AUGS = 8  # Much more TTA
 USE_SWA = True  # Stochastic Weight Averaging
-SWA_START = 100  # Start SWA after epoch 100
+SWA_START = 60  # Start SWA after epoch 60
 LABEL_SMOOTH = 0.1  # Regression label smoothing
 USE_OUTLIER_CLIPPING = True  # Clip extreme predictions
 OUTLIER_CLIP_RANGE = (0, 35)  # Clip predictions to valid VF range
@@ -366,7 +366,7 @@ class MultiImageModel(nn.Module):
             pred = self.decoder(vf_features)
             
             # Post-process predictions
-            def post_process_predictions(pred, threshold=1.5):
+            def post_process_predictions(pred, threshold=0.5):
                 """
                 Apply domain-specific post-processing to predictions.
                 - Clip very low predictions to 0 (undetectable)
@@ -379,7 +379,7 @@ class MultiImageModel(nn.Module):
                 # pred = torch.round(pred * 2) / 2
                 
                 return pred
-            pred = post_process_predictions(pred, threshold=1.5)
+            pred = post_process_predictions(pred, threshold=0.5)
             
             if USE_OUTLIER_CLIPPING:
                 pred = torch.clamp(pred, OUTLIER_CLIP_RANGE[0], OUTLIER_CLIP_RANGE[1])
@@ -514,21 +514,47 @@ def evaluate(model, loader, epoch=None, save_debug=False):
     total_mae = 0.0
     n_valid = 0
     all_preds, all_targets, all_lats = [], [], []
-    all_errors = []  # Per-sample errors
-    all_sample_info = []  # Store sample metadata
+    all_errors = []
+    all_sample_info = []
     
     with torch.no_grad():
         for sample_idx, sample in enumerate(loader):
             imgs, hvf, lat = sample
             imgs = imgs.to(DEVICE)
             
-            pred = model(imgs, average_multi=True)
+            # ENSEMBLE WITH MULTIPLE THRESHOLDS (only during validation)
+            if epoch is not None:  # During training - use ensemble
+                preds_ensemble = []
+                for threshold in [0.3, 0.5, 0.8]:
+                    # Get raw prediction
+                    latent = model.encoder.forward_encoder(imgs, mask_ratio=0.0)[0]
+                    if latent.dim() == 3:
+                        latent = latent[:, 0, :]
+                    vf_features = model.projection(latent)
+                    pred_raw = model.decoder(vf_features)
+                    
+                    # Post-process with different thresholds
+                    pred_processed = torch.where(pred_raw < threshold, 
+                                                torch.zeros_like(pred_raw), pred_raw)
+                    if USE_OUTLIER_CLIPPING:
+                        pred_processed = torch.clamp(pred_processed, 
+                                                     OUTLIER_CLIP_RANGE[0], 
+                                                     OUTLIER_CLIP_RANGE[1])
+                    
+                    if pred_processed.shape[0] > 1:
+                        pred_processed = pred_processed.mean(dim=0, keepdim=True)
+                    
+                    preds_ensemble.append(pred_processed)
+                
+                # Average across thresholds
+                pred = torch.stack(preds_ensemble).mean(dim=0)
+            else:
+                pred = model(imgs, average_multi=True)
             
-            _, mae, nv = compute_loss(pred, hvf, lat)
+            _, mae, nv = compute_loss(pred, hvf, lat, epoch=epoch if epoch else 0)
             total_mae += mae * nv
             n_valid += nv
             
-            # Store per-sample error and info
             all_errors.append(mae)
             all_preds.append(pred.cpu().numpy().flatten())
             all_targets.append(hvf.cpu().numpy().flatten())
@@ -548,7 +574,6 @@ def evaluate(model, loader, epoch=None, save_debug=False):
     all_errors = np.array(all_errors)
     corr = pearson_correlation(torch.tensor(all_preds), torch.tensor(all_targets), all_lats)
     
-    # Debug visualization
     if save_debug and epoch is not None:
         analyze_predictions(all_preds, all_targets, all_errors, all_lats, all_sample_info, epoch)
     
@@ -1037,6 +1062,81 @@ def train():
             if patience >= PATIENCE:
                 print(f"\nEarly stopping at epoch {epoch}")
                 break
+
+    # ============== PHASE 2: FINE-TUNING ==============
+    if best_mae > 3.80:  # If not reached target
+        print(f"\n{'='*60}")
+        print(f"PHASE 2: Fine-Tuning with Ultra-Low LR")
+        print(f"{'='*60}")
+        
+        # Load best model
+        checkpoint = torch.load(BEST_SAVE, map_location=DEVICE)
+        model.load_state_dict(checkpoint['model'])
+        
+        # Drastically reduce learning rate
+        optimizer = optim.AdamW([
+            {'params': [p for p in model.encoder.parameters() if p.requires_grad], 
+             'lr': LR * 0.003, 'weight_decay': WEIGHT_DECAY * 3},  # 10x lower
+            {'params': model.projection.parameters(), 
+             'lr': LR * 0.05, 'weight_decay': WEIGHT_DECAY * 2},  # 10x lower
+            {'params': model.decoder.parameters(), 
+             'lr': LR * 0.01, 'weight_decay': WEIGHT_DECAY}  # 10x lower
+        ])
+        
+        # Reset patience
+        patience = 0
+        phase2_epochs = 50
+        
+        for epoch in range(1, phase2_epochs + 1):
+            model.train()
+            pbar = tqdm(train_loader, desc=f"Phase2 Epoch {epoch}/{phase2_epochs}")
+            optimizer.zero_grad()
+            
+            for batch_idx, (imgs, hvf, lat) in enumerate(pbar):
+                imgs = imgs.to(DEVICE)
+                pred = model(imgs, average_multi=False)
+                loss, mae, nv = compute_loss(pred, hvf, lat, smooth=LABEL_SMOOTH, epoch=100)
+                
+                if nv > 0:
+                    loss = loss / ACCUM_STEPS
+                    loss.backward()
+                    
+                    if (batch_idx + 1) % ACCUM_STEPS == 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+                        optimizer.zero_grad()
+                
+                pbar.set_postfix({'MAE': f'{mae:.2f}'})
+            
+            val_mae, val_corr = evaluate(model, val_loader, epoch=None, save_debug=False)
+            
+            if epoch % 5 == 0:
+                print(f"\n[Phase2 Epoch {epoch}]")
+                print(f"  Val: {val_mae:.2f} dB | Corr: {val_corr:.3f}")
+            
+            if val_mae < best_mae:
+                best_mae = val_mae
+                torch.save({
+                    'model': model.state_dict(),
+                    'mae': val_mae,
+                    'corr': val_corr,
+                    'epoch': epoch,
+                    'phase': 2
+                }, BEST_SAVE)
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'encoder_checkpoint': CHECKPOINT_PATH,
+                    'val_mae': val_mae,
+                    'val_corr': val_corr,
+                    'use_pretrained': model.use_pretrained
+                }, INFERENCE_SAVE)
+                print(f"  ✓ New Best!")
+                patience = 0
+            else:
+                patience += 1
+                if patience >= 15:  # Shorter patience
+                    print(f"\nPhase 2 early stopping at epoch {epoch}")
+                    break
     
     print(f"\n{'='*60}")
     print(f"Training Complete!")
