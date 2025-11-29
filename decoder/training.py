@@ -29,6 +29,7 @@ from torchvision import transforms
 from PIL import Image, ImageEnhance
 from tqdm import tqdm
 import random
+from scipy import stats
 
 # ============== MPS Configuration ==============
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
@@ -46,16 +47,16 @@ BATCH_SIZE = 24  # Smaller for gradient accumulation
 ACCUM_STEPS = 2  # Effective batch size = 48
 EPOCHS = 300
 LR = 2.5e-3
-WEIGHT_DECAY = 3e-4
+WEIGHT_DECAY = 2e-4
 PATIENCE = 70
 NUM_ENCODER_BLOCKS = 6
 MASKED_VALUE_THRESHOLD = 99.0
-DROPOUT_RATE = 0.45
+DROPOUT_RATE = 0.4
 USE_TTA = True
 NUM_TTA_AUGS = 8  # Much more TTA
 USE_SWA = True  # Stochastic Weight Averaging
 SWA_START = 60  # Start SWA after epoch 60
-LABEL_SMOOTH = 0.1  # Regression label smoothing
+LABEL_SMOOTH = 0.08  # Regression label smoothing
 USE_OUTLIER_CLIPPING = True  # Clip extreme predictions
 OUTLIER_CLIP_RANGE = (0, 35)  # Clip predictions to valid VF range
 USE_ROBUST_LOSS = True  # Use Huber loss (less sensitive to outliers)
@@ -367,17 +368,7 @@ class MultiImageModel(nn.Module):
             
             # Post-process predictions
             def post_process_predictions(pred, threshold=0.5):
-                """
-                Apply domain-specific post-processing to predictions.
-                - Clip very low predictions to 0 (undetectable)
-                - Round predictions to nearest 0.5 dB (closer to real VF granularity)
-                """
-                # Clip predictions below threshold to 0
                 pred = torch.where(pred < threshold, torch.zeros_like(pred), pred)
-                
-                # Optional: Round to nearest 0.5 dB to match VF test precision
-                # pred = torch.round(pred * 2) / 2
-                
                 return pred
             pred = post_process_predictions(pred, threshold=0.5)
             
@@ -580,55 +571,22 @@ def evaluate(model, loader, epoch=None, save_debug=False):
     return mae, corr
 
 def analyze_predictions(preds, targets, errors, lateralities, sample_info, epoch):
-    """Analyze and visualize prediction errors"""
+    """
+    Create comprehensive visualization of ALL predictions.
     
-    # Load validation JSON to get patient IDs
-    with open(VAL_JSON, 'r') as f:
-        val_data = json.load(f)
+    This replaces the old analyze_predictions function.
+    Creates a single figure with 6 subplots showing complete analysis.
+    """
     
-    # 1. Identify outliers using IQR method
-    Q1 = np.percentile(errors, 25)
-    Q3 = np.percentile(errors, 75)
-    IQR = Q3 - Q1
-    outlier_threshold = Q3 + 1.5 * IQR
-    outliers = errors > outlier_threshold
-    n_outliers = outliers.sum()
+    print(f"\n  📊 Error Statistics (Epoch {epoch}):")
+    print(f"    Mean MAE: {errors.mean():.2f} dB | Median: {np.median(errors):.2f} dB")
+    print(f"    Std Dev: {errors.std():.2f} dB")
+    print(f"    Min: {errors.min():.2f} dB | Max: {errors.max():.2f} dB")
     
-    print(f"\n  📊 Error Statistics:")
-    print(f"    Mean: {errors.mean():.2f} dB | Median: {np.median(errors):.2f} dB")
-    print(f"    Q1: {Q1:.2f} | Q3: {Q3:.2f} | IQR: {IQR:.2f}")
-    print(f"    Outliers (>Q3+1.5*IQR): {n_outliers}/{len(errors)} samples ({100*n_outliers/len(errors):.1f}%)")
-    print(f"    Outlier threshold: {outlier_threshold:.2f} dB")
-    
-    # 1b. Find worst predictions with patient IDs
-    worst_idx = np.argsort(errors)[-10:]  # Top 10 worst
-    best_idx = np.argsort(errors)[:10]     # Top 10 best
-    
-    print(f"\n  ⚠️  WORST SAMPLES TO REMOVE:")
-    print(f"  {'='*70}")
-    for rank, i in enumerate(worst_idx[-5:], 1):
-        is_outlier = " [OUTLIER - REMOVE THIS!]" if errors[i] > outlier_threshold else ""
-        sample_data = val_data[i]
-        patient_id = sample_data.get('PatientID', 'Unknown')
-        laterality = sample_data.get('Laterality', 'Unknown')
-        fundus_imgs = sample_data.get('FundusImage', [])
-        if isinstance(fundus_imgs, str):
-            fundus_imgs = [fundus_imgs]
-        
-        print(f"  Rank {rank}: Sample Index {i} | MAE: {errors[i]:.2f} dB{is_outlier}")
-        print(f"    → PatientID: {patient_id}")
-        print(f"    → Laterality: {laterality}")
-        print(f"    → Fundus Images: {', '.join(fundus_imgs)}")
-        print(f"    → REMOVE FROM: {VAL_JSON}")
-        print(f"  {'-'*70}")
-    
-    print(f"\n  ✓ Best 5 samples (MAE):")
-    for i in best_idx[:5]:
-        patient_id = val_data[i].get('PatientID', 'Unknown')
-        print(f"    Sample {i}: {errors[i]:.2f} dB (PatientID: {patient_id})")
-    
-    # 2. Per-location error analysis
-    all_location_errors = [[] for _ in range(52)]  # One list per location
+    # Collect ALL prediction points
+    all_pred_points = []
+    all_target_points = []
+    all_residuals = []
     
     for pred, target, lat in zip(preds, targets, lateralities):
         valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
@@ -638,283 +596,215 @@ def analyze_predictions(preds, targets, errors, lateralities, sample_info, epoch
         if mask.sum() > 0:
             pred_clean = pred[mask]
             target_clean = target_valid[mask]
-            point_errors = np.abs(pred_clean - target_clean)
-            
-            # Assign errors to their respective locations
-            masked_indices = np.where(mask)[0]
-            for loc_idx, error in zip(masked_indices, point_errors):
-                if loc_idx < 52:
-                    all_location_errors[loc_idx].append(error)
+            all_pred_points.extend(pred_clean)
+            all_target_points.extend(target_clean)
+            all_residuals.extend((pred_clean - target_clean).tolist())
     
-    # Average error per location
+    all_pred_points = np.array(all_pred_points)
+    all_target_points = np.array(all_target_points)
+    all_residuals = np.array(all_residuals)
+    
+    # Create figure
+    fig = plt.figure(figsize=(18, 12))
+    gs = fig.add_gridspec(3, 3, hspace=0.35, wspace=0.35)
+    
+    # ========== PLOT 1: MAIN SCATTER - ALL PREDICTIONS ==========
+    ax1 = fig.add_subplot(gs[0:2, 0:2])
+    
+    # Color by error magnitude
+    point_errors = np.abs(all_pred_points - all_target_points)
+    scatter = ax1.scatter(all_target_points, all_pred_points, 
+                         c=point_errors, cmap='RdYlGn_r', 
+                         alpha=0.6, s=25, vmin=0, vmax=10,
+                         edgecolors='black', linewidth=0.3)
+    
+    # Perfect prediction line
+    ax1.plot([0, 35], [0, 35], 'k--', linewidth=2.5, label='Perfect prediction', alpha=0.8)
+    
+    # Regression line
+    slope, intercept, r_value, p_value, std_err = stats.linregress(all_target_points, all_pred_points)
+    line_x = np.array([0, 35])
+    line_y = slope * line_x + intercept
+    ax1.plot(line_x, line_y, 'r-', linewidth=2.5, 
+            label=f'Fit: y={slope:.2f}x+{intercept:.2f} (R²={r_value**2:.3f})', alpha=0.8)
+    
+    ax1.set_xlabel('True VF Sensitivity (dB)', fontsize=13, fontweight='bold')
+    ax1.set_ylabel('Predicted VF Sensitivity (dB)', fontsize=13, fontweight='bold')
+    ax1.set_title(f'All Predictions vs Ground Truth - Epoch {epoch}\n'
+                 f'N = {len(all_pred_points):,} points from {len(preds)} samples',
+                 fontsize=14, fontweight='bold')
+    ax1.legend(loc='upper left', fontsize=11)
+    ax1.grid(True, alpha=0.3, linestyle='--')
+    ax1.set_xlim(-1, 36)
+    ax1.set_ylim(-1, 36)
+    ax1.set_aspect('equal')
+    
+    # Colorbar
+    cbar = plt.colorbar(scatter, ax=ax1)
+    cbar.set_label('Absolute Error (dB)', fontsize=11, fontweight='bold')
+    
+    # Stats box
+    textstr = f'Pearson r: {r_value:.3f}\nMAE: {point_errors.mean():.2f} dB\nRMSE: {np.sqrt(np.mean(point_errors**2)):.2f} dB\nBias: {all_residuals.mean():.2f} dB'
+    ax1.text(0.02, 0.98, textstr, transform=ax1.transAxes, fontsize=11,
+            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.9))
+    
+    # ========== PLOT 2: SAMPLE ERROR DISTRIBUTION ==========
+    ax2 = fig.add_subplot(gs[0, 2])
+    ax2.hist(errors, bins=25, edgecolor='black', alpha=0.75, color='steelblue')
+    ax2.axvline(errors.mean(), color='red', linestyle='--', linewidth=2, 
+               label=f'Mean: {errors.mean():.2f}')
+    ax2.axvline(np.median(errors), color='green', linestyle='--', linewidth=2,
+               label=f'Median: {np.median(errors):.2f}')
+    ax2.set_xlabel('MAE per Sample (dB)', fontsize=10, fontweight='bold')
+    ax2.set_ylabel('Frequency', fontsize=10, fontweight='bold')
+    ax2.set_title('Sample-Level Errors', fontsize=11, fontweight='bold')
+    ax2.legend(fontsize=9)
+    ax2.grid(True, alpha=0.3, axis='y')
+    
+    # ========== PLOT 3: RESIDUALS ==========
+    ax3 = fig.add_subplot(gs[1, 2])
+    ax3.scatter(all_pred_points, all_residuals, alpha=0.4, s=12, color='navy')
+    ax3.axhline(0, color='red', linestyle='--', linewidth=2, alpha=0.8)
+    ax3.axhline(all_residuals.mean(), color='orange', linestyle='--', linewidth=2,
+               label=f'Mean: {all_residuals.mean():.2f}')
+    # Add ±1 std lines
+    ax3.axhline(all_residuals.mean() + all_residuals.std(), color='orange', 
+               linestyle=':', linewidth=1.5, alpha=0.6)
+    ax3.axhline(all_residuals.mean() - all_residuals.std(), color='orange', 
+               linestyle=':', linewidth=1.5, alpha=0.6)
+    ax3.set_xlabel('Predicted Value (dB)', fontsize=10, fontweight='bold')
+    ax3.set_ylabel('Residual (Pred - True)', fontsize=10, fontweight='bold')
+    ax3.set_title('Residual Analysis', fontsize=11, fontweight='bold')
+    ax3.legend(fontsize=9)
+    ax3.grid(True, alpha=0.3)
+    
+    # ========== PLOT 4: ERROR BY TRUE VALUE RANGE ==========
+    ax4 = fig.add_subplot(gs[2, 0])
+    
+    bins = np.arange(0, 36, 5)
+    bin_centers = bins[:-1] + 2.5
+    binned_errors = []
+    binned_counts = []
+    
+    for i in range(len(bins) - 1):
+        mask = (all_target_points >= bins[i]) & (all_target_points < bins[i+1])
+        if mask.sum() > 0:
+            binned_errors.append(point_errors[mask].mean())
+            binned_counts.append(mask.sum())
+        else:
+            binned_errors.append(0)
+            binned_counts.append(0)
+    
+    bars = ax4.bar(bin_centers, binned_errors, width=4, edgecolor='black', alpha=0.75, color='coral')
+    ax4.set_xlabel('True VF Value Range (dB)', fontsize=10, fontweight='bold')
+    ax4.set_ylabel('Mean Absolute Error (dB)', fontsize=10, fontweight='bold')
+    ax4.set_title('Error by VF Sensitivity Range', fontsize=11, fontweight='bold')
+    ax4.grid(True, alpha=0.3, axis='y')
+    
+    # Add counts on bars
+    for bar, count in zip(bars, binned_counts):
+        if count > 0:
+            height = bar.get_height()
+            ax4.text(bar.get_x() + bar.get_width()/2., height,
+                    f'n={count}', ha='center', va='bottom', fontsize=8)
+    
+    # ========== PLOT 5: VF LOCATION HEATMAP ==========
+    ax5 = fig.add_subplot(gs[2, 1])
+    
+    location_errors = [[] for _ in range(52)]
+    
+    for pred, target, lat in zip(preds, targets, lateralities):
+        valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
+        target_valid = target[valid_idx]
+        mask = target_valid < MASKED_VALUE_THRESHOLD
+        
+        if mask.sum() > 0:
+            pred_clean = pred[mask]
+            target_clean = target_valid[mask]
+            point_errors_sample = np.abs(pred_clean - target_clean)
+            
+            masked_indices = np.where(mask)[0]
+            for loc_idx, error in zip(masked_indices, point_errors_sample):
+                if loc_idx < 52:
+                    location_errors[loc_idx].append(error)
+    
     mean_location_errors = np.array([
-        np.mean(errors) if len(errors) > 0 else 0 
-        for errors in all_location_errors
+        np.mean(errors_loc) if len(errors_loc) > 0 else np.nan
+        for errors_loc in location_errors
     ])
     
-    # Find problematic locations
-    valid_locations = [i for i, errors in enumerate(all_location_errors) if len(errors) > 0]
-    worst_locations = np.argsort(mean_location_errors[valid_locations])[-5:]
-    worst_locations = [valid_locations[i] for i in worst_locations]
-    
-    print(f"\n  Worst 5 VF locations (mean error):")
-    for loc in worst_locations:
-        print(f"    Location {loc}: {mean_location_errors[loc]:.2f} dB (n={len(all_location_errors[loc])})")
-    
-    # 3. Visualize error distribution
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    
-    # Error histogram
-    axes[0, 0].hist(errors, bins=30, edgecolor='black', alpha=0.7)
-    axes[0, 0].axvline(errors.mean(), color='red', linestyle='--', label=f'Mean: {errors.mean():.2f}')
-    axes[0, 0].axvline(np.median(errors), color='green', linestyle='--', label=f'Median: {np.median(errors):.2f}')
-    axes[0, 0].set_xlabel('MAE per sample (dB)')
-    axes[0, 0].set_ylabel('Frequency')
-    axes[0, 0].set_title(f'Error Distribution - Epoch {epoch}')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-    
-    # Location-wise error
-    axes[0, 1].bar(range(len(mean_location_errors)), mean_location_errors)
-    axes[0, 1].set_xlabel('VF Location Index')
-    axes[0, 1].set_ylabel('Mean Absolute Error (dB)')
-    axes[0, 1].set_title('Mean Error per VF Location')
-    axes[0, 1].grid(True, alpha=0.3)
-    
-    # Prediction vs Target scatter (worst samples)
-    worst_sample_indices = worst_idx[-5:]
-    worst_preds_list = []
-    worst_targets_list = []
-    
-    for idx in worst_sample_indices:
-        pred = preds[idx]
-        target = targets[idx]
-        lat = lateralities[idx]
-        
-        valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
-        target_valid = target[valid_idx]
-        pred_valid = pred[:len(valid_idx)]  # Match length
-        mask = target_valid < MASKED_VALUE_THRESHOLD
-        
-        if mask.sum() > 0:
-            worst_preds_list.append(pred_valid[mask])
-            worst_targets_list.append(target_valid[mask])
-    
-    if worst_preds_list:
-        worst_preds = np.concatenate(worst_preds_list)
-        worst_targets = np.concatenate(worst_targets_list)
-        
-        axes[1, 0].scatter(worst_targets, worst_preds, alpha=0.5, label='Worst 5 samples', color='red')
-        axes[1, 0].plot([0, 40], [0, 40], 'k--', label='Perfect prediction')
-        axes[1, 0].set_xlabel('True VF Value (dB)')
-        axes[1, 0].set_ylabel('Predicted VF Value (dB)')
-        axes[1, 0].set_title('Worst Predictions Scatter')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha=0.3)
-    
-    # Best samples scatter
-    best_sample_indices = best_idx[:5]
-    best_preds_list = []
-    best_targets_list = []
-    
-    for idx in best_sample_indices:
-        pred = preds[idx]
-        target = targets[idx]
-        lat = lateralities[idx]
-        
-        valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
-        target_valid = target[valid_idx]
-        pred_valid = pred[:len(valid_idx)]
-        mask = target_valid < MASKED_VALUE_THRESHOLD
-        
-        if mask.sum() > 0:
-            best_preds_list.append(pred_valid[mask])
-            best_targets_list.append(target_valid[mask])
-    
-    if best_preds_list:
-        best_preds = np.concatenate(best_preds_list)
-        best_targets = np.concatenate(best_targets_list)
-        
-        axes[1, 1].scatter(best_targets, best_preds, alpha=0.5, label='Best 5 samples', color='green')
-        axes[1, 1].plot([0, 40], [0, 40], 'k--', label='Perfect prediction')
-        axes[1, 1].set_xlabel('True VF Value (dB)')
-        axes[1, 1].set_ylabel('Predicted VF Value (dB)')
-        axes[1, 1].set_title('Best Predictions Scatter')
-        axes[1, 1].legend()
-        axes[1, 1].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(DEBUG_DIR, f'error_analysis_epoch_{epoch}.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    # 4. Visualize VF field errors (2D heatmap) + mark worst locations
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
-    
-    # Visualize worst sample's VF field with errors
-    if len(worst_idx) > 0:
-        worst_sample_idx = worst_idx[-1]
-        pred_worst = preds[worst_sample_idx]
-        target_worst = targets[worst_sample_idx]
-        lat_worst = lateralities[worst_sample_idx]
-        
-        valid_idx = valid_indices_od if lat_worst.startswith('OD') else valid_indices_os
-        target_valid = target_worst[valid_idx]
-        pred_valid = pred_worst[:len(valid_idx)]
-        mask = target_valid < MASKED_VALUE_THRESHOLD
-        
-        # Create error field
-        error_field = np.abs(pred_valid - target_valid)
-        error_field[~mask] = np.nan
-        
-        # Reshape to 8x9 grid
-        error_grid = np.ones((8, 9)) * np.nan
-        for idx, loc in enumerate(valid_idx):
-            if idx < len(error_field):
-                row = loc // 9
-                col = loc % 9
-                error_grid[row, col] = error_field[idx]
-        
-        im0 = axes[0, 0].imshow(error_grid, cmap='RdYlGn_r', interpolation='nearest', vmin=0, vmax=15)
-        axes[0, 0].set_title(f'WORST Sample (#{worst_sample_idx}) - Error Heatmap\nMAE: {errors[worst_sample_idx]:.2f} dB')
-        axes[0, 0].set_xlabel('Column')
-        axes[0, 0].set_ylabel('Row')
-        
-        # Mark worst locations with X
-        for idx, loc in enumerate(valid_idx):
-            if idx < len(error_field) and error_field[idx] > 10:  # Mark errors > 10 dB
-                row = loc // 9
-                col = loc % 9
-                axes[0, 0].text(col, row, 'X', ha='center', va='center', 
-                              color='red', fontsize=16, fontweight='bold')
-        
-        plt.colorbar(im0, ax=axes[0, 0], label='Error (dB)')
-        
-        # Show target VF for worst sample
-        target_grid = np.ones((8, 9)) * np.nan
-        for idx, loc in enumerate(valid_idx):
-            if idx < len(target_valid) and mask[idx]:
-                row = loc // 9
-                col = loc % 9
-                target_grid[row, col] = target_valid[idx]
-        
-        im1 = axes[0, 1].imshow(target_grid, cmap='viridis', interpolation='nearest', vmin=0, vmax=35)
-        axes[0, 1].set_title(f'WORST Sample (#{worst_sample_idx}) - True VF')
-        axes[0, 1].set_xlabel('Column')
-        axes[0, 1].set_ylabel('Row')
-        plt.colorbar(im1, ax=axes[0, 1], label='Sensitivity (dB)')
-    
-    # Reshape mean errors to 2D grid for visualization
-    error_grid_od = np.ones((8, 9)) * np.nan
+    # Reshape to 8x9 grid
+    error_grid = np.ones((8, 9)) * np.nan
     for idx, loc in enumerate(valid_indices_od):
-        row = loc // 9
-        col = loc % 9
-        error_grid_od[row, col] = mean_location_errors[idx] if idx < len(mean_location_errors) else 0
+        if idx < len(mean_location_errors):
+            row = loc // 9
+            col = loc % 9
+            error_grid[row, col] = mean_location_errors[idx]
     
-    im2 = axes[1, 0].imshow(error_grid_od, cmap='hot', interpolation='nearest')
-    axes[1, 0].set_title('Mean Error Heatmap (All Samples, OD pattern)')
-    axes[1, 0].set_xlabel('Column')
-    axes[1, 0].set_ylabel('Row')
+    im = ax5.imshow(error_grid, cmap='RdYlGn_r', interpolation='nearest', vmin=0, vmax=7)
+    ax5.set_title('Mean Error by VF Location', fontsize=11, fontweight='bold')
+    ax5.set_xlabel('Column', fontsize=10, fontweight='bold')
+    ax5.set_ylabel('Row', fontsize=10, fontweight='bold')
+    cbar2 = plt.colorbar(im, ax=ax5)
+    cbar2.set_label('MAE (dB)', fontsize=10, fontweight='bold')
     
-    # Mark worst locations
-    for loc in worst_locations:
-        row = valid_indices_od[loc] // 9
-        col = valid_indices_od[loc] % 9
-        axes[1, 0].text(col, row, '!', ha='center', va='center', 
-                       color='white', fontsize=14, fontweight='bold')
+    # ========== PLOT 6: BIAS BY RANGE ==========
+    ax6 = fig.add_subplot(gs[2, 2])
     
-    plt.colorbar(im2, ax=axes[1, 0], label='MAE (dB)')
+    binned_bias = []
+    for i in range(len(bins) - 1):
+        mask = (all_target_points >= bins[i]) & (all_target_points < bins[i+1])
+        if mask.sum() > 0:
+            binned_bias.append(all_residuals[mask].mean())
+        else:
+            binned_bias.append(0)
     
-    # Error percentiles
-    percentiles = [50, 75, 90, 95, 99]
-    percentile_values = np.percentile(errors, percentiles)
+    colors = ['red' if b > 0 else 'blue' for b in binned_bias]
+    ax6.bar(bin_centers, binned_bias, width=4, edgecolor='black', alpha=0.75, color=colors)
+    ax6.axhline(0, color='black', linestyle='-', linewidth=2)
+    ax6.set_xlabel('True VF Value Range (dB)', fontsize=10, fontweight='bold')
+    ax6.set_ylabel('Mean Bias (Pred - True)', fontsize=10, fontweight='bold')
+    ax6.set_title('Prediction Bias by Range', fontsize=11, fontweight='bold')
+    ax6.grid(True, alpha=0.3, axis='y')
     
-    axes[1, 1].bar(percentiles, percentile_values, width=5, edgecolor='black', alpha=0.7)
-    axes[1, 1].axhline(errors.mean(), color='red', linestyle='--', label=f'Mean: {errors.mean():.2f}')
-    axes[1, 1].axhline(outlier_threshold, color='orange', linestyle='--', label=f'Outlier: {outlier_threshold:.2f}')
-    axes[1, 1].set_xlabel('Percentile')
-    axes[1, 1].set_ylabel('MAE (dB)')
-    axes[1, 1].set_title('Error Percentiles')
-    axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
+    # Legend for colors
+    ax6.text(0.02, 0.98, 'Red: Over-prediction\nBlue: Under-prediction', 
+            transform=ax6.transAxes, fontsize=9,
+            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
     
-    for i, (p, v) in enumerate(zip(percentiles, percentile_values)):
-        axes[1, 1].text(p, v + 0.1, f'{v:.2f}', ha='center', va='bottom')
+    # Overall title
+    plt.suptitle(f'Comprehensive Prediction Analysis - Epoch {epoch} - MAE: {errors.mean():.2f} dB', 
+                fontsize=16, fontweight='bold', y=0.998)
     
-    plt.tight_layout()
-    plt.savefig(os.path.join(DEBUG_DIR, f'vf_heatmap_epoch_{epoch}.png'), dpi=150, bbox_inches='tight')
+    # Save
+    plt.savefig(os.path.join(DEBUG_DIR, f'comprehensive_analysis_epoch_{epoch}.png'), 
+               dpi=200, bbox_inches='tight')
     plt.close()
     
-    # 5. Save detailed removal instructions
-    with open(os.path.join(DEBUG_DIR, f'REMOVE_THESE_SAMPLES_epoch_{epoch}.txt'), 'w') as f:
-        f.write("="*70 + "\n")
-        f.write("SAMPLES TO REMOVE FROM VALIDATION SET\n")
-        f.write("="*70 + "\n\n")
-        
-        f.write(f"File to edit: {VAL_JSON}\n\n")
-        
-        outlier_indices = [i for i in worst_idx if errors[i] > outlier_threshold]
-        
-        if outlier_indices:
-            f.write(f"CRITICAL OUTLIERS (Remove these {len(outlier_indices)} samples):\n")
-            f.write("-"*70 + "\n")
-            
-            for i in outlier_indices:
-                sample_data = val_data[i]
-                f.write(f"\nSample Index: {i}\n")
-                f.write(f"  MAE: {errors[i]:.2f} dB\n")
-                f.write(f"  PatientID: {sample_data.get('PatientID', 'Unknown')}\n")
-                f.write(f"  Laterality: {sample_data.get('Laterality', 'Unknown')}\n")
-                fundus_imgs = sample_data.get('FundusImage', [])
-                if isinstance(fundus_imgs, str):
-                    fundus_imgs = [fundus_imgs]
-                f.write(f"  Fundus Images: {', '.join(fundus_imgs)}\n")
-                f.write(f"  Action: Remove entry #{i} from {VAL_JSON}\n")
-                f.write("-"*70 + "\n")
-            
-            f.write(f"\n\nEXPECTED IMPROVEMENT:\n")
-            f.write(f"Current MAE: {errors.mean():.2f} dB\n")
-            f.write(f"Median MAE: {np.median(errors):.2f} dB\n")
-            
-            # Calculate expected MAE without outliers
-            non_outlier_errors = errors[~outliers]
-            f.write(f"MAE without outliers: {non_outlier_errors.mean():.2f} dB\n")
-            f.write(f"Improvement: {errors.mean() - non_outlier_errors.mean():.2f} dB\n")
-        else:
-            f.write("No critical outliers detected.\n")
-        
-        f.write(f"\n\n" + "="*70 + "\n")
-        f.write(f"ALL STATISTICS (Epoch {epoch})\n")
-        f.write("="*70 + "\n\n")
-        
-        f.write(f"Overall MAE: {errors.mean():.3f} dB\n")
-        f.write(f"Median MAE: {np.median(errors):.3f} dB\n")
-        f.write(f"Std Dev: {errors.std():.3f} dB\n")
-        f.write(f"Min MAE: {errors.min():.3f} dB\n")
-        f.write(f"Max MAE: {errors.max():.3f} dB\n\n")
-        
-        f.write("Percentiles:\n")
-        for p, v in zip(percentiles, percentile_values):
-            f.write(f"  {p}th: {v:.3f} dB\n")
-        
-        f.write(f"\nWorst 10 samples:\n")
-        for i, idx in enumerate(worst_idx):
-            patient_id = val_data[idx].get('PatientID', 'Unknown')
-            f.write(f"  {i+1}. Sample {idx} (PatientID {patient_id}): {errors[idx]:.3f} dB\n")
-        
-        f.write(f"\nWorst 10 VF locations (mean error):\n")
-        worst_locs_full = np.argsort(mean_location_errors)[-10:]
-        for i, loc in enumerate(worst_locs_full):
-            f.write(f"  {i+1}. Location {loc}: {mean_location_errors[loc]:.3f} dB\n")
-        
-        f.write(f"\nBest 10 VF locations (mean error):\n")
-        best_locs = np.argsort(mean_location_errors)[:10]
-        for i, loc in enumerate(best_locs):
-            f.write(f"  {i+1}. Location {loc}: {mean_location_errors[loc]:.3f} dB\n")
+    print(f"\n  📁 Comprehensive visualization saved:")
+    print(f"    → {DEBUG_DIR}/comprehensive_analysis_epoch_{epoch}.png")
     
-    print(f"\n  📁 Debug files saved:")
-    print(f"    → {DEBUG_DIR}/error_analysis_epoch_{epoch}.png")
-    print(f"    → {DEBUG_DIR}/vf_heatmap_epoch_{epoch}.png")
-    print(f"    → {DEBUG_DIR}/REMOVE_THESE_SAMPLES_epoch_{epoch}.txt  ⚠️  READ THIS!")
+    # Print statistics
+    print(f"\n  📈 Detailed Statistics:")
+    print(f"    Total points: {len(all_pred_points):,}")
+    print(f"    Pearson r: {r_value:.3f} (R² = {r_value**2:.3f})")
+    print(f"    MAE: {point_errors.mean():.2f} dB")
+    print(f"    RMSE: {np.sqrt(np.mean(point_errors**2)):.2f} dB")
+    print(f"    Mean bias: {all_residuals.mean():.2f} dB")
+    print(f"    Bias std: {all_residuals.std():.2f} dB")
+    
+    # Range-specific analysis
+    zero_mask = all_target_points < 1.0
+    low_mask = (all_target_points >= 1.0) & (all_target_points < 10.0)
+    mid_mask = (all_target_points >= 10.0) & (all_target_points < 20.0)
+    high_mask = all_target_points >= 20.0
+    
+    print(f"\n  🎯 Error by Sensitivity Range:")
+    print(f"    Very Low (<1 dB):  {point_errors[zero_mask].mean():.2f} dB MAE ({zero_mask.sum():,} pts)")
+    print(f"    Low (1-10 dB):     {point_errors[low_mask].mean():.2f} dB MAE ({low_mask.sum():,} pts)")
+    print(f"    Mid (10-20 dB):    {point_errors[mid_mask].mean():.2f} dB MAE ({mid_mask.sum():,} pts)")
+    print(f"    High (≥20 dB):     {point_errors[high_mask].mean():.2f} dB MAE ({high_mask.sum():,} pts)")
+
 
 # ============== Training ==============
 def train():
