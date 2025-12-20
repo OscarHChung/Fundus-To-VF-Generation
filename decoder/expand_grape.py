@@ -5,8 +5,9 @@ import re
 
 def expand_fundus_images(json_path, fundus_dir, output_path=None):
     """
-    Updates each entry's 'FundusImage' field so it contains a list of all
-    matching fundus image files in the fundus_dir.
+    Updates each entry's FundusImage field so it contains a list of all
+    matching fundus image files in the fundus_dir rather than just a single
+    matching fundus image.
     """
     # Load JSON
     with open(json_path, "r") as f:

@@ -11,15 +11,6 @@ BLIND_SPOTS_R = [(3, 7), (4, 7)]
 BLIND_SPOTS_L = [(3, 1), (4, 1)]
 
 def visualize_hvf(patient_id, eye='R', test_idx=0):
-    """
-    Visualize the raw HVF sensitivity (0-30 dB) from UWHVF dataset,
-    with both blind spots correctly masked.
-    
-    Args:
-        patient_id (str or int): Patient ID.
-        eye (str): 'R' or 'L'.
-        test_idx (int): Index of the HVF test to display.
-    """
     patient_id = str(patient_id)
     
     entry_list = dat['data'][patient_id][eye.upper()]

@@ -1,15 +1,6 @@
-#!/usr/bin/env python3
 """
-ULTIMATE Training Strategy for Sub-3 MAE
-Combining multiple advanced techniques:
-1. Stochastic Weight Averaging (SWA)
-2. Heavy augmentation with AutoAugment-style policies
-3. Multi-scale TTA (8 augmentations)
-4. Gradient accumulation for larger effective batch
-5. Cosine annealing with warm restarts
-6. Lookahead optimizer
-7. Label smoothing via regression
-8. Self-distillation
+Training - Build on pretraining baseline
+ - TO ADD
 """
 
 import os, sys, json, numpy as np
@@ -18,7 +9,7 @@ from typing import List, Tuple
 import copy
 import matplotlib.pyplot as plt
 import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend
+matplotlib.use('Agg')
 
 import torch
 import torch.nn as nn
@@ -26,7 +17,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from PIL import Image, ImageEnhance
+from PIL import Image
 from tqdm import tqdm
 import random
 from scipy import stats
@@ -43,25 +34,26 @@ else:
     print(f"⚠️  MPS not available, using CPU")
 
 # ============== Config ==============
-BATCH_SIZE = 24  # Smaller for gradient accumulation
-ACCUM_STEPS = 2  # Effective batch size = 48
-EPOCHS = 300
-LR = 2.5e-3
-WEIGHT_DECAY = 2e-4
-PATIENCE = 70
+BATCH_SIZE = 32
+EPOCHS = 120
+BASE_LR = 1e-3
+WEIGHT_DECAY = 1e-4
+PATIENCE = 40
 NUM_ENCODER_BLOCKS = 6
 MASKED_VALUE_THRESHOLD = 99.0
-DROPOUT_RATE = 0.4
+DROPOUT_RATE = 0.3
 USE_TTA = True
-NUM_TTA_AUGS = 8  # Much more TTA
-USE_SWA = True  # Stochastic Weight Averaging
-SWA_START = 60  # Start SWA after epoch 60
-LABEL_SMOOTH = 0.08  # Regression label smoothing
-USE_OUTLIER_CLIPPING = True  # Clip extreme predictions
-OUTLIER_CLIP_RANGE = (0, 35)  # Clip predictions to valid VF range
-USE_ROBUST_LOSS = True  # Use Huber loss (less sensitive to outliers)
-USE_MIXUP = False 
-MIXUP_ALPHA = 0.2
+NUM_TTA_AUGS = 4
+LABEL_SMOOTH = 0.05
+USE_OUTLIER_CLIPPING = True
+OUTLIER_CLIP_RANGE = (0, 35)
+
+# MILD class imbalance handling (not aggressive!)
+LOW_DB_THRESHOLD = 10.0
+LOW_VALUE_WEIGHT = 2.0
+
+# Decoder unfreezing
+DECODER_UNFREEZE_EPOCH = 15
 
 # Paths
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -74,8 +66,6 @@ TRAIN_JSON = os.path.join(BASE_DIR, "data", "vf_tests", "grape_train.json")
 VAL_JSON = os.path.join(BASE_DIR, "data", "vf_tests", "grape_test.json")
 BEST_SAVE = os.path.join(CURRENT_DIR, "best_multi_image_model.pth")
 INFERENCE_SAVE = os.path.join(CURRENT_DIR, "inference_model.pth")
-DEBUG_DIR = os.path.join(CURRENT_DIR, "debug_visualizations")
-os.makedirs(DEBUG_DIR, exist_ok=True)
 
 # ============== Mask ==============
 mask_OD = np.array([
@@ -113,32 +103,14 @@ if os.path.exists(PRETRAINED_DECODER):
     except Exception as e:
         print(f"⚠️  Could not load pre-trained decoder: {e}")
 
-# ============== Heavy Augmentation ==============
-class RandAugment:
-    """Custom strong augmentation policy"""
-    def __init__(self):
-        self.ops = [
-            lambda img: ImageEnhance.Brightness(img).enhance(random.uniform(0.7, 1.3)),
-            lambda img: ImageEnhance.Contrast(img).enhance(random.uniform(0.7, 1.3)),
-            lambda img: ImageEnhance.Color(img).enhance(random.uniform(0.7, 1.3)),
-            lambda img: ImageEnhance.Sharpness(img).enhance(random.uniform(0.7, 1.3)),
-        ]
-    
-    def __call__(self, img):
-        n_ops = random.randint(1, 3)
-        for _ in range(n_ops):
-            op = random.choice(self.ops)
-            img = op(img)
-        return img
-
+# ============== Augmentation (Keep Simple) ==============
 train_transform = transforms.Compose([
     transforms.Resize((224, 224)),
-    transforms.RandomHorizontalFlip(p=0.3),  # Reduced from 0.5
-    transforms.RandomRotation(10),  # Reduced from 20
-    transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),  # Reduced
+    transforms.RandomHorizontalFlip(p=0.3),
+    transforms.RandomRotation(10),
+    transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    # Remove RandomErasing and RandAugment for now
 ])
 
 val_transform = transforms.Compose([
@@ -147,9 +119,7 @@ val_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# ============== 8x TTA ==============
 def get_tta_transforms():
-    """8 diverse augmentations for TTA"""
     return [
         val_transform,
         transforms.Compose([
@@ -167,30 +137,6 @@ def get_tta_transforms():
         transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.Lambda(lambda img: transforms.functional.rotate(img, -5)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ]),
-        transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ColorJitter(brightness=0.1),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ]),
-        transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ColorJitter(contrast=0.1),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ]),
-        transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.Lambda(lambda img: transforms.functional.adjust_sharpness(img, 1.5)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ]),
-        transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.Lambda(lambda img: transforms.functional.adjust_sharpness(img, 0.5)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ]),
@@ -311,7 +257,7 @@ class VFAutoDecoder(nn.Module):
         return output
 
 class MultiImageModel(nn.Module):
-    def __init__(self, encoder, pretrained_state=None, num_blocks=10, dropout=0.3):
+    def __init__(self, encoder, pretrained_state=None, num_blocks=6, dropout=0.3):
         super().__init__()
         self.encoder = encoder
         
@@ -346,16 +292,30 @@ class MultiImageModel(nn.Module):
         self.decoder = VFAutoDecoder(input_dim=52)
         
         self.use_pretrained = False
+        self.decoder_frozen = True
+        
         if pretrained_state is not None:
             try:
                 self.decoder.load_state_dict(pretrained_state, strict=True)
                 self.use_pretrained = True
-                print(f"✓ Pre-trained decoder loaded")
+                for param in self.decoder.parameters():
+                    param.requires_grad = False
+                print(f"✓ Pre-trained decoder loaded (will unfreeze at epoch {DECODER_UNFREEZE_EPOCH})")
             except Exception as e:
                 print(f"⚠️  Decoder: {e}")
-                print(f"✓ Training from scratch")
+                self.decoder_frozen = False
         else:
+            self.decoder_frozen = False
             print(f"✓ Training decoder from scratch")
+    
+    def unfreeze_decoder(self):
+        if self.use_pretrained and self.decoder_frozen:
+            for param in self.decoder.parameters():
+                param.requires_grad = True
+            self.decoder_frozen = False
+            print(f"  ✓ Decoder UNFROZEN")
+            return True
+        return False
     
     def forward(self, x, average_multi=True):
         if x.dim() == 4:
@@ -366,11 +326,9 @@ class MultiImageModel(nn.Module):
             vf_features = self.projection(latent)
             pred = self.decoder(vf_features)
             
-            # Post-process predictions
-            def post_process_predictions(pred, threshold=0.5):
-                pred = torch.where(pred < threshold, torch.zeros_like(pred), pred)
-                return pred
-            pred = post_process_predictions(pred, threshold=0.5)
+            # CRITICAL FIX: Lower threshold to 0.1 (was 0.3-0.5 in baseline)
+            # This allows low predictions (0-3 dB) to pass through
+            pred = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
             
             if USE_OUTLIER_CLIPPING:
                 pred = torch.clamp(pred, OUTLIER_CLIP_RANGE[0], OUTLIER_CLIP_RANGE[1])
@@ -382,14 +340,8 @@ class MultiImageModel(nn.Module):
         else:
             raise ValueError(f"Unexpected input shape: {x.shape}")
 
-# ============== Mixup ==============
-def mixup_criterion(pred, y_a, y_b, lam, laterality_a, laterality_b):
-    loss_a, mae_a, nv_a = compute_loss(pred, y_a, laterality_a, smooth=LABEL_SMOOTH)
-    loss_b, mae_b, nv_b = compute_loss(pred, y_b, laterality_b, smooth=LABEL_SMOOTH)
-    return lam * loss_a + (1 - lam) * loss_b, lam * mae_a + (1 - lam) * mae_b, max(nv_a, nv_b)
-
-# ============== Loss & Metrics ==============
-def compute_loss(pred, target, laterality, smooth=0.0, epoch=0):
+# ============== Loss with MILD Reweighting ==============
+def compute_loss(pred, target, laterality, smooth=0.0):
     device = pred.device
     target = target.to(device)
     
@@ -414,55 +366,25 @@ def compute_loss(pred, target, laterality, smooth=0.0, epoch=0):
         
         pred_clean = pred[i][mask]
         target_clean = target_valid[mask]
-
-        # ======== ADAPTIVE LOCATION WEIGHTING ========
-        # Phase 1: Focus on historically worst locations
-        if epoch <= 30:
-            worst_locs = [18, 20, 26, 34, 42, 48]  # Current worst from epoch 10
-            weight_multiplier = 1.3  # Moderate weight
-        # Phase 2: Uniform weighting for balance
-        elif epoch <= 80:
-            worst_locs = []
-            weight_multiplier = 1.0
-        # Phase 3: Focus on peripheral locations
-        else:
-            worst_locs = [0, 4, 10, 34, 42, 48, 49, 51]
-            weight_multiplier = 1.2
         
+        # Mild class reweighting
         weights = torch.ones_like(pred_clean)
-        masked_positions = mask.nonzero(as_tuple=False).squeeze()
-        if masked_positions.dim() == 0:
-            masked_positions = masked_positions.unsqueeze(0)
+        low_mask = (target_clean < LOW_DB_THRESHOLD)
+        weights[low_mask] = LOW_VALUE_WEIGHT
         
-        for idx, pos in enumerate(masked_positions):
-            actual_location = valid_idx[pos.item()]
-            if actual_location in worst_locs:
-                weights[idx] = weight_multiplier
-        # =============================================
-
         # Label smoothing
         if smooth > 0:
             mean_val = target_clean.mean()
             target_clean = (1 - smooth) * target_clean + smooth * mean_val
         
-        # ======== BALANCED ZERO-INFLATED LOSS ========
-        if USE_ROBUST_LOSS:
-            base_loss = F.huber_loss(pred_clean, target_clean, reduction='none', delta=2.0)
-            
-            # Moderate zero penalty
-            zero_mask = (target_clean == 0.0)
-            zero_penalty = zero_mask.float() * (pred_clean.abs() * 0.5)  # Reduced penalty
-            
-            loss = ((base_loss + zero_penalty) * weights).sum()
-        else:
-            loss = F.smooth_l1_loss(pred_clean, target_clean, reduction='none', beta=1.0)
-            loss = (loss * weights).sum()
-        # =============================================
+        # Huber loss
+        loss = F.huber_loss(pred_clean, target_clean, reduction='none', delta=2.0)
+        loss = (loss * weights).mean()
         
-        mae = ((pred_clean - target_clean).abs()).sum()  # Don't weight MAE metric
+        mae = (pred_clean - target_clean).abs().mean()
         
-        total_loss += loss
-        total_mae += mae.item()
+        total_loss += loss * mask.sum().item()
+        total_mae += mae.item() * mask.sum().item()
         n_valid += mask.sum().item()
     
     if n_valid == 0:
@@ -500,61 +422,25 @@ def pearson_correlation(pred, target, laterality):
     
     return np.corrcoef(np.array(all_pred), np.array(all_target))[0, 1]
 
-def evaluate(model, loader, epoch=None, save_debug=False):
+def evaluate(model, loader):
     model.eval()
     total_mae = 0.0
     n_valid = 0
     all_preds, all_targets, all_lats = [], [], []
-    all_errors = []
-    all_sample_info = []
     
     with torch.no_grad():
-        for sample_idx, sample in enumerate(loader):
+        for sample in loader:
             imgs, hvf, lat = sample
             imgs = imgs.to(DEVICE)
+            pred = model(imgs, average_multi=True)
             
-            # ENSEMBLE WITH MULTIPLE THRESHOLDS (only during validation)
-            if epoch is not None:  # During training - use ensemble
-                preds_ensemble = []
-                for threshold in [0.3, 0.5, 0.8]:
-                    # Get raw prediction
-                    latent = model.encoder.forward_encoder(imgs, mask_ratio=0.0)[0]
-                    if latent.dim() == 3:
-                        latent = latent[:, 0, :]
-                    vf_features = model.projection(latent)
-                    pred_raw = model.decoder(vf_features)
-                    
-                    # Post-process with different thresholds
-                    pred_processed = torch.where(pred_raw < threshold, 
-                                                torch.zeros_like(pred_raw), pred_raw)
-                    if USE_OUTLIER_CLIPPING:
-                        pred_processed = torch.clamp(pred_processed, 
-                                                     OUTLIER_CLIP_RANGE[0], 
-                                                     OUTLIER_CLIP_RANGE[1])
-                    
-                    if pred_processed.shape[0] > 1:
-                        pred_processed = pred_processed.mean(dim=0, keepdim=True)
-                    
-                    preds_ensemble.append(pred_processed)
-                
-                # Average across thresholds
-                pred = torch.stack(preds_ensemble).mean(dim=0)
-            else:
-                pred = model(imgs, average_multi=True)
-            
-            _, mae, nv = compute_loss(pred, hvf, lat, epoch=epoch if epoch else 0)
+            _, mae, nv = compute_loss(pred, hvf, lat)
             total_mae += mae * nv
             n_valid += nv
             
-            all_errors.append(mae)
             all_preds.append(pred.cpu().numpy().flatten())
             all_targets.append(hvf.cpu().numpy().flatten())
             all_lats.append(lat)
-            all_sample_info.append({
-                'sample_idx': sample_idx,
-                'mae': mae,
-                'laterality': lat
-            })
     
     if n_valid == 0:
         return float('inf'), 0.0
@@ -562,255 +448,20 @@ def evaluate(model, loader, epoch=None, save_debug=False):
     mae = total_mae / n_valid
     all_preds = np.stack(all_preds)
     all_targets = np.stack(all_targets)
-    all_errors = np.array(all_errors)
     corr = pearson_correlation(torch.tensor(all_preds), torch.tensor(all_targets), all_lats)
     
-    if save_debug and epoch is not None:
-        analyze_predictions(all_preds, all_targets, all_errors, all_lats, all_sample_info, epoch)
-    
     return mae, corr
-
-def analyze_predictions(preds, targets, errors, lateralities, sample_info, epoch):
-    """
-    Create comprehensive visualization of ALL predictions.
-    
-    This replaces the old analyze_predictions function.
-    Creates a single figure with 6 subplots showing complete analysis.
-    """
-    
-    print(f"\n  📊 Error Statistics (Epoch {epoch}):")
-    print(f"    Mean MAE: {errors.mean():.2f} dB | Median: {np.median(errors):.2f} dB")
-    print(f"    Std Dev: {errors.std():.2f} dB")
-    print(f"    Min: {errors.min():.2f} dB | Max: {errors.max():.2f} dB")
-    
-    # Collect ALL prediction points
-    all_pred_points = []
-    all_target_points = []
-    all_residuals = []
-    
-    for pred, target, lat in zip(preds, targets, lateralities):
-        valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
-        target_valid = target[valid_idx]
-        mask = target_valid < MASKED_VALUE_THRESHOLD
-        
-        if mask.sum() > 0:
-            pred_clean = pred[mask]
-            target_clean = target_valid[mask]
-            all_pred_points.extend(pred_clean)
-            all_target_points.extend(target_clean)
-            all_residuals.extend((pred_clean - target_clean).tolist())
-    
-    all_pred_points = np.array(all_pred_points)
-    all_target_points = np.array(all_target_points)
-    all_residuals = np.array(all_residuals)
-    
-    # Create figure
-    fig = plt.figure(figsize=(18, 12))
-    gs = fig.add_gridspec(3, 3, hspace=0.35, wspace=0.35)
-    
-    # ========== PLOT 1: MAIN SCATTER - ALL PREDICTIONS ==========
-    ax1 = fig.add_subplot(gs[0:2, 0:2])
-    
-    # Color by error magnitude
-    point_errors = np.abs(all_pred_points - all_target_points)
-    scatter = ax1.scatter(all_target_points, all_pred_points, 
-                         c=point_errors, cmap='RdYlGn_r', 
-                         alpha=0.6, s=25, vmin=0, vmax=10,
-                         edgecolors='black', linewidth=0.3)
-    
-    # Perfect prediction line
-    ax1.plot([0, 35], [0, 35], 'k--', linewidth=2.5, label='Perfect prediction', alpha=0.8)
-    
-    # Regression line
-    slope, intercept, r_value, p_value, std_err = stats.linregress(all_target_points, all_pred_points)
-    line_x = np.array([0, 35])
-    line_y = slope * line_x + intercept
-    ax1.plot(line_x, line_y, 'r-', linewidth=2.5, 
-            label=f'Fit: y={slope:.2f}x+{intercept:.2f} (R²={r_value**2:.3f})', alpha=0.8)
-    
-    ax1.set_xlabel('True VF Sensitivity (dB)', fontsize=13, fontweight='bold')
-    ax1.set_ylabel('Predicted VF Sensitivity (dB)', fontsize=13, fontweight='bold')
-    ax1.set_title(f'All Predictions vs Ground Truth - Epoch {epoch}\n'
-                 f'N = {len(all_pred_points):,} points from {len(preds)} samples',
-                 fontsize=14, fontweight='bold')
-    ax1.legend(loc='upper left', fontsize=11)
-    ax1.grid(True, alpha=0.3, linestyle='--')
-    ax1.set_xlim(-1, 36)
-    ax1.set_ylim(-1, 36)
-    ax1.set_aspect('equal')
-    
-    # Colorbar
-    cbar = plt.colorbar(scatter, ax=ax1)
-    cbar.set_label('Absolute Error (dB)', fontsize=11, fontweight='bold')
-    
-    # Stats box
-    textstr = f'Pearson r: {r_value:.3f}\nMAE: {point_errors.mean():.2f} dB\nRMSE: {np.sqrt(np.mean(point_errors**2)):.2f} dB\nBias: {all_residuals.mean():.2f} dB'
-    ax1.text(0.02, 0.98, textstr, transform=ax1.transAxes, fontsize=11,
-            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.9))
-    
-    # ========== PLOT 2: SAMPLE ERROR DISTRIBUTION ==========
-    ax2 = fig.add_subplot(gs[0, 2])
-    ax2.hist(errors, bins=25, edgecolor='black', alpha=0.75, color='steelblue')
-    ax2.axvline(errors.mean(), color='red', linestyle='--', linewidth=2, 
-               label=f'Mean: {errors.mean():.2f}')
-    ax2.axvline(np.median(errors), color='green', linestyle='--', linewidth=2,
-               label=f'Median: {np.median(errors):.2f}')
-    ax2.set_xlabel('MAE per Sample (dB)', fontsize=10, fontweight='bold')
-    ax2.set_ylabel('Frequency', fontsize=10, fontweight='bold')
-    ax2.set_title('Sample-Level Errors', fontsize=11, fontweight='bold')
-    ax2.legend(fontsize=9)
-    ax2.grid(True, alpha=0.3, axis='y')
-    
-    # ========== PLOT 3: RESIDUALS ==========
-    ax3 = fig.add_subplot(gs[1, 2])
-    ax3.scatter(all_pred_points, all_residuals, alpha=0.4, s=12, color='navy')
-    ax3.axhline(0, color='red', linestyle='--', linewidth=2, alpha=0.8)
-    ax3.axhline(all_residuals.mean(), color='orange', linestyle='--', linewidth=2,
-               label=f'Mean: {all_residuals.mean():.2f}')
-    # Add ±1 std lines
-    ax3.axhline(all_residuals.mean() + all_residuals.std(), color='orange', 
-               linestyle=':', linewidth=1.5, alpha=0.6)
-    ax3.axhline(all_residuals.mean() - all_residuals.std(), color='orange', 
-               linestyle=':', linewidth=1.5, alpha=0.6)
-    ax3.set_xlabel('Predicted Value (dB)', fontsize=10, fontweight='bold')
-    ax3.set_ylabel('Residual (Pred - True)', fontsize=10, fontweight='bold')
-    ax3.set_title('Residual Analysis', fontsize=11, fontweight='bold')
-    ax3.legend(fontsize=9)
-    ax3.grid(True, alpha=0.3)
-    
-    # ========== PLOT 4: ERROR BY TRUE VALUE RANGE ==========
-    ax4 = fig.add_subplot(gs[2, 0])
-    
-    bins = np.arange(0, 36, 5)
-    bin_centers = bins[:-1] + 2.5
-    binned_errors = []
-    binned_counts = []
-    
-    for i in range(len(bins) - 1):
-        mask = (all_target_points >= bins[i]) & (all_target_points < bins[i+1])
-        if mask.sum() > 0:
-            binned_errors.append(point_errors[mask].mean())
-            binned_counts.append(mask.sum())
-        else:
-            binned_errors.append(0)
-            binned_counts.append(0)
-    
-    bars = ax4.bar(bin_centers, binned_errors, width=4, edgecolor='black', alpha=0.75, color='coral')
-    ax4.set_xlabel('True VF Value Range (dB)', fontsize=10, fontweight='bold')
-    ax4.set_ylabel('Mean Absolute Error (dB)', fontsize=10, fontweight='bold')
-    ax4.set_title('Error by VF Sensitivity Range', fontsize=11, fontweight='bold')
-    ax4.grid(True, alpha=0.3, axis='y')
-    
-    # Add counts on bars
-    for bar, count in zip(bars, binned_counts):
-        if count > 0:
-            height = bar.get_height()
-            ax4.text(bar.get_x() + bar.get_width()/2., height,
-                    f'n={count}', ha='center', va='bottom', fontsize=8)
-    
-    # ========== PLOT 5: VF LOCATION HEATMAP ==========
-    ax5 = fig.add_subplot(gs[2, 1])
-    
-    location_errors = [[] for _ in range(52)]
-    
-    for pred, target, lat in zip(preds, targets, lateralities):
-        valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
-        target_valid = target[valid_idx]
-        mask = target_valid < MASKED_VALUE_THRESHOLD
-        
-        if mask.sum() > 0:
-            pred_clean = pred[mask]
-            target_clean = target_valid[mask]
-            point_errors_sample = np.abs(pred_clean - target_clean)
-            
-            masked_indices = np.where(mask)[0]
-            for loc_idx, error in zip(masked_indices, point_errors_sample):
-                if loc_idx < 52:
-                    location_errors[loc_idx].append(error)
-    
-    mean_location_errors = np.array([
-        np.mean(errors_loc) if len(errors_loc) > 0 else np.nan
-        for errors_loc in location_errors
-    ])
-    
-    # Reshape to 8x9 grid
-    error_grid = np.ones((8, 9)) * np.nan
-    for idx, loc in enumerate(valid_indices_od):
-        if idx < len(mean_location_errors):
-            row = loc // 9
-            col = loc % 9
-            error_grid[row, col] = mean_location_errors[idx]
-    
-    im = ax5.imshow(error_grid, cmap='RdYlGn_r', interpolation='nearest', vmin=0, vmax=7)
-    ax5.set_title('Mean Error by VF Location', fontsize=11, fontweight='bold')
-    ax5.set_xlabel('Column', fontsize=10, fontweight='bold')
-    ax5.set_ylabel('Row', fontsize=10, fontweight='bold')
-    cbar2 = plt.colorbar(im, ax=ax5)
-    cbar2.set_label('MAE (dB)', fontsize=10, fontweight='bold')
-    
-    # ========== PLOT 6: BIAS BY RANGE ==========
-    ax6 = fig.add_subplot(gs[2, 2])
-    
-    binned_bias = []
-    for i in range(len(bins) - 1):
-        mask = (all_target_points >= bins[i]) & (all_target_points < bins[i+1])
-        if mask.sum() > 0:
-            binned_bias.append(all_residuals[mask].mean())
-        else:
-            binned_bias.append(0)
-    
-    colors = ['red' if b > 0 else 'blue' for b in binned_bias]
-    ax6.bar(bin_centers, binned_bias, width=4, edgecolor='black', alpha=0.75, color=colors)
-    ax6.axhline(0, color='black', linestyle='-', linewidth=2)
-    ax6.set_xlabel('True VF Value Range (dB)', fontsize=10, fontweight='bold')
-    ax6.set_ylabel('Mean Bias (Pred - True)', fontsize=10, fontweight='bold')
-    ax6.set_title('Prediction Bias by Range', fontsize=11, fontweight='bold')
-    ax6.grid(True, alpha=0.3, axis='y')
-    
-    # Legend for colors
-    ax6.text(0.02, 0.98, 'Red: Over-prediction\nBlue: Under-prediction', 
-            transform=ax6.transAxes, fontsize=9,
-            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
-    
-    # Overall title
-    plt.suptitle(f'Comprehensive Prediction Analysis - Epoch {epoch} - MAE: {errors.mean():.2f} dB', 
-                fontsize=16, fontweight='bold', y=0.998)
-    
-    # Save
-    plt.savefig(os.path.join(DEBUG_DIR, f'comprehensive_analysis_epoch_{epoch}.png'), 
-               dpi=200, bbox_inches='tight')
-    plt.close()
-    
-    print(f"\n  📁 Comprehensive visualization saved:")
-    print(f"    → {DEBUG_DIR}/comprehensive_analysis_epoch_{epoch}.png")
-    
-    # Print statistics
-    print(f"\n  📈 Detailed Statistics:")
-    print(f"    Total points: {len(all_pred_points):,}")
-    print(f"    Pearson r: {r_value:.3f} (R² = {r_value**2:.3f})")
-    print(f"    MAE: {point_errors.mean():.2f} dB")
-    print(f"    RMSE: {np.sqrt(np.mean(point_errors**2)):.2f} dB")
-    print(f"    Mean bias: {all_residuals.mean():.2f} dB")
-    print(f"    Bias std: {all_residuals.std():.2f} dB")
-    
-    # Range-specific analysis
-    zero_mask = all_target_points < 1.0
-    low_mask = (all_target_points >= 1.0) & (all_target_points < 10.0)
-    mid_mask = (all_target_points >= 10.0) & (all_target_points < 20.0)
-    high_mask = all_target_points >= 20.0
-    
-    print(f"\n  🎯 Error by Sensitivity Range:")
-    print(f"    Very Low (<1 dB):  {point_errors[zero_mask].mean():.2f} dB MAE ({zero_mask.sum():,} pts)")
-    print(f"    Low (1-10 dB):     {point_errors[low_mask].mean():.2f} dB MAE ({low_mask.sum():,} pts)")
-    print(f"    Mid (10-20 dB):    {point_errors[mid_mask].mean():.2f} dB MAE ({mid_mask.sum():,} pts)")
-    print(f"    High (≥20 dB):     {point_errors[high_mask].mean():.2f} dB MAE ({high_mask.sum():,} pts)")
-
 
 # ============== Training ==============
 def train():
     print("="*60)
-    print("ULTIMATE Multi-Technique Training for Sub-3 MAE")
+    print("CONSERVATIVE Training - Build on 3.74 dB Baseline")
     print("="*60)
+    print(f"\nMinimal Changes:")
+    print(f"  1. Unfreeze decoder at epoch {DECODER_UNFREEZE_EPOCH} (gentle LR)")
+    print(f"  2. Lower threshold: 0.1 dB (was 0.3-0.5) - allows low predictions")
+    print(f"  3. Mild 2x weight on low values (not 10x!)")
+    print(f"  4. Keep everything else from baseline that was working")
     
     train_dataset = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, train_transform, mode='train', use_tta=False)
     val_dataset = MultiImageDataset(VAL_JSON, FUNDUS_DIR, val_transform, mode='val', use_tta=USE_TTA)
@@ -820,123 +471,89 @@ def train():
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, 
                            num_workers=0, collate_fn=val_collate_fn)
     
-    print(f"Techniques: SWA + 8x TTA + RandAugment + Gradient Accum + Mixup + Label Smooth")
-    
     model = MultiImageModel(base_model, pretrained_decoder_state, NUM_ENCODER_BLOCKS, DROPOUT_RATE)
     model.to(DEVICE)
     
-    enc_params = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
-    proj_params = sum(p.numel() for p in model.projection.parameters())
-    dec_params = sum(p.numel() for p in model.decoder.parameters())
-    print(f"Trainable: Enc={enc_params:,}, Proj={proj_params:,}, Dec={dec_params:,}")
-    
+    # Initial optimizer
     optimizer = optim.AdamW([
         {'params': [p for p in model.encoder.parameters() if p.requires_grad], 
-        'lr': LR * 0.03, 'weight_decay': WEIGHT_DECAY * 2},  # Reduced from 0.06
+         'lr': BASE_LR * 0.05, 'weight_decay': WEIGHT_DECAY * 2},
         {'params': model.projection.parameters(), 
-        'lr': LR * 0.5, 'weight_decay': WEIGHT_DECAY},  # Reduced from 1.0
-        {'params': model.decoder.parameters(), 
-        'lr': LR * 0.1, 'weight_decay': WEIGHT_DECAY * 0.5}  # Reduced
+         'lr': BASE_LR * 1.0, 'weight_decay': WEIGHT_DECAY}
     ])
     
-    # Cosine annealing with warm restarts
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=50, T_mult=1, eta_min=1e-6
-    )
-    
-    # SWA model
-    swa_model = None
-    swa_n = 0
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
     
     best_mae = float('inf')
     patience = 0
+    decoder_unfrozen = False
     
     for epoch in range(1, EPOCHS + 1):
+        # Unfreeze decoder
+        if epoch == DECODER_UNFREEZE_EPOCH and not decoder_unfrozen:
+            if model.unfreeze_decoder():
+                print(f"\n{'='*60}")
+                print(f"Decoder unfrozen at epoch {epoch}")
+                print(f"{'='*60}")
+                decoder_unfrozen = True
+                
+                # Conservative decoder LR
+                optimizer = optim.AdamW([
+                    {'params': [p for p in model.encoder.parameters() if p.requires_grad], 
+                     'lr': BASE_LR * 0.03, 'weight_decay': WEIGHT_DECAY * 2},
+                    {'params': model.projection.parameters(), 
+                     'lr': BASE_LR * 0.6, 'weight_decay': WEIGHT_DECAY},
+                    {'params': model.decoder.parameters(), 
+                     'lr': BASE_LR * 0.08, 'weight_decay': WEIGHT_DECAY * 0.5}  # Very low!
+                ])
+                
+                remaining_epochs = EPOCHS - epoch + 1
+                scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_epochs, eta_min=1e-6)
+        
         model.train()
-        
-        # Enable mixup in later epochs
-        use_mixup = USE_MIXUP and epoch > EPOCHS // 2
-        
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
-        optimizer.zero_grad()
         
-        for batch_idx, (imgs, hvf, lat) in enumerate(pbar):
+        for imgs, hvf, lat in pbar:
             imgs = imgs.to(DEVICE)
             
-            if use_mixup and random.random() < 0.5:
-                # Mixup
-                lam = np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA)
-                batch_size = imgs.size(0)
-                index = torch.randperm(batch_size)
-                
-                mixed_imgs = lam * imgs + (1 - lam) * imgs[index]
-                hvf_a, hvf_b = hvf, hvf[index]
-                lat_a = lat
-                lat_b = [lat[i] for i in index.tolist()]
-                
-                pred = model(mixed_imgs, average_multi=False)
-                loss, mae, nv = mixup_criterion(pred, hvf_a, hvf_b, lam, lat_a, lat_b)
-            else:
-                pred = model(imgs, average_multi=False)
-                loss, mae, nv = compute_loss(pred, hvf, lat, smooth=LABEL_SMOOTH, epoch=epoch)
+            pred = model(imgs, average_multi=False)
+            loss, mae, nv = compute_loss(pred, hvf, lat, smooth=LABEL_SMOOTH)
             
             if nv > 0:
-                loss = loss / ACCUM_STEPS
+                optimizer.zero_grad()
                 loss.backward()
-                
-                if (batch_idx + 1) % ACCUM_STEPS == 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.5)
-                    optimizer.step()
-                    optimizer.zero_grad()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
             
             pbar.set_postfix({'MAE': f'{mae:.2f}'})
         
         scheduler.step()
         
-        # SWA: Start averaging weights
-        if USE_SWA and epoch >= SWA_START:
-            if swa_model is None:
-                swa_model = copy.deepcopy(model)
-                swa_n = 1
-            else:
-                # Update SWA model
-                for swa_param, param in zip(swa_model.parameters(), model.parameters()):
-                    swa_param.data = (swa_param.data * swa_n + param.data) / (swa_n + 1)
-                swa_n += 1
-        
-        # Evaluate with SWA model if available
-        eval_model = swa_model if swa_model is not None else model
-        
-        # Save debug visualizations every 10 epochs or at key milestones
-        save_debug = (epoch % 10 == 0) or (epoch in [5, 15, 25, 50, 100, SWA_START])
-        val_mae, val_corr = evaluate(eval_model, val_loader, epoch=epoch, save_debug=save_debug)
+        val_mae, val_corr = evaluate(model, val_loader)
         
         if epoch % 5 == 0:
-            train_mae, train_corr = evaluate(eval_model, DataLoader(
+            train_mae, train_corr = evaluate(model, DataLoader(
                 MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, val_transform, mode='val', use_tta=False),
                 batch_size=1, shuffle=False, collate_fn=val_collate_fn
-            ), epoch=None, save_debug=False)
+            ))
             gap = train_mae - val_mae
-            swa_status = " [SWA]" if swa_model is not None else ""
-            print(f"\n[Epoch {epoch}]{swa_status}")
+            status = "[FROZEN]" if not decoder_unfrozen else "[ACTIVE]"
+            print(f"\n[Epoch {epoch}] {status}")
             print(f"  Train: {train_mae:.2f} dB | Corr: {train_corr:.3f}")
             print(f"  Val:   {val_mae:.2f} dB | Corr: {val_corr:.3f} | Gap: {gap:+.2f}")
         
         if val_mae < best_mae:
             best_mae = val_mae
             
-            save_model = swa_model if swa_model is not None else model
-            
             torch.save({
-                'model': save_model.state_dict(),
+                'model': model.state_dict(),
                 'mae': val_mae,
                 'corr': val_corr,
-                'epoch': epoch,
-                'swa': swa_model is not None
+                'epoch': epoch
             }, BEST_SAVE)
             
             torch.save({
-                'model_state_dict': save_model.state_dict(),
+                'model_state_dict': model.state_dict(),
                 'encoder_checkpoint': CHECKPOINT_PATH,
                 'val_mae': val_mae,
                 'val_corr': val_corr,
@@ -944,7 +561,7 @@ def train():
             }, INFERENCE_SAVE)
             
             if epoch % 5 == 0:
-                print(f"  ✓ Best!")
+                print(f"  ✓ New Best!")
             
             patience = 0
         else:
@@ -952,100 +569,19 @@ def train():
             if patience >= PATIENCE:
                 print(f"\nEarly stopping at epoch {epoch}")
                 break
-
-    # ============== PHASE 2: FINE-TUNING ==============
-    if best_mae > 3.80:  # If not reached target
-        print(f"\n{'='*60}")
-        print(f"PHASE 2: Fine-Tuning with Ultra-Low LR")
-        print(f"{'='*60}")
-        
-        # Load best model
-        checkpoint = torch.load(BEST_SAVE, map_location=DEVICE)
-        model.load_state_dict(checkpoint['model'])
-        
-        # Drastically reduce learning rate
-        optimizer = optim.AdamW([
-            {'params': [p for p in model.encoder.parameters() if p.requires_grad], 
-             'lr': LR * 0.003, 'weight_decay': WEIGHT_DECAY * 3},  # 10x lower
-            {'params': model.projection.parameters(), 
-             'lr': LR * 0.05, 'weight_decay': WEIGHT_DECAY * 2},  # 10x lower
-            {'params': model.decoder.parameters(), 
-             'lr': LR * 0.01, 'weight_decay': WEIGHT_DECAY}  # 10x lower
-        ])
-        
-        # Reset patience
-        patience = 0
-        phase2_epochs = 50
-        
-        for epoch in range(1, phase2_epochs + 1):
-            model.train()
-            pbar = tqdm(train_loader, desc=f"Phase2 Epoch {epoch}/{phase2_epochs}")
-            optimizer.zero_grad()
-            
-            for batch_idx, (imgs, hvf, lat) in enumerate(pbar):
-                imgs = imgs.to(DEVICE)
-                pred = model(imgs, average_multi=False)
-                loss, mae, nv = compute_loss(pred, hvf, lat, smooth=LABEL_SMOOTH, epoch=100)
-                
-                if nv > 0:
-                    loss = loss / ACCUM_STEPS
-                    loss.backward()
-                    
-                    if (batch_idx + 1) % ACCUM_STEPS == 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                        optimizer.step()
-                        optimizer.zero_grad()
-                
-                pbar.set_postfix({'MAE': f'{mae:.2f}'})
-            
-            val_mae, val_corr = evaluate(model, val_loader, epoch=None, save_debug=False)
-            
-            if epoch % 5 == 0:
-                print(f"\n[Phase2 Epoch {epoch}]")
-                print(f"  Val: {val_mae:.2f} dB | Corr: {val_corr:.3f}")
-            
-            if val_mae < best_mae:
-                best_mae = val_mae
-                torch.save({
-                    'model': model.state_dict(),
-                    'mae': val_mae,
-                    'corr': val_corr,
-                    'epoch': epoch,
-                    'phase': 2
-                }, BEST_SAVE)
-                torch.save({
-                    'model_state_dict': model.state_dict(),
-                    'encoder_checkpoint': CHECKPOINT_PATH,
-                    'val_mae': val_mae,
-                    'val_corr': val_corr,
-                    'use_pretrained': model.use_pretrained
-                }, INFERENCE_SAVE)
-                print(f"  ✓ New Best!")
-                patience = 0
-            else:
-                patience += 1
-                if patience >= 15:  # Shorter patience
-                    print(f"\nPhase 2 early stopping at epoch {epoch}")
-                    break
     
     print(f"\n{'='*60}")
     print(f"Training Complete!")
     print(f"Best Val MAE: {best_mae:.2f} dB")
     
-    print(f"\n📊 Key Recommendations Based on Errors:")
-    print(f"  1. Check samples with MAE > 10 dB for data quality issues")
-    print(f"  2. Outlier clipping is now enabled (0-35 dB range)")
-    print(f"  3. Huber loss reduces sensitivity to extreme errors")
-    print(f"  4. Review visualizations in {DEBUG_DIR}/")
+    baseline_gain = 3.74 - best_mae
     
     if best_mae < 3.0:
-        print(f"\n✓✓✓ SUB-3 MAE ACHIEVED!")
+        print(f"\n SUB-3 MAE ACHIEVED! Beat baseline by {baseline_gain:.2f} dB")
     elif best_mae < 3.5:
-        print(f"\n✓✓ Close to sub-3 (gap: {best_mae - 3.0:.2f} dB)")
-    elif best_mae < 4.0:
-        print(f"\n✓ SUB-4 ACHIEVED!")
+        print(f"\n SUB-3.5 ACHIEVED! Beat baseline by {baseline_gain:.2f} dB")
     else:
-        print(f"\n⚠️  Target not reached. Check debug visualizations for insights.")
+        print(f"\n Gap to baseline: {best_mae - 3.74:+.2f} dB") # 3.74db previous baseline
     
     print(f"\nModel saved to: {INFERENCE_SAVE}")
     print("="*60)

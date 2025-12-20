@@ -41,7 +41,7 @@ distances, indices = tree.query(G1_RIGHT)
 
 # -----------------------------
 # Create color palette 
-# (same color for a G1 cluster and the 24-2 it maps to)
+# G1 clusters and 24-2 point they map to will set to same color
 # -----------------------------
 
 num_targets = len(VF24_2_RIGHT)

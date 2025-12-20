@@ -5,12 +5,12 @@ import json
 from scipy.interpolate import griddata
 
 grape = pd.read_excel("data/vf_tests/grape_data.xlsx", sheet_name="Baseline")
-grape_vf = grape.iloc[:, -61:].values  # last 61 columns: G1 VF values
+grape_vf = grape.iloc[:, -61:].values
 patient_ids = grape.iloc[:, 0].values
 laterality = grape.iloc[:, 1].values
 fundus_files = grape.iloc[:, 16].values
 
-# Degree locations of G1 vf tests (NO BLIND SPOTS - 59 instead of 61)
+# Degree locations of G1 vf tests (59 not including blind spots)
 G1_LOCATIONS_RIGHT = np.array([
     [-8,  26], [  8, 26],
     [-20, 20], [-12, 20], [ -4, 20], [  4, 20], [ 12, 20], [ 20, 20],
@@ -42,7 +42,7 @@ G1_LOCATIONS_LEFT = np.array([
     [ -8,-26], [  8,-26],
 ], dtype=float)
 
-# 24-2 VF Test Locations (NO blind spots - 52 not 54)
+# 24-2 VF Test Locations (52 total not including blind spots)
 VF24_2_RIGHT = np.array([
     [-9, 21], [-3, 21], [3, 21], [9, 21],
     [-15, 15], [-9, 15], [-3, 15], [3, 15], [9, 15], [15, 15],
@@ -100,13 +100,13 @@ def spiral_order(eye):
                 33, 34, 35, 36, 37, 38,
                 52, 53] # left eye
 
-# Remove 22nd and 33rd columns
+# Mask 22nd and 33rd columns (blind spots)
 mask = np.ones(grape_vf.shape[1], dtype=bool)
 mask[21] = False
 mask[32] = False
 vf_removed = grape_vf[:, mask]
 
-# Reorder each row based on laterality (now with 59 columns instead of 61)
+# Reorder each row based on laterality (59 columns instead of 61)
 reordered_vf = np.zeros_like(vf_removed)
 
 for i, (vf_row, lat) in enumerate(zip(vf_removed, laterality)):

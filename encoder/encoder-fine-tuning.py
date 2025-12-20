@@ -1,10 +1,8 @@
-#!/usr/bin/env python3
 """
-Simple Encoder Fine-tuning for VF Prediction
+Encoder Fine-tuning for VF Predictions
 - Fine-tunes last N blocks of RETFound encoder
 - Adds lightweight prediction head for 52 VF values
-- Careful not to overfit on limited GRAPE data
-- Target: 0.7-0.8 correlation, leaving room for decoder
+- Targets 0.7-0.8 Pearson correlation, leaving space for decoder
 """
 
 import os
@@ -26,11 +24,11 @@ from tqdm import tqdm
 DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 BATCH_SIZE = 8
 EPOCHS = 50
-LR_ENCODER = 2e-5  # Increased from 5e-6
-LR_HEAD = 1e-3     # Much higher for prediction head
+LR_ENCODER = 2e-5
+LR_HEAD = 1e-3 
 WEIGHT_DECAY = 1e-4
 PATIENCE = 12
-NUM_BLOCKS_TO_FINETUNE = 4  # Increased from 2 to 4
+NUM_BLOCKS_TO_FINETUNE = 4
 
 # Paths
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -123,7 +121,7 @@ class EncoderWithPredictionHead(nn.Module):
                     param.requires_grad = True
             print(f"✓ Unfrozen last {num_blocks_to_finetune} encoder blocks (blocks {total_blocks - num_blocks_to_finetune} to {total_blocks - 1})")
         
-        # Simple prediction head (intentionally simple to avoid overfitting)
+        # Simple prediction head to avoid overfitting
         # RETFound ViT-Large has 1024 dim embeddings
         embed_dim = 1024
         self.prediction_head = nn.Sequential(
@@ -153,7 +151,7 @@ class EncoderWithPredictionHead(nn.Module):
 # ============== Loss Function ==============
 def compute_masked_mae(pred: torch.Tensor, target: torch.Tensor, 
                        laterality: List[str]) -> Tuple[torch.Tensor, float]:
-    """Compute MAE only on valid points."""
+    """Computes MAE only on valid points."""
     device = pred.device
     target = target.to(device)
     total_loss = 0.0
@@ -175,7 +173,7 @@ def compute_masked_mae(pred: torch.Tensor, target: torch.Tensor,
 
 def pearson_correlation(pred: np.ndarray, target: np.ndarray, 
                        laterality: List[str]) -> float:
-    """Compute Pearson correlation across all valid points."""
+    """Computes Pearson correlation across all valid points."""
     all_pred = []
     all_target = []
     
@@ -197,7 +195,6 @@ def pearson_correlation(pred: np.ndarray, target: np.ndarray,
 
 # ============== Training & Evaluation ==============
 def evaluate(model, dataloader):
-    """Evaluate model on dataset."""
     model.eval()
     total_mae = 0.0
     all_preds = []
@@ -227,7 +224,6 @@ def evaluate(model, dataloader):
     return avg_mae, corr
 
 def train():
-    """Main training loop."""
     # Create datasets
     train_dataset = GRAPEDataset(TRAIN_JSON, FUNDUS_DIR, retfound_transform)
     val_dataset = GRAPEDataset(VAL_JSON, FUNDUS_DIR, retfound_transform)

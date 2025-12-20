@@ -1,9 +1,7 @@
-#!/usr/bin/env python3
 """
-Stage 1: VF Auto-encoder Pre-training - MPS OPTIMIZED
+Stage 1: VF Auto-encoder Pre-training via MPS
 - Train decoder to reconstruct VF from corrupted/masked VF
-- Uses 28,943 UWHVF samples (VF only, no images)
-- MPS-friendly: no hangs, explicit operations
+- Uses 28,943 of UWHVF's VF tests only
 """
 
 import os, json, numpy as np
@@ -27,8 +25,8 @@ else:
     DEVICE = torch.device("cpu")
     print(f"⚠️  MPS not available, using CPU")
 
-BATCH_SIZE = 256  # Larger batch on CPU
-EPOCHS = 80  # Fewer epochs since simpler architecture
+BATCH_SIZE = 256
+EPOCHS = 80
 LR = 1e-3
 WEIGHT_DECAY = 1e-4
 PATIENCE = 12
@@ -60,7 +58,7 @@ valid_indices_os: List[int] = list(reversed(valid_indices_od))
 
 # ============== Dataset ==============
 class VFDataset(Dataset):
-    """Enhanced dataset for VF auto-encoder training with multiple corruption strategies."""
+    """Enhanced dataset for VF auto-encoder training with 3 corruption strategies."""
     def __init__(self, json_path: str, corruption_ratio: float = 0.35):
         with open(json_path, 'r') as f:
             self.data = json.load(f)
@@ -70,23 +68,23 @@ class VFDataset(Dataset):
         return len(self.data)
     
     def corrupt_vf(self, hvf_valid):
-        """Apply multiple corruption strategies"""
+        """Applies multiple corruption strategies"""
         corrupted = hvf_valid.copy()
         n_corrupt = int(len(corrupted) * self.corruption_ratio)
         
-        # Strategy 1: Random masking (50% of corruptions)
+        # Random masking (50% of corruptions)
         n_random = n_corrupt // 2
         random_indices = np.random.choice(len(corrupted), n_random, replace=False)
         corrupted[random_indices] = 0.0
         
-        # Strategy 2: Add noise (30% of corruptions)
+        # Noise (30% of corruptions)
         n_noise = int(n_corrupt * 0.3)
         noise_indices = np.random.choice(len(corrupted), n_noise, replace=False)
         noise = np.random.randn(n_noise) * 3.0  # Gaussian noise
         corrupted[noise_indices] = np.clip(corrupted[noise_indices] + noise, 0, 40)
         
-        # Strategy 3: Regional dropout (20% of corruptions)
-        # Simulate loss of quadrants
+        # Regional dropout (20% of corruptions)
+        # Basically simulates loss of quadrants
         if np.random.rand() < 0.2:
             quadrant_size = len(corrupted) // 4
             quadrant_start = np.random.randint(0, len(corrupted) - quadrant_size)
@@ -117,7 +115,6 @@ class VFDataset(Dataset):
 
 # ============== Enhanced VF Decoder ==============
 class VFAutoDecoder(nn.Module):
-    """Simplified decoder without attention (MPS-friendly and matches training)"""
     def __init__(self, input_dim: int = 52):
         super().__init__()
         
@@ -154,7 +151,7 @@ class VFAutoDecoder(nn.Module):
 
 # ============== Loss Functions ==============
 def compute_mae(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None) -> Tuple[torch.Tensor, float]:
-    """MAE loss with optional masking."""
+    """Computes MAE loss with optional masking."""
     if mask is not None:
         # Only compute loss on valid (non-masked) values
         valid_pred = pred[mask]
@@ -168,7 +165,7 @@ def compute_mae(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = N
     return mae, mae.item()
 
 def compute_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-    """MSE loss with optional masking."""
+    """Computes MSE loss with optional masking."""
     if mask is not None:
         valid_pred = pred[mask]
         valid_target = target[mask]
@@ -178,7 +175,7 @@ def compute_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = N
     return torch.mean((pred - target) ** 2)
 
 def pearson_correlation(pred: np.ndarray, target: np.ndarray) -> float:
-    """Compute Pearson correlation."""
+    """Computes Pearson correlation."""
     pred_flat = pred.flatten()
     target_flat = target.flatten()
     
@@ -200,7 +197,6 @@ def pearson_correlation(pred: np.ndarray, target: np.ndarray) -> float:
 
 # ============== Training & Evaluation ==============
 def evaluate(model, dataloader):
-    """Evaluate model on dataset."""
     model.eval()
     total_mae = 0.0
     total_samples = 0
@@ -236,7 +232,6 @@ def evaluate(model, dataloader):
     return avg_mae, corr
 
 def train():
-    """Main training loop."""
     print("=" * 60)
     print("Stage 1: Enhanced VF Auto-encoder Pre-training")
     print("=" * 60)
@@ -356,7 +351,7 @@ def train():
                 break
     
     print(f"\n" + "=" * 60)
-    print(f"Stage 1 Complete!")
+    print(f"Stage 1 Complete")
     print(f"Best Val MAE: {best_val_mae:.3f} dB")
     print(f"Pre-trained decoder saved to: {PRETRAINED_DECODER_SAVE}")
     print(f"\nNext: Run training.py to fine-tune on GRAPE")
