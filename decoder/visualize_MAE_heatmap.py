@@ -26,7 +26,7 @@ from tqdm import tqdm
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 RETFOUND_DIR = os.path.join(CURRENT_DIR, '..', 'encoder', 'RETFound_MAE')
 CHECKPOINT_PATH = os.path.join(CURRENT_DIR, "..", "encoder", "RETFound_cfp_weights.pth")
-INFERENCE_SAVE   = os.path.join(CURRENT_DIR, "inference_model.pth")
+INFERENCE_SAVE   = os.path.join(CURRENT_DIR, "best_multi_image_model.pth")
 BASE_DIR         = os.path.join(CURRENT_DIR, "..")
 FUNDUS_DIR       = os.path.join(BASE_DIR, "data", "fundus", "grape_fundus_images")
 TRAIN_JSON       = os.path.join(BASE_DIR, "data", "vf_tests", "grape_train.json")
@@ -179,11 +179,6 @@ class MultiImageModel(nn.Module):
 
 # ============== Load model ==============
 def load_model():
-    # Try this temporarily
-    INFERENCE_SAVE = os.path.join(CURRENT_DIR, "best_multi_image_model.pth")
-    # and change the key from 'model_state_dict' to 'model'
-    state = inf_ckpt.get('model', inf_ckpt.get('model_state_dict'))
-    
     import argparse
     print("Loading RETFound encoder …")
     with torch.serialization.safe_globals([argparse.Namespace]):
