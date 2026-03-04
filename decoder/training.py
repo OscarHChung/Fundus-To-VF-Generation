@@ -44,7 +44,7 @@ MASKED_VALUE_THRESHOLD = 99.0
 DROPOUT_RATE = 0.3
 USE_TTA = True
 NUM_TTA_AUGS = 4
-LABEL_SMOOTH = 0.05
+LABEL_SMOOTH = 0.0
 USE_OUTLIER_CLIPPING = True
 OUTLIER_CLIP_RANGE = (0, 35)
 
@@ -53,7 +53,7 @@ LOW_DB_THRESHOLD = 10.0
 LOW_VALUE_WEIGHT = 2.0
 
 # Decoder unfreezing
-DECODER_UNFREEZE_EPOCH = 15
+DECODER_UNFREEZE_EPOCH = 1
 
 # Paths
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -80,7 +80,8 @@ mask_OD = np.array([
 ], dtype=bool)
 
 valid_indices_od = [i for i, v in enumerate(mask_OD.flatten()) if v]
-valid_indices_os = list(reversed(valid_indices_od))
+mask_OS = np.fliplr(mask_OD)
+valid_indices_os = [i for i, v in enumerate(mask_OS.flatten()) if v]
 
 # ============== Load RETFound ==============
 sys.path.insert(0, RETFOUND_DIR)
@@ -107,8 +108,10 @@ if os.path.exists(PRETRAINED_DECODER):
 train_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.RandomHorizontalFlip(p=0.3),
-    transforms.RandomRotation(10),
-    transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+    transforms.RandomRotation(15),          # was 10
+    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),  # ADD
+    transforms.RandomGrayscale(p=0.1),      # ADD
+    transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.9, 1.1)),  # wider scale
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
@@ -378,7 +381,7 @@ def compute_loss(pred, target, laterality, smooth=0.0):
             target_clean = (1 - smooth) * target_clean + smooth * mean_val
         
         # Huber loss
-        loss = F.huber_loss(pred_clean, target_clean, reduction='none', delta=2.0)
+        loss = F.huber_loss(pred_clean, target_clean, reduction='none', delta=1.0)
         loss = (loss * weights).mean()
         
         mae = (pred_clean - target_clean).abs().mean()
@@ -479,10 +482,10 @@ def train():
         {'params': [p for p in model.encoder.parameters() if p.requires_grad], 
          'lr': BASE_LR * 0.05, 'weight_decay': WEIGHT_DECAY * 2},
         {'params': model.projection.parameters(), 
-         'lr': BASE_LR * 1.0, 'weight_decay': WEIGHT_DECAY}
+         'lr': BASE_LR * 1.5, 'weight_decay': WEIGHT_DECAY}
     ])
     
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2, eta_min=1e-6)
     
     best_mae = float('inf')
     patience = 0
