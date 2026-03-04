@@ -1,11 +1,11 @@
 """
-Visualize average per-location MAE heatmap for OD eyes.
-Uses saved inference model - no retraining needed.
+Visualize average per-location MAE heatmap for OD and OS eyes side-by-side.
+Uses saved inference model — no retraining needed.
 
 Usage:
-    python visualize_mae_heatmap.py
-    python visualize_mae_heatmap.py --split train   # use train set instead
-    python visualize_mae_heatmap.py --no-tta        # disable TTA
+    python visualize_mae_heatmap.py                 # val set + TTA
+    python visualize_mae_heatmap.py --split train
+    python visualize_mae_heatmap.py --no-tta
 """
 
 import os, sys, json, argparse
@@ -16,26 +16,23 @@ matplotlib.use('Agg')
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
 
-# ============== Paths (mirror training.py) ==============
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-RETFOUND_DIR = os.path.join(CURRENT_DIR, '..', 'encoder', 'RETFound_MAE')
+# ============== Paths ==============
+CURRENT_DIR     = os.path.dirname(os.path.abspath(__file__))
+RETFOUND_DIR    = os.path.join(CURRENT_DIR, '..', 'encoder', 'RETFound_MAE')
 CHECKPOINT_PATH = os.path.join(CURRENT_DIR, "..", "encoder", "RETFound_cfp_weights.pth")
-INFERENCE_SAVE   = os.path.join(CURRENT_DIR, "best_multi_image_model.pth")
-BASE_DIR         = os.path.join(CURRENT_DIR, "..")
-FUNDUS_DIR       = os.path.join(BASE_DIR, "data", "fundus", "grape_fundus_images")
-TRAIN_JSON       = os.path.join(BASE_DIR, "data", "vf_tests", "grape_train.json")
-VAL_JSON         = os.path.join(BASE_DIR, "data", "vf_tests", "grape_test.json")
-OUTPUT_DIR       = os.path.join(CURRENT_DIR, "mae_heatmaps")
-
+INFERENCE_SAVE  = os.path.join(CURRENT_DIR, "inference_model.pth")
+BASE_DIR        = os.path.join(CURRENT_DIR, "..")
+FUNDUS_DIR      = os.path.join(BASE_DIR, "data", "fundus", "grape_fundus_images")
+TRAIN_JSON      = os.path.join(BASE_DIR, "data", "vf_tests", "grape_train.json")
+VAL_JSON        = os.path.join(BASE_DIR, "data", "vf_tests", "grape_test.json")
+OUTPUT_DIR      = os.path.join(CURRENT_DIR, "mae_heatmaps")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ============== Config (mirror training.py) ==============
+# ============== Config ==============
 MASKED_VALUE_THRESHOLD = 99.0
 OUTLIER_CLIP_RANGE     = (0, 35)
 NUM_TTA_AUGS           = 4
@@ -53,7 +50,7 @@ else:
     DEVICE = torch.device("cpu")
     print("⚠  Using CPU")
 
-# ============== Mask (mirror training.py) ==============
+# ============== Valid index masks (mirror training.py) ==============
 mask_OD = np.array([
     [False, False, False, True,  True,  True,  True,  False, False],
     [False, False, True,  True,  True,  True,  True,  True,  False],
@@ -66,8 +63,9 @@ mask_OD = np.array([
 ], dtype=bool)
 
 valid_indices_od = [i for i, v in enumerate(mask_OD.flatten()) if v]
+valid_indices_os = list(reversed(valid_indices_od))
 
-# ============== Transforms (mirror training.py) ==============
+# ============== Transforms ==============
 val_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
@@ -97,47 +95,43 @@ def get_tta_transforms():
         ]),
     ]
 
-# ============== Dataset (OD only) ==============
-class ODValDataset(Dataset):
+# ============== Dataset (both eyes) ==============
+class BilateralValDataset:
     def __init__(self, json_path, fundus_dir, use_tta=True):
         with open(json_path, 'r') as f:
             raw = json.load(f)
-
         self.fundus_dir = fundus_dir
         self.use_tta    = use_tta
         self.samples    = []
-
         for item in raw:
-            lat = item.get('Laterality', 'OD').strip().upper()
-            if not lat.startswith('OD'):
-                continue
+            lat    = item.get('Laterality', 'OD').strip().upper()
             images = item['FundusImage'] if isinstance(item['FundusImage'], list) else [item['FundusImage']]
             self.samples.append({
-                'images':    images,
-                'hvf':       item['hvf'],
+                'images':     images,
+                'hvf':        item['hvf'],
+                'laterality': lat,
                 'patient_id': item.get('PatientID', 0),
             })
-
-        print(f"  OD samples: {len(self.samples)}")
+        od  = sum(1 for s in self.samples if s['laterality'].startswith('OD'))
+        os_ = sum(1 for s in self.samples if s['laterality'].startswith('OS'))
+        print(f"  Total samples: {len(self.samples)}  (OD: {od}, OS: {os_})")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        s = self.samples[idx]
-        aug_images = []
-        tta_list   = get_tta_transforms() if self.use_tta else [val_transform]
-
+        s        = self.samples[idx]
+        tta_list = get_tta_transforms() if self.use_tta else [val_transform]
+        aug_imgs = []
         for img_path in s['images']:
             img = Image.open(os.path.join(self.fundus_dir, img_path)).convert('RGB')
             for t in tta_list:
-                aug_images.append(t(img))
+                aug_imgs.append(t(img))
+        imgs = torch.stack(aug_imgs)
+        hvf  = np.array(s['hvf'], dtype=np.float32).flatten()
+        return imgs, torch.tensor(hvf), s['laterality']
 
-        hvf    = np.array(s['hvf'], dtype=np.float32).flatten()
-        images = torch.stack(aug_images)
-        return images, torch.tensor(hvf)
-
-# ============== Model (mirror training.py exactly) ==============
+# ============== Model (mirror training.py) ==============
 sys.path.insert(0, RETFOUND_DIR)
 from models_mae import mae_vit_large_patch16_dec512d8b
 
@@ -159,7 +153,7 @@ class VFAutoDecoder(nn.Module):
 class MultiImageModel(nn.Module):
     def __init__(self, encoder):
         super().__init__()
-        self.encoder = encoder
+        self.encoder    = encoder
         self.projection = nn.Sequential(
             nn.Linear(1024, 512), nn.LayerNorm(512), nn.GELU(), nn.Dropout(0.3),
             nn.Linear(512, 256),  nn.LayerNorm(256), nn.GELU(), nn.Dropout(0.21),
@@ -168,177 +162,182 @@ class MultiImageModel(nn.Module):
         self.decoder = VFAutoDecoder(input_dim=52)
 
     def forward(self, x):
-        latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
+        latent  = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
         if latent.dim() == 3:
             latent = latent[:, 0, :]
         features = self.projection(latent)
         pred     = self.decoder(features)
         pred     = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
         pred     = torch.clamp(pred, OUTLIER_CLIP_RANGE[0], OUTLIER_CLIP_RANGE[1])
-        return pred.mean(dim=0, keepdim=True)   # average over TTA/multi-image
+        return pred.mean(dim=0, keepdim=True)  # average TTA/multi-image
 
 # ============== Load model ==============
 def load_model():
-    import argparse
     print("Loading RETFound encoder …")
     with torch.serialization.safe_globals([argparse.Namespace]):
         ckpt = torch.load(CHECKPOINT_PATH, map_location='cpu', weights_only=False)
     encoder = mae_vit_large_patch16_dec512d8b()
     encoder.load_state_dict(ckpt['model'], strict=False)
 
-    model = MultiImageModel(encoder)
-
-    print(f"Loading inference checkpoint: {INFERENCE_SAVE}")
+    model    = MultiImageModel(encoder)
     inf_ckpt = torch.load(INFERENCE_SAVE, map_location='cpu', weights_only=False)
-    state = inf_ckpt.get('model_state_dict', inf_ckpt.get('model'))
+    state    = inf_ckpt.get('model_state_dict', inf_ckpt.get('model'))
     missing, unexpected = model.load_state_dict(state, strict=False)
     if unexpected:
-        print(f"  ℹ  Ignored keys not in this model: {unexpected}")
+        print(f"  ℹ  Ignored keys: {unexpected}")
     if missing:
-        print(f"  ⚠  Missing keys (not loaded): {missing}")
+        print(f"  ⚠  Missing keys: {missing}")
 
     val_mae  = inf_ckpt.get('val_mae',  '?')
     val_corr = inf_ckpt.get('val_corr', '?')
     print(f"✓ Model loaded  |  Saved val MAE: {val_mae}  |  Corr: {val_corr}")
-
     model.to(DEVICE)
     model.eval()
     return model
 
-# ============== Run inference & collect per-location errors ==============
-def collect_errors(model, json_path, use_tta):
-    dataset = ODValDataset(json_path, FUNDUS_DIR, use_tta=use_tta)
+# ============== Inference — collect per-location errors for both eyes ==============
+def collect_errors_bilateral(model, json_path, use_tta):
+    dataset = BilateralValDataset(json_path, FUNDUS_DIR, use_tta=use_tta)
 
-    # per-location accumulators over the 52 valid OD positions
-    sum_ae  = np.zeros(52, dtype=np.float64)
-    count   = np.zeros(52, dtype=np.int64)
-    sum_gt  = np.zeros(52, dtype=np.float64)
+    acc = {
+        'OD': {'sum_ae': np.zeros(52), 'sum_gt': np.zeros(52), 'count': np.zeros(52, dtype=int)},
+        'OS': {'sum_ae': np.zeros(52), 'sum_gt': np.zeros(52), 'count': np.zeros(52, dtype=int)},
+    }
 
     with torch.no_grad():
-        for imgs, hvf in tqdm(dataset, desc="Inference"):
+        for idx in tqdm(range(len(dataset)), desc="Inference"):
+            imgs, hvf, lat = dataset[idx]
             imgs = imgs.to(DEVICE)
-            pred = model(imgs)                         # (1, 52) — already averaged
+            pred = model(imgs)  # (1, 52)
 
-            # Extract valid OD positions from ground truth
-            hvf_flat   = hvf.numpy().flatten()         # length 72
-            gt_valid   = hvf_flat[valid_indices_od]    # length 52
-            pred_valid = pred.cpu().numpy().flatten()  # length 52
+            hvf_flat  = hvf.numpy().flatten()         # length 72
+            pred_flat = pred.cpu().numpy().flatten()  # length 52
 
-            # Only accumulate non-masked locations
+            eye       = 'OD' if lat.startswith('OD') else 'OS'
+            valid_idx = valid_indices_od if eye == 'OD' else valid_indices_os
+            gt_valid  = hvf_flat[valid_idx]  # 52 values in eye-specific order
+
             for loc in range(52):
                 if gt_valid[loc] < MASKED_VALUE_THRESHOLD:
-                    ae = abs(pred_valid[loc] - gt_valid[loc])
-                    sum_ae[loc]  += ae
-                    sum_gt[loc]  += gt_valid[loc]
-                    count[loc]   += 1
+                    acc[eye]['sum_ae'][loc] += abs(pred_flat[loc] - gt_valid[loc])
+                    acc[eye]['sum_gt'][loc] += gt_valid[loc]
+                    acc[eye]['count'][loc]  += 1
 
-    # Avoid div-by-zero
-    with np.errstate(invalid='ignore'):
-        mean_ae = np.where(count > 0, sum_ae / count, np.nan)
-        mean_gt = np.where(count > 0, sum_gt / count, np.nan)
+    results = {}
+    for eye, a in acc.items():
+        with np.errstate(invalid='ignore'):
+            mean_ae = np.where(a['count'] > 0, a['sum_ae'] / a['count'], np.nan)
+            mean_gt = np.where(a['count'] > 0, a['sum_gt'] / a['count'], np.nan)
+        n       = int(a['count'].max()) if a['count'].max() > 0 else 0
+        overall = np.nanmean(mean_ae)
+        print(f"  {eye}: {n} samples  |  Overall MAE: {overall:.3f} dB")
+        results[eye] = {'mean_ae': mean_ae, 'mean_gt': mean_gt, 'count': a['count']}
 
-    overall_mae = np.nanmean(mean_ae)
-    print(f"\nOverall OD MAE (per-location mean): {overall_mae:.3f} dB")
-    return mean_ae, mean_gt, count
+    return results
 
-# ============== Map 52-vector back to 8×9 grid ==============
-def vector_to_grid(vec_52):
-    """Place 52 valid OD values back into an 8×9 grid; NaN elsewhere."""
-    grid = np.full(72, np.nan)
-    for k, flat_idx in enumerate(valid_indices_od):
+# ============== Map 52-vector → 8×9 display grid ==============
+def vector_to_grid(vec_52, eye='OD'):
+    """
+    Place 52 valid values into an 8×9 grid.
+    OS values are stored in reversed OD index order (valid_indices_os).
+    We flip OS horizontally so nasal/temporal sides display correctly.
+    """
+    grid      = np.full(72, np.nan)
+    valid_idx = valid_indices_od if eye == 'OD' else valid_indices_os
+    for k, flat_idx in enumerate(valid_idx):
         grid[flat_idx] = vec_52[k]
-    return grid.reshape(8, 9)
+    grid = grid.reshape(8, 9)
+    if eye == 'OS':
+        grid = np.fliplr(grid)
+    return grid
 
-# ============== Plot heatmap (matches heatmap visualizer style) ==============
-def plot_heatmap(grid, title, filename, cmap='inferno', vmin=None, vmax=None,
-                 cbar_label="MAE (dB)"):
-    cmap_obj = plt.cm.get_cmap(cmap).copy()
+# ============== Plot single panel ==============
+def plot_single(ax, grid, title, cmap_name, vmin, vmax, cbar_label):
+    cmap_obj = matplotlib.colormaps[cmap_name].copy()
     cmap_obj.set_bad(color='white')
-
-    fig, ax = plt.subplots(figsize=(6, 5))
     im = ax.imshow(grid, cmap=cmap_obj, vmin=vmin, vmax=vmax,
                    aspect='equal', interpolation='nearest')
-    plt.colorbar(im, ax=ax, label=cbar_label)
-    ax.set_title(title, fontsize=12)
+    plt.colorbar(im, ax=ax, label=cbar_label, fraction=0.046, pad=0.04)
+    ax.set_title(title, fontsize=11)
     ax.axis('off')
-    plt.tight_layout()
-    plt.savefig(filename, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  Saved → {filename}")
 
-# ============== Side-by-side comparison ==============
-def save_side_by_side(path1, path2, out_path, label1, label2):
-    img1 = Image.open(path1)
-    img2 = Image.open(path2)
-    h    = min(img1.height, img2.height)
-    img1 = img1.resize((int(img1.width * h / img1.height), h))
-    img2 = img2.resize((int(img2.width * h / img2.height), h))
-    combined = Image.new("RGBA", (img1.width + img2.width, h), (255,255,255,255))
-    combined.paste(img1.convert("RGBA"), (0, 0))
-    combined.paste(img2.convert("RGBA"), (img1.width, 0))
-    combined.save(out_path)
-    print(f"  Side-by-side saved → {out_path}")
+# ============== Build 4-panel figure ==============
+def save_four_panel(results, tag, split):
+    od_mae_grid = vector_to_grid(results['OD']['mean_ae'], 'OD')
+    os_mae_grid = vector_to_grid(results['OS']['mean_ae'], 'OS')
+    od_gt_grid  = vector_to_grid(results['OD']['mean_gt'], 'OD')
+    os_gt_grid  = vector_to_grid(results['OS']['mean_gt'], 'OS')
+
+    od_mae_val = np.nanmean(results['OD']['mean_ae'])
+    os_mae_val = np.nanmean(results['OS']['mean_ae'])
+    combined   = np.nanmean(np.concatenate([
+        results['OD']['mean_ae'][~np.isnan(results['OD']['mean_ae'])],
+        results['OS']['mean_ae'][~np.isnan(results['OS']['mean_ae'])]
+    ]))
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10))
+    fig.suptitle(
+        f"Visual Field Prediction — MAE & GT Sensitivity  |  {split} set\n"
+        f"OD MAE: {od_mae_val:.2f} dB   |   OS MAE: {os_mae_val:.2f} dB   |   Combined: {combined:.2f} dB",
+        fontsize=13, fontweight='bold', y=0.98
+    )
+
+    # Row 0: MAE heatmaps
+    plot_single(axes[0, 0], od_mae_grid,
+                "OD — Avg MAE per Location  (Right Eye)",
+                'inferno', 0, 10, "MAE (dB)")
+    plot_single(axes[0, 1], os_mae_grid,
+                "OS — Avg MAE per Location  (Left Eye)",
+                'inferno', 0, 10, "MAE (dB)")
+
+    # Row 1: GT sensitivity heatmaps
+    plot_single(axes[1, 0], od_gt_grid,
+                "OD — Avg GT Sensitivity  (Right Eye)",
+                'inferno', 0, 30, "Sensitivity (dB)")
+    plot_single(axes[1, 1], os_gt_grid,
+                "OS — Avg GT Sensitivity  (Left Eye)",
+                'inferno', 0, 30, "Sensitivity (dB)")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    out_path = os.path.join(OUTPUT_DIR, f"bilateral_MAE_{tag}.png")
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"\n  ✓ 4-panel figure saved → {out_path}")
+    return out_path
+
+# ============== Print per-location table ==============
+def print_table(results):
+    print(f"\n{'='*60}")
+    print("Per-location summary")
+    print(f"{'='*60}")
+    for eye in ['OD', 'OS']:
+        r = results[eye]
+        print(f"\n{eye}:")
+        print(f"  {'Loc':>4}  {'MAE':>6}  {'GT':>6}  {'N':>5}")
+        print(f"  {'-'*28}")
+        for i in range(52):
+            print(f"  {i:4d}  {r['mean_ae'][i]:6.2f}  {r['mean_gt'][i]:6.2f}  {r['count'][i]:5d}")
 
 # ============== Main ==============
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--split', choices=['val', 'train'], default='val',
-                        help='Which split to evaluate (default: val)')
-    parser.add_argument('--no-tta', action='store_true',
-                        help='Disable test-time augmentation')
+    parser.add_argument('--split', choices=['val', 'train'], default='val')
+    parser.add_argument('--no-tta', action='store_true')
     args = parser.parse_args()
 
     json_path = VAL_JSON if args.split == 'val' else TRAIN_JSON
     use_tta   = not args.no_tta
+    tag       = f"{args.split}_tta{NUM_TTA_AUGS if use_tta else 0}"
 
     print(f"\n{'='*60}")
-    print(f"OD MAE Heatmap  |  split={args.split}  |  TTA={'on' if use_tta else 'off'}")
+    print(f"Bilateral MAE Heatmap  |  split={args.split}  |  TTA={'on' if use_tta else 'off'}")
     print(f"{'='*60}")
 
-    model = load_model()
+    model   = load_model()
+    results = collect_errors_bilateral(model, json_path, use_tta)
 
-    mean_ae, mean_gt, count = collect_errors(model, json_path, use_tta)
-
-    # Grids
-    mae_grid = vector_to_grid(mean_ae)
-    gt_grid  = vector_to_grid(mean_gt)
-
-    tag = f"{args.split}_tta{NUM_TTA_AUGS if use_tta else 0}"
-
-    # ── 1. MAE heatmap ──────────────────────────────────────────────
-    mae_path = os.path.join(OUTPUT_DIR, f"OD_MAE_heatmap_{tag}.png")
-    overall  = np.nanmean(mean_ae)
-    plot_heatmap(
-        mae_grid,
-        title=f"OD | Average MAE per location | {args.split} set\n(mean MAE = {overall:.2f} dB)",
-        filename=mae_path,
-        cmap='inferno',
-        vmin=0, vmax=10,
-        cbar_label="MAE (dB)"
-    )
-
-    # ── 2. Ground-truth sensitivity heatmap ─────────────────────────
-    gt_path = os.path.join(OUTPUT_DIR, f"OD_GT_sensitivity_{tag}.png")
-    plot_heatmap(
-        gt_grid,
-        title=f"OD | Average GT sensitivity | {args.split} set",
-        filename=gt_path,
-        cmap='inferno',
-        vmin=0, vmax=30,
-        cbar_label="Sensitivity (dB)"
-    )
-
-    # ── 3. Side-by-side ─────────────────────────────────────────────
-    combined_path = os.path.join(OUTPUT_DIR, f"OD_MAE_vs_GT_{tag}.png")
-    save_side_by_side(mae_path, gt_path, combined_path,
-                      label1="MAE", label2="GT sensitivity")
-
-    # ── 4. Print per-location table ──────────────────────────────────
-    print(f"\nPer-location summary (52 valid OD positions):")
-    print(f"  {'Loc':>4}  {'MAE':>6}  {'GT':>6}  {'N':>5}")
-    print(f"  {'-'*28}")
-    for i, (ae, gt, n) in enumerate(zip(mean_ae, mean_gt, count)):
-        print(f"  {i:4d}  {ae:6.2f}  {gt:6.2f}  {n:5d}")
+    save_four_panel(results, tag, args.split)
+    print_table(results)
 
     print(f"\nAll outputs saved to: {OUTPUT_DIR}")
     print("="*60)
