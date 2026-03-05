@@ -39,7 +39,7 @@ EPOCHS = 120
 BASE_LR = 1e-3
 WEIGHT_DECAY = 1e-4
 PATIENCE = 40
-NUM_ENCODER_BLOCKS = 6
+NUM_ENCODER_BLOCKS = 3
 MASKED_VALUE_THRESHOLD = 99.0
 DROPOUT_RATE = 0.3
 USE_TTA = True
@@ -108,10 +108,8 @@ if os.path.exists(PRETRAINED_DECODER):
 train_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.RandomHorizontalFlip(p=0.3),
-    transforms.RandomRotation(15),          # was 10
-    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),  # ADD
-    transforms.RandomGrayscale(p=0.1),      # ADD
-    transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.9, 1.1)),  # wider scale
+    transforms.RandomRotation(10),
+    transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
@@ -476,43 +474,27 @@ def train():
     
     model = MultiImageModel(base_model, pretrained_decoder_state, NUM_ENCODER_BLOCKS, DROPOUT_RATE)
     model.to(DEVICE)
+
+    # Unfreeze decoder immediately and include in optimizer from epoch 1
+    model.unfreeze_decoder()
+    decoder_unfrozen = True
     
     # Initial optimizer
     optimizer = optim.AdamW([
-        {'params': [p for p in model.encoder.parameters() if p.requires_grad], 
-         'lr': BASE_LR * 0.05, 'weight_decay': WEIGHT_DECAY * 2},
-        {'params': model.projection.parameters(), 
-         'lr': BASE_LR * 1.5, 'weight_decay': WEIGHT_DECAY}
+        {'params': [p for p in model.encoder.parameters() if p.requires_grad],
+        'lr': BASE_LR * 0.05, 'weight_decay': WEIGHT_DECAY * 2},
+        {'params': model.projection.parameters(),
+        'lr': BASE_LR * 1.5, 'weight_decay': WEIGHT_DECAY},
+        {'params': model.decoder.parameters(),
+        'lr': BASE_LR * 0.08, 'weight_decay': WEIGHT_DECAY * 0.5},
     ])
     
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2, eta_min=1e-6)
-    
+
     best_mae = float('inf')
     patience = 0
-    decoder_unfrozen = False
     
     for epoch in range(1, EPOCHS + 1):
-        # Unfreeze decoder
-        if epoch == DECODER_UNFREEZE_EPOCH and not decoder_unfrozen:
-            if model.unfreeze_decoder():
-                print(f"\n{'='*60}")
-                print(f"Decoder unfrozen at epoch {epoch}")
-                print(f"{'='*60}")
-                decoder_unfrozen = True
-                
-                # Conservative decoder LR
-                optimizer = optim.AdamW([
-                    {'params': [p for p in model.encoder.parameters() if p.requires_grad], 
-                     'lr': BASE_LR * 0.03, 'weight_decay': WEIGHT_DECAY * 2},
-                    {'params': model.projection.parameters(), 
-                     'lr': BASE_LR * 0.6, 'weight_decay': WEIGHT_DECAY},
-                    {'params': model.decoder.parameters(), 
-                     'lr': BASE_LR * 0.08, 'weight_decay': WEIGHT_DECAY * 0.5}  # Very low!
-                ])
-                
-                remaining_epochs = EPOCHS - epoch + 1
-                scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_epochs, eta_min=1e-6)
-        
         model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
         
