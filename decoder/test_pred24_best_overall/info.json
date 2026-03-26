@@ -1,0 +1,15 @@
+{
+  "fundus_file": "94_OD_1.jpg",
+  "output_original": "decoder/test_pred24_best_overall/original_fundus.png",
+  "output_prediction": "decoder/test_pred24_best_overall/predicted_24_2.png",
+  "output_ground_truth": "decoder/test_pred24_best_overall/ground_truth_24_2.png",
+  "mae": 1.303263089595697,
+  "eye": "OS",
+  "chosen_model_path": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/inference_model_backup_4.13dB.pth",
+  "tried_models": [
+    "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/best_multi_image_model.pth",
+    "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/inference_model_backup_4.13dB.pth",
+    "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/inference_model.pth"
+  ],
+  "json_source": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/vf_tests/grape_new_vf_tests.json"
+}
