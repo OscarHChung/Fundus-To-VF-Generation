@@ -1,0 +1,18 @@
+{
+  "moderate": {
+    "category_dir": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/best_prediction_out/moderate",
+    "mae": 3.539976462339744,
+    "patient_id": 92,
+    "eye": "OS",
+    "fundus_file": "92_OS_1.jpg",
+    "model_path": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/inference_model_backup_4.13dB.pth"
+  },
+  "severe": {
+    "category_dir": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/best_prediction_out/severe",
+    "mae": 2.0970524029854016,
+    "patient_id": 69,
+    "eye": "OS",
+    "fundus_file": "69_OS_1.jpg",
+    "model_path": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/inference_model_backup_4.13dB.pth"
+  }
+}

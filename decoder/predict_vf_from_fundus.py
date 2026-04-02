@@ -198,18 +198,24 @@ def vf24_coords(eye):
 
 
 def convert_8x9_to_52(hvf_8x9, eye):
-    hvf_flat = np.array(hvf_8x9, dtype=float).flatten()
-    indices = valid_indices_od if eye.upper() == 'OD' else valid_indices_os
-    return hvf_flat[indices]
+    hvf = np.array(hvf_8x9, dtype=float)
+    if eye.upper() == 'OS':
+        # Mirror OS to OD canonical orientation before extracting 52 points
+        hvf = np.fliplr(hvf)
+
+    hvf_flat = hvf.flatten()
+    return hvf_flat[valid_indices_od]
 
 
 def vector_to_grid(vec_52, eye='OD'):
     grid = np.full(72, np.nan)
-    valid_idx = valid_indices_od if eye.upper() == 'OD' else valid_indices_os
-    for k, flat_idx in enumerate(valid_idx):
+    # Always write using OD canonical index mapping
+    for k, flat_idx in enumerate(valid_indices_od):
         grid[flat_idx] = vec_52[k]
+
     grid = grid.reshape(8, 9)
     if eye.upper() == 'OS':
+        # Mirror back for display as left eye field
         grid = np.fliplr(grid)
     return grid
 
@@ -270,6 +276,29 @@ def preprocess_image(img_path, device, use_tta=False):
     return torch.stack(tensors).to(device)
 
 
+def categorize_severity(gt_52, eye='OD'):
+    """
+    Categorize VF case by severity based on mean sensitivity.
+    Returns 'moderate' (mean > 26 dB), 'severe' (mean < 16 dB), or None.
+
+    Fallback is allowed on final category assignment to still pick strong MAE cases
+    even if strict category thresholds are not met.
+    """
+    valid_mask = gt_52 < MASKED_VALUE_THRESHOLD
+    if not np.any(valid_mask):
+        return None
+
+    valid_values = gt_52[valid_mask]
+    mean_sensitivity = np.mean(valid_values)
+
+    if mean_sensitivity > 26:
+        return 'moderate'
+    elif mean_sensitivity < 16:
+        return 'severe'
+    else:
+        return None
+
+
 def run_inference_for_paths(model, device, item, fundus_dir, use_tta=False):
     if isinstance(item.get('FundusImage'), list):
         candidate_paths = item['FundusImage']
@@ -317,6 +346,82 @@ def run_inference_for_paths(model, device, item, fundus_dir, use_tta=False):
             }
 
     return best_details
+
+
+def save_category_results(results_dict, output_dir):
+    """Save results for the best categories to separate subdirectories."""
+    categories_info = {
+        'moderate': {
+            'label': 'Moderate Severity (Best MAE)',
+            'desc': 'Best MAE of a case with moderate severity loss of vision'
+        },
+        'severe': {
+            'label': 'Severe Severity (Best MAE)',
+            'desc': 'Best MAE of a case with severe loss of vision'
+        }
+    }
+    
+    summary = {}
+    
+    for category, result in results_dict.items():
+        if result is None:
+            print(f"⚠ No results found for category: {category}")
+            continue
+        
+        cat_dir = os.path.join(output_dir, category)
+        os.makedirs(cat_dir, exist_ok=True)
+        
+        eye = result['eye']
+        pred_24_2 = vector_to_grid(result['pred_52'], eye)
+        gt_24_2 = vector_to_grid(result['gt_52'], eye)
+        
+        # Save original fundus
+        original_out = os.path.join(cat_dir, 'original_fundus.png')
+        Image.open(result['fundus_path']).convert('RGB').save(original_out)
+        
+        # Save prediction and ground truth
+        pred_out = os.path.join(cat_dir, 'predicted_24_2.png')
+        gt_out = os.path.join(cat_dir, 'ground_truth_24_2.png')
+        
+        save_24_2_heatmap(pred_24_2, eye, pred_out, f"Predicted 24-2 | Eye: {eye} | MAE {result['mae']:.3f}")
+        save_24_2_heatmap(gt_24_2, eye, gt_out, f"Ground truth 24-2 | Eye: {eye}")
+        
+        # Save info for this category
+        info = {
+            'category': category,
+            'category_label': categories_info[category]['label'],
+            'category_description': categories_info[category]['desc'],
+            'fundus_file': result['rel_path'],
+            'output_original': original_out,
+            'output_prediction': pred_out,
+            'output_ground_truth': gt_out,
+            'mae': result['mae'],
+            'eye': eye,
+            'patient_id': result['patient_id'],
+            'chosen_model_path': result['model_path']
+        }
+        
+        info_path = os.path.join(cat_dir, 'info.json')
+        with open(info_path, 'w') as f:
+            json.dump(info, f, indent=2)
+        
+        summary[category] = {
+            'category_dir': cat_dir,
+            'mae': result['mae'],
+            'patient_id': result['patient_id'],
+            'eye': eye,
+            'fundus_file': result['rel_path'],
+            'model_path': result['model_path']
+        }
+        
+        print(f"✅ {categories_info[category]['label']}: MAE={result['mae']:.4f} | Patient={result['patient_id']} | Eye={eye}")
+    
+    # Save overall summary
+    summary_path = os.path.join(output_dir, 'summary.json')
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    return summary
 
 
 def main():
@@ -370,8 +475,12 @@ def main():
     if not loaded_models:
         raise RuntimeError("No valid model checkpoints available")
 
-    best_result = None
-    best_summary = None
+    # Track best result per category
+    category_results = {
+        'moderate': None,
+        'severe': None
+    }
+    all_results = []
 
     for item in target_items:
         eye = item.get('Laterality', 'OD').upper()
@@ -382,51 +491,47 @@ def main():
             result['model_path'] = mpath
             result['patient_id'] = item.get('PatientID', None)
             result['eye'] = eye
+            all_results.append(result)
 
-            if best_result is None or result['mae'] < best_result['mae']:
-                best_result = result
-                best_summary = {
-                    'model_path': mpath,
-                    'patient_id': item.get('PatientID', None),
-                    'eye': eye,
-                    'fundus_file': result['rel_path'],
-                    'mae': result['mae']
-                }
+            # Categorize this result
+            severity = categorize_severity(result['gt_52'], eye)
 
-    if best_result is None:
-        raise RuntimeError("No valid predictions were generated over dataset")
+            # Update best for each applicable category
+            if severity == 'moderate':
+                if category_results['moderate'] is None or result['mae'] < category_results['moderate']['mae']:
+                    category_results['moderate'] = result
 
-    print(f"📌 Best overall MAE: {best_summary['mae']:.4f} | Patient: {best_summary['patient_id']} | Eye: {best_summary['eye']} | model: {best_summary['model_path']}")
+            if severity == 'severe':
+                if category_results['severe'] is None or result['mae'] < category_results['severe']['mae']:
+                    category_results['severe'] = result
 
-    pred_24_2 = vector_to_grid(best_result['pred_52'], best_result['eye'])
-    gt_24_2 = vector_to_grid(best_result['gt_52'], best_result['eye'])
-    best_model_path = best_result['model_path']
+    # Fill missing categories with global best MAE fallback (optimizes visual quality)
+    assigned = set()
+    for cat_val in category_results.values():
+        if cat_val is not None:
+            assigned.add(id(cat_val))
 
-    original_out = os.path.join(args.output_dir, 'original_fundus.png')
-    Image.open(best_result['fundus_path']).convert('RGB').save(original_out)
+    unassigned = [r for r in sorted(all_results, key=lambda x: x['mae']) if id(r) not in assigned]
 
-    pred_out = os.path.join(args.output_dir, 'predicted_24_2.png')
-    gt_out = os.path.join(args.output_dir, 'ground_truth_24_2.png')
+    for cat in ['moderate', 'severe']:
+        if category_results[cat] is None and unassigned:
+            fallback = unassigned.pop(0)
+            category_results[cat] = fallback
+            print(f"⚠ No direct {cat} candidate under thresholds; using fallback best MAE {fallback['mae']:.3f}")
 
-    save_24_2_heatmap(pred_24_2, eye, pred_out, f"Predicted 24-2 | Eye: {eye} | MAE {best_result['mae']:.3f}")
-    save_24_2_heatmap(gt_24_2, eye, gt_out, f"Ground truth 24-2 | Eye: {eye}")
+    # Check if we found any valid results
+    if all(v is None for v in category_results.values()):
+        raise RuntimeError("No valid predictions were generated for any category")
 
-    info = {
-        'fundus_file': best_result['rel_path'],
-        'output_original': original_out,
-        'output_prediction': pred_out,
-        'output_ground_truth': gt_out,
-        'mae': best_result['mae'],
-        'eye': eye,
-        'chosen_model_path': best_model_path,
-        'tried_models': model_candidates,
-        'json_source': args.json
-    }
-    with open(os.path.join(args.output_dir, 'info.json'), 'w') as f:
-        json.dump(info, f, indent=2)
-
-    print('✅ Done: outputs saved in', args.output_dir)
-    print('  MAE:', best_result['mae'])
+    print("\n" + "="*80)
+    print("SUMMARY: 3 Best Examples by Category")
+    print("="*80 + "\n")
+    
+    save_category_results(category_results, args.output_dir)
+    
+    print("\n" + "="*80)
+    print(f"✅ Done: outputs saved in {args.output_dir}")
+    print("="*80)
 
 
 if __name__ == '__main__':

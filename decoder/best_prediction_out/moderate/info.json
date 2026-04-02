@@ -1,0 +1,13 @@
+{
+  "category": "moderate",
+  "category_label": "Moderate Severity (Best MAE)",
+  "category_description": "Best MAE of a case with moderate severity loss of vision",
+  "fundus_file": "92_OS_1.jpg",
+  "output_original": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/best_prediction_out/moderate/original_fundus.png",
+  "output_prediction": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/best_prediction_out/moderate/predicted_24_2.png",
+  "output_ground_truth": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/best_prediction_out/moderate/ground_truth_24_2.png",
+  "mae": 3.539976462339744,
+  "eye": "OS",
+  "patient_id": 92,
+  "chosen_model_path": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/inference_model_backup_4.13dB.pth"
+}

@@ -1,0 +1,13 @@
+{
+  "category": "severe",
+  "category_label": "Severe Severity (Best MAE)",
+  "category_description": "Best MAE of a case with severe loss of vision",
+  "fundus_file": "69_OS_1.jpg",
+  "output_original": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/best_prediction_out/severe/original_fundus.png",
+  "output_prediction": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/best_prediction_out/severe/predicted_24_2.png",
+  "output_ground_truth": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/best_prediction_out/severe/ground_truth_24_2.png",
+  "mae": 2.0970524029854016,
+  "eye": "OS",
+  "patient_id": 69,
+  "chosen_model_path": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/inference_model_backup_4.13dB.pth"
+}
