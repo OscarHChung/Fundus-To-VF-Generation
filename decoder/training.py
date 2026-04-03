@@ -1,6 +1,5 @@
 """
 Training - Build on pretraining baseline
- - TO ADD
 """
 
 import os, sys, json, numpy as np
@@ -42,15 +41,22 @@ PATIENCE = 40
 NUM_ENCODER_BLOCKS = 3
 MASKED_VALUE_THRESHOLD = 99.0
 DROPOUT_RATE = 0.3
+
+# Label smoothing: scales targets slightly toward the mean
+LABEL_SMOOTH = 0.05
+
+# TTA: rotations only (no flips), matching methodology
 USE_TTA = True
-NUM_TTA_AUGS = 4
-LABEL_SMOOTH = 0.0
+TTA_ROTATIONS = [-5, 0, 5]  # degrees; 0 = original pass
+
+# Outlier clipping
 USE_OUTLIER_CLIPPING = True
 OUTLIER_CLIP_RANGE = (0, 35)
 
-# MILD class imbalance handling (not aggressive!)
+# Focal-style reweighting: upweight low-sensitivity (scotoma) predictions
+# Helps counter the regression-to-mean smoothing issue
 LOW_DB_THRESHOLD = 10.0
-LOW_VALUE_WEIGHT = 2.0
+LOW_VALUE_WEIGHT = 2.5
 
 # Decoder unfreezing
 DECODER_UNFREEZE_EPOCH = 1
@@ -104,12 +110,11 @@ if os.path.exists(PRETRAINED_DECODER):
     except Exception as e:
         print(f"⚠️  Could not load pre-trained decoder: {e}")
 
-# ============== Augmentation (Keep Simple) ==============
+# ============== Augmentation ==============
+# Training: rotations only (±5°), matching methodology description
 train_transform = transforms.Compose([
     transforms.Resize((224, 224)),
-    transforms.RandomHorizontalFlip(p=0.3),
-    transforms.RandomRotation(10),
-    transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+    transforms.RandomRotation(5),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
@@ -121,26 +126,15 @@ val_transform = transforms.Compose([
 ])
 
 def get_tta_transforms():
+    """TTA: rotation only (no flips), per methodology description."""
     return [
-        val_transform,
         transforms.Compose([
             transforms.Resize((224, 224)),
-            transforms.Lambda(lambda img: transforms.functional.hflip(img)),
+            transforms.Lambda(lambda img: transforms.functional.rotate(img, deg)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ]),
-        transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.Lambda(lambda img: transforms.functional.rotate(img, 5)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ]),
-        transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.Lambda(lambda img: transforms.functional.rotate(img, -5)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ]),
+        ])
+        for deg in TTA_ROTATIONS
     ]
 
 # ============== Dataset ==============
@@ -181,7 +175,7 @@ class MultiImageDataset(Dataset):
         else:
             print(f"  Val: {len(self.data)} eyes with {sum(len(s['images']) for s in self.samples)} images")
             if use_tta:
-                print(f"  TTA: Enabled ({NUM_TTA_AUGS}x augmentations)")
+                print(f"  TTA: Enabled ({len(TTA_ROTATIONS)} rotations: {TTA_ROTATIONS}°)")
     
     def __len__(self):
         return len(self.samples)
@@ -222,41 +216,6 @@ def val_collate_fn(batch):
     return batch[0]
 
 # ============== Model ==============
-class VFAutoDecoder(nn.Module):
-    def __init__(self, input_dim: int = 52):
-        super().__init__()
-        
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.LayerNorm(256),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            
-            nn.Linear(256, 512),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            
-            nn.Linear(512, 512),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            
-            nn.Linear(512, 256),
-            nn.LayerNorm(256),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            
-            nn.Linear(256, input_dim)
-        )
-        
-        self.residual_weight = nn.Parameter(torch.tensor(0.1))
-    
-    def forward(self, x):
-        output = self.network(x)
-        output = output + self.residual_weight * x
-        return output
-
 class MultiImageModel(nn.Module):
     def __init__(self, encoder, pretrained_state=None, num_blocks=6, dropout=0.3):
         super().__init__()
@@ -272,6 +231,7 @@ class MultiImageModel(nn.Module):
                     param.requires_grad = True
             print(f"✓ Unfrozen {num_blocks}/{total} encoder blocks")
         
+        # Projection head with dropout per methodology
         self.projection = nn.Sequential(
             nn.Linear(1024, 512),
             nn.LayerNorm(512),
@@ -289,34 +249,6 @@ class MultiImageModel(nn.Module):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        
-        self.decoder = VFAutoDecoder(input_dim=52)
-        
-        self.use_pretrained = False
-        self.decoder_frozen = True
-        
-        if pretrained_state is not None:
-            try:
-                self.decoder.load_state_dict(pretrained_state, strict=True)
-                self.use_pretrained = True
-                for param in self.decoder.parameters():
-                    param.requires_grad = False
-                print(f"✓ Pre-trained decoder loaded (will unfreeze at epoch {DECODER_UNFREEZE_EPOCH})")
-            except Exception as e:
-                print(f"⚠️  Decoder: {e}")
-                self.decoder_frozen = False
-        else:
-            self.decoder_frozen = False
-            print(f"✓ Training decoder from scratch")
-    
-    def unfreeze_decoder(self):
-        if self.use_pretrained and self.decoder_frozen:
-            for param in self.decoder.parameters():
-                param.requires_grad = True
-            self.decoder_frozen = False
-            print(f"  ✓ Decoder UNFROZEN")
-            return True
-        return False
     
     def forward(self, x, average_multi=True):
         if x.dim() == 4:
@@ -324,11 +256,9 @@ class MultiImageModel(nn.Module):
             if latent.dim() == 3:
                 latent = latent[:, 0, :]
             
-            vf_features = self.projection(latent)
-            pred = self.decoder(vf_features)
+            pred = self.projection(latent)
             
-            # CRITICAL FIX: Lower threshold to 0.1 (was 0.3-0.5 in baseline)
-            # This allows low predictions (0-3 dB) to pass through
+            # Allow low (scotoma-level) predictions through — threshold kept minimal
             pred = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
             
             if USE_OUTLIER_CLIPPING:
@@ -341,8 +271,13 @@ class MultiImageModel(nn.Module):
         else:
             raise ValueError(f"Unexpected input shape: {x.shape}")
 
-# ============== Loss with MILD Reweighting ==============
+# ============== Loss ==============
 def compute_loss(pred, target, laterality, smooth=0.0):
+    """
+    Huber loss with:
+    - Label smoothing: targets nudged toward mean, discourages overconfident extremes
+    - Focal-style reweighting: upweights low-dB points to reduce scotoma underestimation
+    """
     device = pred.device
     target = target.to(device)
     
@@ -368,17 +303,17 @@ def compute_loss(pred, target, laterality, smooth=0.0):
         pred_clean = pred[i][mask]
         target_clean = target_valid[mask]
         
-        # Mild class reweighting
-        weights = torch.ones_like(pred_clean)
-        low_mask = (target_clean < LOW_DB_THRESHOLD)
-        weights[low_mask] = LOW_VALUE_WEIGHT
-        
-        # Label smoothing
+        # Label smoothing: scale targets slightly toward the mean
         if smooth > 0:
             mean_val = target_clean.mean()
             target_clean = (1 - smooth) * target_clean + smooth * mean_val
         
-        # Huber loss
+        # Upweight low-sensitivity (scotoma) points to counter regression-to-mean
+        weights = torch.ones_like(pred_clean)
+        low_mask = (target_clean < LOW_DB_THRESHOLD)
+        weights[low_mask] = LOW_VALUE_WEIGHT
+        
+        # Huber loss (robust to outliers, smooth near zero)
         loss = F.huber_loss(pred_clean, target_clean, reduction='none', delta=1.0)
         loss = (loss * weights).mean()
         
@@ -456,13 +391,14 @@ def evaluate(model, loader):
 # ============== Training ==============
 def train():
     print("="*60)
-    print("CONSERVATIVE Training - Build on 3.74 dB Baseline")
+    print("Training - Build on Pretraining Baseline")
     print("="*60)
-    print(f"\nMinimal Changes:")
-    print(f"  1. Unfreeze decoder at epoch {DECODER_UNFREEZE_EPOCH} (gentle LR)")
-    print(f"  2. Lower threshold: 0.1 dB (was 0.3-0.5) - allows low predictions")
-    print(f"  3. Mild 2x weight on low values (not 10x!)")
-    print(f"  4. Keep everything else from baseline that was working")
+    print(f"\nActive techniques:")
+    print(f"  1. Dropout (rate={DROPOUT_RATE})")
+    print(f"  2. Label smoothing (alpha={LABEL_SMOOTH})")
+    print(f"  3. Data augmentation: rotation ±5° only")
+    print(f"  4. TTA: {len(TTA_ROTATIONS)} rotations {TTA_ROTATIONS}°, averaged at inference")
+    print(f"  5. Low-dB upweighting ({LOW_VALUE_WEIGHT}x below {LOW_DB_THRESHOLD} dB) — scotoma preservation")
     
     train_dataset = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, train_transform, mode='train', use_tta=False)
     val_dataset = MultiImageDataset(VAL_JSON, FUNDUS_DIR, val_transform, mode='val', use_tta=USE_TTA)
@@ -475,18 +411,11 @@ def train():
     model = MultiImageModel(base_model, pretrained_decoder_state, NUM_ENCODER_BLOCKS, DROPOUT_RATE)
     model.to(DEVICE)
 
-    # Unfreeze decoder immediately and include in optimizer from epoch 1
-    model.unfreeze_decoder()
-    decoder_unfrozen = True
-    
-    # Initial optimizer
     optimizer = optim.AdamW([
         {'params': [p for p in model.encoder.parameters() if p.requires_grad],
         'lr': BASE_LR * 0.05, 'weight_decay': WEIGHT_DECAY * 2},
         {'params': model.projection.parameters(),
         'lr': BASE_LR * 1.5, 'weight_decay': WEIGHT_DECAY},
-        {'params': model.decoder.parameters(),
-        'lr': BASE_LR * 0.08, 'weight_decay': WEIGHT_DECAY * 0.5},
     ])
     
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2, eta_min=1e-6)
@@ -522,8 +451,7 @@ def train():
                 batch_size=1, shuffle=False, collate_fn=val_collate_fn
             ))
             gap = train_mae - val_mae
-            status = "[FROZEN]" if not decoder_unfrozen else "[ACTIVE]"
-            print(f"\n[Epoch {epoch}] {status}")
+            print(f"\n[Epoch {epoch}]")
             print(f"  Train: {train_mae:.2f} dB | Corr: {train_corr:.3f}")
             print(f"  Val:   {val_mae:.2f} dB | Corr: {val_corr:.3f} | Gap: {gap:+.2f}")
         
@@ -542,7 +470,6 @@ def train():
                 'encoder_checkpoint': CHECKPOINT_PATH,
                 'val_mae': val_mae,
                 'val_corr': val_corr,
-                'use_pretrained': model.use_pretrained
             }, INFERENCE_SAVE)
             
             if epoch % 5 == 0:
@@ -566,7 +493,7 @@ def train():
     elif best_mae < 3.5:
         print(f"\n SUB-3.5 ACHIEVED! Beat baseline by {baseline_gain:.2f} dB")
     else:
-        print(f"\n Gap to baseline: {best_mae - 3.74:+.2f} dB") # 3.74db previous baseline
+        print(f"\n Gap to baseline: {best_mae - 3.74:+.2f} dB")
     
     print(f"\nModel saved to: {INFERENCE_SAVE}")
     print("="*60)
