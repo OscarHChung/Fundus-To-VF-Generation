@@ -216,6 +216,43 @@ def val_collate_fn(batch):
     return batch[0]
 
 # ============== Model ==============
+class VFAutoDecoder(nn.Module):
+    """Pretrained refinement decoder: takes 52 VF values, refines them."""
+    def __init__(self, input_dim: int = 52):
+        super().__init__()
+        
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            
+            nn.Linear(256, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            
+            nn.Linear(512, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            
+            nn.Linear(256, input_dim)
+        )
+        
+        self.residual_weight = nn.Parameter(torch.tensor(0.1))
+    
+    def forward(self, x):
+        output = self.network(x)
+        output = output + self.residual_weight * x
+        return output
+
+
 class MultiImageModel(nn.Module):
     def __init__(self, encoder, pretrained_state=None, num_blocks=6, dropout=0.3):
         super().__init__()
@@ -249,6 +286,34 @@ class MultiImageModel(nn.Module):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        
+        # Refinement decoder — loaded from pretrained weights, frozen initially
+        self.decoder = VFAutoDecoder(input_dim=52)
+        self.decoder_frozen = True
+        self.use_pretrained = False
+        
+        if pretrained_state is not None:
+            try:
+                self.decoder.load_state_dict(pretrained_state, strict=True)
+                self.use_pretrained = True
+                for param in self.decoder.parameters():
+                    param.requires_grad = False
+                print(f"✓ Pre-trained decoder loaded and frozen (unfreezes at epoch {DECODER_UNFREEZE_EPOCH})")
+            except Exception as e:
+                print(f"⚠️  Decoder load failed: {e} — training from scratch")
+                self.decoder_frozen = False
+        else:
+            self.decoder_frozen = False
+            print(f"✓ Training decoder from scratch")
+    
+    def unfreeze_decoder(self):
+        if self.use_pretrained and self.decoder_frozen:
+            for param in self.decoder.parameters():
+                param.requires_grad = True
+            self.decoder_frozen = False
+            print(f"  ✓ Decoder UNFROZEN")
+            return True
+        return False
     
     def forward(self, x, average_multi=True):
         if x.dim() == 4:
@@ -256,7 +321,8 @@ class MultiImageModel(nn.Module):
             if latent.dim() == 3:
                 latent = latent[:, 0, :]
             
-            pred = self.projection(latent)
+            vf_features = self.projection(latent)
+            pred = self.decoder(vf_features)
             
             # Allow low (scotoma-level) predictions through — threshold kept minimal
             pred = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
@@ -411,11 +477,16 @@ def train():
     model = MultiImageModel(base_model, pretrained_decoder_state, NUM_ENCODER_BLOCKS, DROPOUT_RATE)
     model.to(DEVICE)
 
+    # Unfreeze decoder immediately and include at a low LR to preserve pretrained weights
+    model.unfreeze_decoder()
+
     optimizer = optim.AdamW([
         {'params': [p for p in model.encoder.parameters() if p.requires_grad],
-        'lr': BASE_LR * 0.05, 'weight_decay': WEIGHT_DECAY * 2},
+         'lr': BASE_LR * 0.05, 'weight_decay': WEIGHT_DECAY * 2},
         {'params': model.projection.parameters(),
-        'lr': BASE_LR * 1.5, 'weight_decay': WEIGHT_DECAY},
+         'lr': BASE_LR * 1.5, 'weight_decay': WEIGHT_DECAY},
+        {'params': model.decoder.parameters(),
+         'lr': BASE_LR * 0.08, 'weight_decay': WEIGHT_DECAY * 0.5},
     ])
     
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2, eta_min=1e-6)
