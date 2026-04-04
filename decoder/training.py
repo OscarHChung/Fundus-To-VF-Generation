@@ -58,8 +58,8 @@ OUTLIER_CLIP_RANGE = (0, 35)
 LOW_DB_THRESHOLD = 10.0
 LOW_VALUE_WEIGHT = 2.5
 
-# Decoder unfreezing: projection converges faster now at lower LR
-DECODER_UNFREEZE_EPOCH = 3
+# Decoder unfreezing: projection warm-started so decoder can engage from epoch 1
+DECODER_UNFREEZE_EPOCH = 1
 
 # Paths
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -269,7 +269,6 @@ class MultiImageModel(nn.Module):
             print(f"✓ Unfrozen {num_blocks}/{total} encoder blocks")
         
         # Projection head: wide enough to preserve spatial VF structure
-        # Bottleneck (128) was discarding too much encoder information — correlation stalled at 0.19
         self.projection = nn.Sequential(
             nn.Linear(1024, 512),
             nn.LayerNorm(512),
@@ -287,6 +286,13 @@ class MultiImageModel(nn.Module):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        
+        # Warm-start: bias final projection layer toward mean VF sensitivity (~18 dB)
+        # Without this, random init outputs garbage to the pretrained decoder for 20+ epochs
+        # before the projection accidentally discovers the right output range
+        final_linear = self.projection[-1]
+        nn.init.constant_(final_linear.bias, 18.0)
+        nn.init.normal_(final_linear.weight, mean=0.0, std=0.01)  # Small weights — bias dominates early
         
         # Refinement decoder — loaded from pretrained weights, frozen initially
         self.decoder = VFAutoDecoder(input_dim=52)
