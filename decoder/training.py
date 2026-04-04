@@ -38,9 +38,9 @@ EPOCHS = 120
 BASE_LR = 5e-4
 WEIGHT_DECAY = 5e-4      # 5x higher — projection head was overfitting
 PATIENCE = 40
-NUM_ENCODER_BLOCKS = 3
+NUM_ENCODER_BLOCKS = 0  # Freeze encoder entirely — fine-tuning overfits on 211 eyes
 MASKED_VALUE_THRESHOLD = 99.0
-DROPOUT_RATE = 0.35
+DROPOUT_RATE = 0.25  # Reduced from 0.35 — frozen encoder means less overfitting risk
 
 # Label smoothing: scales targets slightly toward the mean
 LABEL_SMOOTH = 0.05
@@ -488,10 +488,8 @@ def train():
     decoder_unfrozen = False
 
     optimizer = optim.AdamW([
-        {'params': [p for p in model.encoder.parameters() if p.requires_grad],
-         'lr': BASE_LR * 0.02, 'weight_decay': WEIGHT_DECAY * 2},   # Encoder: very conservative
         {'params': model.projection.parameters(),
-         'lr': BASE_LR * 0.5, 'weight_decay': WEIGHT_DECAY},         # Projection: halved from 1.5x — was thrashing
+         'lr': BASE_LR * 0.8, 'weight_decay': WEIGHT_DECAY},         # Higher — projection does all representational work now
     ])
     
     warmup_epochs = 5
