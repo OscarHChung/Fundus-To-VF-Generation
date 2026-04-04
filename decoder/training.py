@@ -58,8 +58,8 @@ OUTLIER_CLIP_RANGE = (0, 35)
 LOW_DB_THRESHOLD = 10.0
 LOW_VALUE_WEIGHT = 2.5
 
-# Decoder unfreezing: keep frozen until projection head has stabilized
-DECODER_UNFREEZE_EPOCH = 10
+# Decoder unfreezing: let projection stabilize for a few epochs first
+DECODER_UNFREEZE_EPOCH = 5
 
 # Paths
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -268,18 +268,18 @@ class MultiImageModel(nn.Module):
                     param.requires_grad = True
             print(f"✓ Unfrozen {num_blocks}/{total} encoder blocks")
         
-        # Projection head: bottleneck design reduces overfitting surface
-        # 1024 → 256 → 128 → 52 (fewer parameters than previous 1024→512→256→52)
+        # Projection head: wide enough to preserve spatial VF structure
+        # Bottleneck (128) was discarding too much encoder information — correlation stalled at 0.19
         self.projection = nn.Sequential(
-            nn.Linear(1024, 256),
-            nn.LayerNorm(256),
+            nn.Linear(1024, 512),
+            nn.LayerNorm(512),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(256, 128),
-            nn.LayerNorm(128),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
             nn.GELU(),
             nn.Dropout(dropout * 0.7),
-            nn.Linear(128, 52)
+            nn.Linear(256, 52)
         )
         
         for m in self.projection.modules():
