@@ -58,8 +58,8 @@ OUTLIER_CLIP_RANGE = (0, 35)
 LOW_DB_THRESHOLD = 10.0
 LOW_VALUE_WEIGHT = 2.5
 
-# Decoder unfreezing: let projection stabilize for a few epochs first
-DECODER_UNFREEZE_EPOCH = 5
+# Decoder unfreezing: projection converges faster now at lower LR
+DECODER_UNFREEZE_EPOCH = 3
 
 # Paths
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -483,9 +483,9 @@ def train():
 
     optimizer = optim.AdamW([
         {'params': [p for p in model.encoder.parameters() if p.requires_grad],
-         'lr': BASE_LR * 0.05, 'weight_decay': WEIGHT_DECAY * 2},
+         'lr': BASE_LR * 0.02, 'weight_decay': WEIGHT_DECAY * 2},   # Encoder: very conservative
         {'params': model.projection.parameters(),
-         'lr': BASE_LR * 1.5, 'weight_decay': WEIGHT_DECAY},
+         'lr': BASE_LR * 0.5, 'weight_decay': WEIGHT_DECAY},         # Projection: halved from 1.5x — was thrashing
     ])
     
     warmup_epochs = 5
@@ -507,11 +507,11 @@ def train():
             if unfrozen:
                 optimizer.add_param_group({
                     'params': model.decoder.parameters(),
-                    'lr': BASE_LR * 0.05,          # Conservative — preserve pretrained knowledge
+                    'lr': BASE_LR * 0.15,       # ~3x lower than projection (0.5x) — proportional, not 30x gap
                     'weight_decay': WEIGHT_DECAY * 0.5
                 })
                 decoder_unfrozen = True
-                print(f"  [Epoch {epoch}] Decoder added to optimizer at LR={BASE_LR * 0.05:.2e}")
+                print(f"  [Epoch {epoch}] Decoder added to optimizer at LR={BASE_LR * 0.15:.2e}")
 
         model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
