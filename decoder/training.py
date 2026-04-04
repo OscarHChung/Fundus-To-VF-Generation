@@ -35,12 +35,12 @@ else:
 # ============== Config ==============
 BATCH_SIZE = 32
 EPOCHS = 120
-BASE_LR = 1e-3
-WEIGHT_DECAY = 1e-4
+BASE_LR = 5e-4
+WEIGHT_DECAY = 5e-4      # 5x higher — projection head was overfitting
 PATIENCE = 40
 NUM_ENCODER_BLOCKS = 3
 MASKED_VALUE_THRESHOLD = 99.0
-DROPOUT_RATE = 0.3
+DROPOUT_RATE = 0.35
 
 # Label smoothing: scales targets slightly toward the mean
 LABEL_SMOOTH = 0.05
@@ -58,8 +58,8 @@ OUTLIER_CLIP_RANGE = (0, 35)
 LOW_DB_THRESHOLD = 10.0
 LOW_VALUE_WEIGHT = 2.5
 
-# Decoder unfreezing
-DECODER_UNFREEZE_EPOCH = 1
+# Decoder unfreezing: keep frozen until projection head has stabilized
+DECODER_UNFREEZE_EPOCH = 10
 
 # Paths
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -268,17 +268,18 @@ class MultiImageModel(nn.Module):
                     param.requires_grad = True
             print(f"✓ Unfrozen {num_blocks}/{total} encoder blocks")
         
-        # Projection head with dropout per methodology
+        # Projection head: bottleneck design reduces overfitting surface
+        # 1024 → 256 → 128 → 52 (fewer parameters than previous 1024→512→256→52)
         self.projection = nn.Sequential(
-            nn.Linear(1024, 512),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(512, 256),
+            nn.Linear(1024, 256),
             nn.LayerNorm(256),
             nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 128),
+            nn.LayerNorm(128),
+            nn.GELU(),
             nn.Dropout(dropout * 0.7),
-            nn.Linear(256, 52)
+            nn.Linear(128, 52)
         )
         
         for m in self.projection.modules():
@@ -477,24 +478,41 @@ def train():
     model = MultiImageModel(base_model, pretrained_decoder_state, NUM_ENCODER_BLOCKS, DROPOUT_RATE)
     model.to(DEVICE)
 
-    # Unfreeze decoder immediately and include at a low LR to preserve pretrained weights
-    model.unfreeze_decoder()
+    # Decoder stays frozen until epoch DECODER_UNFREEZE_EPOCH — projection stabilizes first
+    decoder_unfrozen = False
 
     optimizer = optim.AdamW([
         {'params': [p for p in model.encoder.parameters() if p.requires_grad],
          'lr': BASE_LR * 0.05, 'weight_decay': WEIGHT_DECAY * 2},
         {'params': model.projection.parameters(),
          'lr': BASE_LR * 1.5, 'weight_decay': WEIGHT_DECAY},
-        {'params': model.decoder.parameters(),
-         'lr': BASE_LR * 0.08, 'weight_decay': WEIGHT_DECAY * 0.5},
     ])
     
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2, eta_min=1e-6)
+    warmup_epochs = 5
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return float(epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(1, EPOCHS - warmup_epochs)
+        return max(0.05, 0.5 * (1.0 + np.cos(np.pi * progress)))
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     best_mae = float('inf')
     patience = 0
     
     for epoch in range(1, EPOCHS + 1):
+        # Unfreeze decoder at target epoch and add to optimizer at low LR
+        if not decoder_unfrozen and epoch >= DECODER_UNFREEZE_EPOCH:
+            unfrozen = model.unfreeze_decoder()
+            if unfrozen:
+                optimizer.add_param_group({
+                    'params': model.decoder.parameters(),
+                    'lr': BASE_LR * 0.05,          # Conservative — preserve pretrained knowledge
+                    'weight_decay': WEIGHT_DECAY * 0.5
+                })
+                decoder_unfrozen = True
+                print(f"  [Epoch {epoch}] Decoder added to optimizer at LR={BASE_LR * 0.05:.2e}")
+
         model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
         
