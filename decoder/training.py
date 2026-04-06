@@ -42,7 +42,7 @@ else:
 BATCH_SIZE    = 32
 ACCUM_STEPS   = 2           # Effective batch = 64, reduces noise
 EPOCHS        = 120
-BASE_LR       = 2e-4        # Lower than v1 (was 5e-4) — gentler on pretrained decoder
+BASE_LR       = 5e-4        # Restored from v1 — 2e-4 was too slow (corr stuck 0.21)
 WEIGHT_DECAY  = 5e-4
 PATIENCE      = 40
 
@@ -61,16 +61,20 @@ PROJ_INIT_BIAS = 18.0
 # ── Technique 3: Rotation augmentation (laterality-safe) ───────
 ROTATION_DEG = 5
 
-# ── Technique 4: Huber loss (no upweighting) ───────────────────
-# Plain Huber — no low-dB weighting. With 211 eyes the weighted
-# loss distorts gradients more than it helps scotoma prediction.
+# ── Technique 4: Mild low-dB upweighting ──────────────────────
+# Restored from v1 at reduced strength (1.5x vs 2.5x).
+# v2 without it: corr stuck at 0.21 — model predicts near-mean for
+# everything. The upweighting forces learning the normal-vs-damaged
+# distinction which drives correlation.
+LOW_DB_THRESHOLD = 10.0
+LOW_VALUE_WEIGHT = 1.5       # Reduced from 2.5x — less distortion, still helps
 
 # ── Decoder config ─────────────────────────────────────────────
-DECODER_LR_SCALE = 0.4       # 0.4 × 2e-4 = 8e-5 (gentle on pretrained weights)
+DECODER_LR_SCALE = 0.4       # 0.4 × 5e-4 = 2e-4 (gentle on pretrained weights)
 DECODER_WD_SCALE = 2.0       # 2 × 5e-4 = 1e-3 (mild regularisation)
 
 # ── LR schedule ────────────────────────────────────────────────
-WARMUP_EPOCHS = 5             # Linear warmup avoids early thrashing
+WARMUP_EPOCHS = 2             # Shortened — 5 epochs wasted too much time at near-zero LR
 VAL_EVERY     = 3             # Validate more often to catch best checkpoint
 
 # Outlier clipping
@@ -290,7 +294,7 @@ class MultiImageModel(nn.Module):
 
 # ============== Loss ==============
 def compute_loss(pred, target, laterality):
-    """Plain Huber loss — no upweighting, no label smoothing."""
+    """Huber loss with mild low-dB upweighting."""
     device = pred.device
     target = target.to(device)
     if isinstance(laterality, str):
@@ -315,7 +319,11 @@ def compute_loss(pred, target, laterality):
         pred_clean   = pred_valid[mask]
         target_clean = target_valid[mask]
 
-        loss = F.huber_loss(pred_clean, target_clean, reduction='mean', delta=1.0)
+        # Mild upweighting for low-dB points (scotoma preservation)
+        weights = torch.ones_like(pred_clean)
+        weights[target_clean < LOW_DB_THRESHOLD] = LOW_VALUE_WEIGHT
+
+        loss = (F.huber_loss(pred_clean, target_clean, reduction='none', delta=1.0) * weights).mean()
         mae  = (pred_clean - target_clean).abs().mean()
 
         total_loss += loss * mask.sum().item()
@@ -394,11 +402,12 @@ def train():
     print("=" * 60)
     print("Training v2 — Simplified Recipe")
     print("=" * 60)
-    print(f"\nActive techniques (4):")
+    print(f"\nActive techniques (5):")
     print(f"  1. Partial encoder fine-tune  ({NUM_ENCODER_BLOCKS_INIT}→{NUM_ENCODER_BLOCKS_FULL} blocks, progressive)")
     print(f"  2. Projection warm-start      (bias={PROJ_INIT_BIAS} dB)")
     print(f"  3. Rotation + color jitter     (±{ROTATION_DEG}°, mild color aug)")
     print(f"  4. Gradient accumulation       (effective batch={BATCH_SIZE * ACCUM_STEPS})")
+    print(f"  5. Low-dB upweighting          ({LOW_VALUE_WEIGHT}x below {LOW_DB_THRESHOLD} dB)")
     print(f"\nLR: {BASE_LR:.1e} (projection) | {BASE_LR * ENCODER_LR_SCALE:.1e} (encoder) | {BASE_LR * DECODER_LR_SCALE:.1e} (decoder)")
     print(f"Warmup: {WARMUP_EPOCHS} epochs linear | Schedule: CosineAnnealingWarmRestarts")
     print(f"Validate every {VAL_EVERY} epochs | Patience: {PATIENCE}")
