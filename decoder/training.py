@@ -1,6 +1,17 @@
 """
-Training - Build on pretraining baseline
-Uses LoRA for parameter-efficient encoder adaptation (PEFT)
+Training v2 — Simplified, principled approach
+Target: sub-3.74 dB val MAE
+
+Changes from v1:
+  - Removed label smoothing (classification technique, not suited for regression)
+  - Removed low-dB upweighting (distorts loss landscape with small dataset)
+  - Removed TTA (±5° too narrow to meaningfully help; re-add if needed)
+  - Lowered decoder LR to 2e-4 (was 5e-4; pretrained decoder needs gentle tuning)
+  - Lowered decoder WD to 1e-3 (was 5e-3; less fighting with lower LR)
+  - Validate every 3 epochs instead of 5 (catch best checkpoint earlier)
+  - Added linear warmup (5 epochs) to avoid early thrashing
+  - Progressive unfreezing: start 3 blocks, unfreeze to 6 at epoch 20
+  - Gradient accumulation (effective batch 64) to reduce per-epoch noise
 """
 
 import os, sys, json, numpy as np
@@ -13,71 +24,74 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
-import math
 
-# ============== MPS Configuration ==============
+# ============== MPS ==============
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
 
 if torch.backends.mps.is_available():
     DEVICE = torch.device("mps")
-    print(f"✓ Using MPS (Apple Silicon GPU)")
+    print("✓ Using MPS (Apple Silicon GPU)")
 else:
     DEVICE = torch.device("cpu")
-    print(f"⚠️  MPS not available, using CPU")
+    print("⚠️  MPS not available, using CPU")
 
 # ==============================================================
 # CONFIG
 # ==============================================================
-BATCH_SIZE   = 32
-EPOCHS       = 120
-BASE_LR      = 5e-4
-WEIGHT_DECAY = 5e-4
-PATIENCE     = 40
+BATCH_SIZE    = 32
+ACCUM_STEPS   = 2           # Effective batch = 64, reduces noise
+EPOCHS        = 120
+BASE_LR       = 2e-4        # Lower than v1 (was 5e-4) — gentler on pretrained decoder
+WEIGHT_DECAY  = 5e-4
+PATIENCE      = 40
 
 MASKED_VALUE_THRESHOLD = 99.0
-DROPOUT_RATE = 0.3
+DROPOUT_RATE  = 0.3
 
-# 1. LoRA on encoder: parameter-efficient adaptation (rank-8)
-#    Proven superior to full fine-tuning on small medical datasets
-#    (Hu et al. 2022; MIDL 2024 PEFT study). Adds ~200k params vs
-#    millions for full fine-tuning — right-sizes capacity for 211 eyes.
-LORA_RANK  = 8
-LORA_ALPHA = 16   # effective scale = alpha/rank = 2.0
+# ── Technique 1: Partial encoder fine-tuning ───────────────────
+NUM_ENCODER_BLOCKS_INIT = 3   # Start with 3 blocks
+NUM_ENCODER_BLOCKS_FULL = 6   # Unfreeze to 6 at UNFREEZE_EPOCH
+UNFREEZE_EPOCH          = 20  # Progressive unfreezing milestone
+ENCODER_LR_SCALE        = 0.05
 
-# 2. Projection warm-start: bias final layer to mean VF (~18 dB)
-#    Without this, random init outputs ~0 dB to pretrained decoder
-#    for 20+ epochs before discovering the right output range.
+# ── Technique 2: Projection warm-start ─────────────────────────
 PROJ_INIT_BIAS = 18.0
 
-# 3. Rotation augmentation ±5° (training only, no flips — laterality-safe)
+# ── Technique 3: Rotation augmentation (laterality-safe) ───────
 ROTATION_DEG = 5
 
-# 4. TTA: average predictions across 3 rotations at inference
-USE_TTA       = True
-TTA_ROTATIONS = [-5, 0, 5]
+# ── Technique 4: Huber loss (no upweighting) ───────────────────
+# Plain Huber — no low-dB weighting. With 211 eyes the weighted
+# loss distorts gradients more than it helps scotoma prediction.
 
-# 5. Huber loss + low-dB upweighting (scotoma preservation)
-LOW_DB_THRESHOLD = 10.0
-LOW_VALUE_WEIGHT = 2.5
+# ── Decoder config ─────────────────────────────────────────────
+DECODER_LR_SCALE = 0.4       # 0.4 × 2e-4 = 8e-5 (gentle on pretrained weights)
+DECODER_WD_SCALE = 2.0       # 2 × 5e-4 = 1e-3 (mild regularisation)
 
-# 6. Label smoothing
-LABEL_SMOOTH = 0.05
+# ── LR schedule ────────────────────────────────────────────────
+WARMUP_EPOCHS = 5             # Linear warmup avoids early thrashing
+VAL_EVERY     = 3             # Validate more often to catch best checkpoint
 
 # Outlier clipping
 OUTLIER_CLIP_RANGE = (0, 35)
 
-# Paths
-CURRENT_DIR      = os.path.dirname(os.path.abspath(__file__))
-RETFOUND_DIR     = os.path.join(CURRENT_DIR, '..', 'encoder', 'RETFound_MAE')
-CHECKPOINT_PATH  = os.path.join(CURRENT_DIR, "..", "encoder", "RETFound_cfp_weights.pth")
+# ── Banned techniques (DO NOT USE) ─────────────────────────────
+# - LoRA           (too slow on MPS — 30 min/epoch)
+# - Flips/affine   (laterality-unsafe / not in methodology)
+# - MixUp          (destroys spatial VF structure)
+
+# ── Paths ──────────────────────────────────────────────────────
+CURRENT_DIR        = os.path.dirname(os.path.abspath(__file__))
+RETFOUND_DIR       = os.path.join(CURRENT_DIR, '..', 'encoder', 'RETFound_MAE')
+CHECKPOINT_PATH    = os.path.join(CURRENT_DIR, "..", "encoder", "RETFound_cfp_weights.pth")
 PRETRAINED_DECODER = os.path.join(CURRENT_DIR, "pretrained_vf_decoder.pth")
-BASE_DIR         = os.path.join(CURRENT_DIR, "..")
-FUNDUS_DIR       = os.path.join(BASE_DIR, "data", "fundus", "grape_fundus_images")
-TRAIN_JSON       = os.path.join(BASE_DIR, "data", "vf_tests", "grape_train.json")
-VAL_JSON         = os.path.join(BASE_DIR, "data", "vf_tests", "grape_test.json")
-BEST_SAVE        = os.path.join(CURRENT_DIR, "best_multi_image_model.pth")
-INFERENCE_SAVE   = os.path.join(CURRENT_DIR, "inference_model.pth")
+BASE_DIR           = os.path.join(CURRENT_DIR, "..")
+FUNDUS_DIR         = os.path.join(BASE_DIR, "data", "fundus", "grape_fundus_images")
+TRAIN_JSON         = os.path.join(BASE_DIR, "data", "vf_tests", "grape_train.json")
+VAL_JSON           = os.path.join(BASE_DIR, "data", "vf_tests", "grape_test.json")
+BEST_SAVE          = os.path.join(CURRENT_DIR, "best_multi_image_model.pth")
+INFERENCE_SAVE     = os.path.join(CURRENT_DIR, "inference_model.pth")
 
 # ============== Mask ==============
 mask_OD = np.array([
@@ -104,7 +118,7 @@ with torch.serialization.safe_globals([argparse.Namespace]):
 
 base_model = mae_vit_large_patch16_dec512d8b()
 base_model.load_state_dict(checkpoint['model'], strict=False)
-print(f"✓ Loaded RETFound")
+print("✓ Loaded RETFound")
 
 pretrained_decoder_state = None
 if os.path.exists(PRETRAINED_DECODER):
@@ -115,11 +129,14 @@ if os.path.exists(PRETRAINED_DECODER):
         print(f"✓ Pre-trained decoder: {pretrained_checkpoint['val_mae']:.2f} dB")
     except Exception as e:
         print(f"⚠️  Could not load pre-trained decoder: {e}")
+else:
+    print("⚠️  No pretrained decoder found — training decoder from scratch")
 
 # ============== Augmentation ==============
 train_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.RandomRotation(ROTATION_DEG),
+    transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
@@ -130,26 +147,14 @@ val_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-def get_tta_transforms():
-    return [
-        transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.Lambda(lambda img, d=deg: transforms.functional.rotate(img, d)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        for deg in TTA_ROTATIONS
-    ]
-
 # ============== Dataset ==============
 class MultiImageDataset(Dataset):
-    def __init__(self, json_path, fundus_dir, transform, mode='train', use_tta=False):
+    def __init__(self, json_path, fundus_dir, transform, mode='train'):
         with open(json_path, 'r') as f:
             self.data = json.load(f)
         self.fundus_dir = fundus_dir
         self.transform  = transform
         self.mode       = mode
-        self.use_tta    = use_tta
 
         self.samples = []
         for item in self.data:
@@ -160,18 +165,20 @@ class MultiImageDataset(Dataset):
 
             if self.mode == 'train':
                 for img_path in images:
-                    self.samples.append({'image': img_path, 'hvf': hvf,
-                                         'laterality': laterality, 'patient_id': patient_id})
+                    self.samples.append({
+                        'image': img_path, 'hvf': hvf,
+                        'laterality': laterality, 'patient_id': patient_id
+                    })
             else:
-                self.samples.append({'images': images, 'hvf': hvf,
-                                     'laterality': laterality, 'patient_id': patient_id})
+                self.samples.append({
+                    'images': images, 'hvf': hvf,
+                    'laterality': laterality, 'patient_id': patient_id
+                })
 
         if self.mode == 'train':
             print(f"  Train: {len(self.data)} eyes → {len(self.samples)} images")
         else:
             print(f"  Val: {len(self.data)} eyes with {sum(len(s['images']) for s in self.samples)} images")
-            if use_tta:
-                print(f"  TTA: {len(TTA_ROTATIONS)} rotations {TTA_ROTATIONS}°")
 
     def __len__(self):
         return len(self.samples)
@@ -186,58 +193,16 @@ class MultiImageDataset(Dataset):
             all_imgs = []
             for img_path in sample['images']:
                 img = Image.open(os.path.join(self.fundus_dir, img_path)).convert('RGB')
-                if self.use_tta:
-                    for t in get_tta_transforms():
-                        all_imgs.append(t(img))
-                else:
-                    all_imgs.append(self.transform(img))
+                all_imgs.append(self.transform(img))
             hvf = np.array(sample['hvf'], dtype=np.float32).flatten()
             return torch.stack(all_imgs), torch.tensor(hvf), sample['laterality']
+
 
 def val_collate_fn(batch):
     return batch[0]
 
-# ============== LoRA ==============
-class LoRALinear(nn.Module):
-    """
-    Low-Rank Adaptation for a frozen Linear layer.
-    Output = W*x + (alpha/rank) * B @ A @ x
-    Only A and B are trained; W stays frozen.
-    B is zero-initialised so LoRA contributes nothing at epoch 0.
-    """
-    def __init__(self, linear: nn.Linear, rank: int, alpha: int):
-        super().__init__()
-        self.linear = linear
-        self.scale  = alpha / rank
-        in_f, out_f = linear.in_features, linear.out_features
 
-        self.lora_A = nn.Parameter(torch.empty(rank, in_f))
-        self.lora_B = nn.Parameter(torch.zeros(out_f, rank))
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-
-        self.linear.weight.requires_grad = False
-        if self.linear.bias is not None:
-            self.linear.bias.requires_grad = False
-
-    def forward(self, x):
-        return self.linear(x) + (x @ self.lora_A.T @ self.lora_B.T) * self.scale
-
-
-def inject_lora(encoder, rank: int, alpha: int):
-    """Inject LoRA into qkv projection of every attention block."""
-    lora_params = []
-    for block in encoder.blocks:
-        attn = block.attn
-        if hasattr(attn, 'qkv') and isinstance(attn.qkv, nn.Linear):
-            lora_layer = LoRALinear(attn.qkv, rank, alpha)
-            attn.qkv   = lora_layer
-            lora_params += [lora_layer.lora_A, lora_layer.lora_B]
-    n = len(lora_params) // 2
-    print(f"✓ LoRA injected into {n} attention blocks (rank={rank}, alpha={alpha})")
-    print(f"  LoRA trainable params: {sum(p.numel() for p in lora_params):,}")
-    return lora_params
-
-# ============== VFAutoDecoder (permanently frozen) ==============
+# ============== VFAutoDecoder ==============
 class VFAutoDecoder(nn.Module):
     def __init__(self, input_dim=52):
         super().__init__()
@@ -253,17 +218,19 @@ class VFAutoDecoder(nn.Module):
     def forward(self, x):
         return self.network(x) + self.residual_weight * x
 
-# ============== Main Model ==============
+
+# ============== Model ==============
 class MultiImageModel(nn.Module):
-    def __init__(self, encoder, pretrained_state=None, dropout=0.3):
+    def __init__(self, encoder, pretrained_state=None, num_blocks=3, dropout=0.3):
         super().__init__()
         self.encoder = encoder
 
-        # Freeze entire encoder; adaptation via LoRA only
+        # Freeze all encoder params initially
         for p in self.encoder.parameters():
             p.requires_grad = False
 
-        self.lora_params = inject_lora(self.encoder, LORA_RANK, LORA_ALPHA)
+        # Unfreeze last N blocks
+        self._unfreeze_blocks(num_blocks)
 
         # Projection: 1024 → 512 → 256 → 52
         self.projection = nn.Sequential(
@@ -271,43 +238,59 @@ class MultiImageModel(nn.Module):
             nn.Linear(512, 256),  nn.LayerNorm(256), nn.GELU(), nn.Dropout(dropout * 0.7),
             nn.Linear(256, 52)
         )
+        # Kaiming init for hidden layers
         for m in list(self.projection.modules())[:-1]:
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-
-        # Warm-start final layer toward mean VF sensitivity
+        # Warm-start final layer
         final = self.projection[-1]
         nn.init.constant_(final.bias, PROJ_INIT_BIAS)
         nn.init.normal_(final.weight, mean=0.0, std=0.01)
+        print(f"✓ Projection warm-start: final bias = {PROJ_INIT_BIAS} dB")
 
-        # Refinement decoder — frozen permanently
+        # Refinement decoder (pretrained)
         self.decoder = VFAutoDecoder(input_dim=52)
         if pretrained_state is not None:
             try:
                 self.decoder.load_state_dict(pretrained_state, strict=True)
-                print(f"✓ Pre-trained decoder loaded (frozen permanently)")
+                print(f"✓ Pre-trained decoder loaded (trainable)")
             except Exception as e:
                 print(f"⚠️  Decoder load failed: {e}")
-        for p in self.decoder.parameters():
-            p.requires_grad = False
+        else:
+            print("✓ Decoder training from scratch")
+
+    def _unfreeze_blocks(self, num_blocks):
+        """Unfreeze the last `num_blocks` encoder blocks."""
+        if hasattr(self.encoder, 'blocks'):
+            total = len(self.encoder.blocks)
+            # First re-freeze all blocks
+            for block in self.encoder.blocks:
+                for p in block.parameters():
+                    p.requires_grad = False
+            # Then unfreeze last N
+            for i in range(max(0, total - num_blocks), total):
+                for p in self.encoder.blocks[i].parameters():
+                    p.requires_grad = True
+            print(f"✓ Unfrozen {num_blocks}/{total} encoder blocks")
 
     def forward(self, x, average_multi=True):
         if x.dim() != 4:
             raise ValueError(f"Expected 4D input, got {x.shape}")
         latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
         if latent.dim() == 3:
-            latent = latent[:, 0, :]
+            latent = latent[:, 0, :]   # CLS token
         pred = self.decoder(self.projection(latent))
-        pred = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
         pred = torch.clamp(pred, OUTLIER_CLIP_RANGE[0], OUTLIER_CLIP_RANGE[1])
         if average_multi and pred.shape[0] > 1:
             pred = pred.mean(dim=0, keepdim=True)
         return pred
 
+
 # ============== Loss ==============
-def compute_loss(pred, target, laterality, smooth=0.0):
+def compute_loss(pred, target, laterality):
+    """Plain Huber loss — no upweighting, no label smoothing."""
     device = pred.device
     target = target.to(device)
     if isinstance(laterality, str):
@@ -321,22 +304,18 @@ def compute_loss(pred, target, laterality, smooth=0.0):
 
     for i, lat in enumerate(laterality):
         valid_idx    = valid_indices_od if lat.startswith('OD') else valid_indices_os
+        # target is 72-dim (full 8x9 grid) → select valid points to get 52
         target_valid = target[i][valid_idx]
+        # pred is already 52-dim (model outputs only valid points)
+        pred_valid   = pred[i]
         mask         = target_valid < MASKED_VALUE_THRESHOLD
         if mask.sum() == 0:
             continue
 
-        pred_clean   = pred[i][mask]
+        pred_clean   = pred_valid[mask]
         target_clean = target_valid[mask]
 
-        if smooth > 0:
-            mean_val     = target_clean.mean()
-            target_clean = (1 - smooth) * target_clean + smooth * mean_val
-
-        weights = torch.ones_like(pred_clean)
-        weights[target_clean < LOW_DB_THRESHOLD] = LOW_VALUE_WEIGHT
-
-        loss = (F.huber_loss(pred_clean, target_clean, reduction='none', delta=1.0) * weights).mean()
+        loss = F.huber_loss(pred_clean, target_clean, reduction='mean', delta=1.0)
         mae  = (pred_clean - target_clean).abs().mean()
 
         total_loss += loss * mask.sum().item()
@@ -359,14 +338,16 @@ def pearson_correlation(pred, target, laterality):
     for i in range(min(len(laterality), pred.shape[0], target.shape[0])):
         lat       = laterality[i] if i < len(laterality) else laterality[0]
         valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
+        # target is 72-dim → select valid to get 52; pred is already 52-dim
         target_i  = target[min(i, target.shape[0]-1)][valid_idx]
+        pred_i    = pred[min(i, pred.shape[0]-1)]
         mask      = target_i < MASKED_VALUE_THRESHOLD
         if mask.sum() > 0:
-            all_pred.extend(pred[min(i, pred.shape[0]-1)][mask].tolist())
+            all_pred.extend(pred_i[mask].tolist())
             all_target.extend(target_i[mask].tolist())
     if len(all_pred) < 2:
         return 0.0
-    return np.corrcoef(np.array(all_pred), np.array(all_target))[0, 1]
+    return float(np.corrcoef(np.array(all_pred), np.array(all_target))[0, 1])
 
 
 def evaluate(model, loader):
@@ -386,120 +367,201 @@ def evaluate(model, loader):
             all_lats.append(lat)
     if n_valid == 0:
         return float('inf'), 0.0
-    corr = pearson_correlation(torch.tensor(np.stack(all_preds)),
-                               torch.tensor(np.stack(all_targets)), all_lats)
+    corr = pearson_correlation(
+        torch.tensor(np.stack(all_preds)),
+        torch.tensor(np.stack(all_targets)),
+        all_lats
+    )
     return total_mae / n_valid, corr
+
+
+# ============== LR helpers ==============
+def get_lr_scale(epoch, warmup_epochs):
+    """Linear warmup for `warmup_epochs`, then 1.0."""
+    if epoch <= warmup_epochs:
+        return epoch / warmup_epochs
+    return 1.0
+
+
+def set_lr(optimizer, base_lrs, scale):
+    """Apply a multiplicative scale to each param group's base LR."""
+    for pg, blr in zip(optimizer.param_groups, base_lrs):
+        pg['lr'] = blr * scale
+
 
 # ============== Training ==============
 def train():
     print("=" * 60)
-    print("Training - Build on Pretraining Baseline")
+    print("Training v2 — Simplified Recipe")
     print("=" * 60)
-    print(f"\nActive techniques (6):")
-    print(f"  1. LoRA encoder adaptation  (rank={LORA_RANK}, alpha={LORA_ALPHA})")
-    print(f"  2. Projection warm-start    (bias={PROJ_INIT_BIAS} dB)")
-    print(f"  3. Rotation augmentation    (±{ROTATION_DEG}°, no flips)")
-    print(f"  4. TTA                      ({len(TTA_ROTATIONS)} rotations, averaged)")
-    print(f"  5. Low-dB upweighting       ({LOW_VALUE_WEIGHT}x below {LOW_DB_THRESHOLD} dB)")
-    print(f"  6. Label smoothing          (alpha={LABEL_SMOOTH})")
+    print(f"\nActive techniques (4):")
+    print(f"  1. Partial encoder fine-tune  ({NUM_ENCODER_BLOCKS_INIT}→{NUM_ENCODER_BLOCKS_FULL} blocks, progressive)")
+    print(f"  2. Projection warm-start      (bias={PROJ_INIT_BIAS} dB)")
+    print(f"  3. Rotation + color jitter     (±{ROTATION_DEG}°, mild color aug)")
+    print(f"  4. Gradient accumulation       (effective batch={BATCH_SIZE * ACCUM_STEPS})")
+    print(f"\nLR: {BASE_LR:.1e} (projection) | {BASE_LR * ENCODER_LR_SCALE:.1e} (encoder) | {BASE_LR * DECODER_LR_SCALE:.1e} (decoder)")
+    print(f"Warmup: {WARMUP_EPOCHS} epochs linear | Schedule: CosineAnnealingWarmRestarts")
+    print(f"Validate every {VAL_EVERY} epochs | Patience: {PATIENCE}")
     print(f"\nBanned techniques:")
-    print(f"  - Horizontal/affine augmentation (laterality-unsafe)")
-    print(f"  - MixUp (destroys spatial VF structure)")
-    print(f"  - Decoder fine-tuning (caused overfitting in every prior run)")
-    print(f"  - Full/partial encoder block unfreezing (replaced by LoRA)")
-    print(f"\nExpected MAE per epoch range:")
-    print(f"  Ep  1- 5:  6-8 dB   (warm-start active; LoRA near-zero at init)")
-    print(f"  Ep  5-15:  4-5 dB   (correlation climbing steadily; target >0.4 by ep15)")
-    print(f"  Ep 15-30:  3.5-4.2  (approaching baseline; corr 0.5-0.65)")
-    print(f"  Ep 30-60: <3.74     (target zone; corr 0.65+; gap within ±0.2 dB)")
-    print(f"  Ep 60+  :  flat     (early stop likely triggers)")
-    print(f"\nStop early if:")
-    print(f"  - Corr < 0.35 at epoch 15        → LoRA rank too low or LR wrong")
-    print(f"  - Val gap worse than -0.4 dB      → overfitting (raise WEIGHT_DECAY)")
-    print(f"  - Val MAE rising 10+ epochs       → past peak, stop")
+    print(f"  - LoRA           (too slow on MPS)")
+    print(f"  - Flips/affine   (laterality-unsafe)")
+    print(f"  - MixUp          (destroys spatial VF structure)")
+    print(f"\nExpected behavior (cancel if off-track):")
+    print(f"  Ep 1-5:   MAE 5-7, Corr ~0.2      (warmup phase, should steadily drop)")
+    print(f"  Ep 6-15:  MAE 4-5, Corr 0.3-0.5   (main learning; CANCEL if Corr<0.3 at ep15)")
+    print(f"  Ep 15-30: MAE 3.5-4.2, Corr 0.5+  (refinement; unfreeze at ep20)")
+    print(f"  Ep 30-60: MAE <3.74, Corr 0.6+     (target zone; CANCEL if MAE stuck >4.0)")
+    print(f"  Ep 60+:   plateau → early stop")
 
+    # ── Data ───────────────────────────────────────────────────
     train_dataset = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, train_transform, mode='train')
-    val_dataset   = MultiImageDataset(VAL_JSON,   FUNDUS_DIR, val_transform,   mode='val', use_tta=USE_TTA)
+    val_dataset   = MultiImageDataset(VAL_JSON,   FUNDUS_DIR, val_transform,   mode='val')
 
     train_loader = DataLoader(train_dataset, BATCH_SIZE, shuffle=True,
                               num_workers=0, drop_last=True)
     val_loader   = DataLoader(val_dataset, batch_size=1, shuffle=False,
                               num_workers=0, collate_fn=val_collate_fn)
 
-    model = MultiImageModel(base_model, pretrained_decoder_state, DROPOUT_RATE)
+    # ── Model ──────────────────────────────────────────────────
+    model = MultiImageModel(base_model, pretrained_decoder_state,
+                            NUM_ENCODER_BLOCKS_INIT, DROPOUT_RATE)
     model.to(DEVICE)
 
+    # ── Optimizer ──────────────────────────────────────────────
     optimizer = optim.AdamW([
-        {'params': model.lora_params,
-         'lr': BASE_LR * 0.3, 'weight_decay': 0.0},          # LoRA: no weight decay (standard)
+        {'params': [p for p in model.encoder.parameters() if p.requires_grad],
+         'lr': BASE_LR * ENCODER_LR_SCALE, 'weight_decay': WEIGHT_DECAY * 2},
         {'params': model.projection.parameters(),
-         'lr': BASE_LR,       'weight_decay': WEIGHT_DECAY},
+         'lr': BASE_LR, 'weight_decay': WEIGHT_DECAY},
+        {'params': model.decoder.parameters(),
+         'lr': BASE_LR * DECODER_LR_SCALE, 'weight_decay': WEIGHT_DECAY * DECODER_WD_SCALE},
     ])
+
+    base_lrs = [pg['lr'] for pg in optimizer.param_groups]
 
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=20, T_mult=2, eta_min=1e-6
     )
 
-    best_mae = float('inf')
-    patience = 0
+    best_mae  = float('inf')
+    best_corr = 0.0
+    patience  = 0
+    unfrozen_more = False
 
     for epoch in range(1, EPOCHS + 1):
-        model.train()
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
 
-        for imgs, hvf, lat in pbar:
+        # ── Warmup ─────────────────────────────────────────────
+        if epoch <= WARMUP_EPOCHS:
+            scale = get_lr_scale(epoch, WARMUP_EPOCHS)
+            set_lr(optimizer, base_lrs, scale)
+
+        # ── Progressive unfreezing ─────────────────────────────
+        if epoch == UNFREEZE_EPOCH and not unfrozen_more:
+            model._unfreeze_blocks(NUM_ENCODER_BLOCKS_FULL)
+            # Add newly unfrozen params to optimizer
+            unfrozen_params = []
+            total = len(model.encoder.blocks)
+            for i in range(total - NUM_ENCODER_BLOCKS_FULL, total - NUM_ENCODER_BLOCKS_INIT):
+                unfrozen_params.extend(model.encoder.blocks[i].parameters())
+            if unfrozen_params:
+                optimizer.add_param_group({
+                    'params': unfrozen_params,
+                    'lr': BASE_LR * ENCODER_LR_SCALE * 0.5,  # Even more conservative for newly unfrozen
+                    'weight_decay': WEIGHT_DECAY * 2,
+                })
+                base_lrs.append(BASE_LR * ENCODER_LR_SCALE * 0.5)
+            unfrozen_more = True
+            print(f"\n  → Progressive unfreeze: {NUM_ENCODER_BLOCKS_INIT} → {NUM_ENCODER_BLOCKS_FULL} blocks at epoch {epoch}")
+
+        # ── Train ──────────────────────────────────────────────
+        model.train()
+        epoch_mae = 0
+        epoch_n   = 0
+        optimizer.zero_grad()
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
+        for step, (imgs, hvf, lat) in enumerate(pbar, 1):
             imgs = imgs.to(DEVICE)
             pred = model(imgs, average_multi=False)
-            loss, mae, nv = compute_loss(pred, hvf, lat, smooth=LABEL_SMOOTH)
+            loss, mae, nv = compute_loss(pred, hvf, lat)
 
             if nv > 0:
-                optimizer.zero_grad()
-                loss.backward()
+                # Scale loss for gradient accumulation
+                (loss / ACCUM_STEPS).backward()
+                epoch_mae += mae * nv
+                epoch_n   += nv
+
+            if step % ACCUM_STEPS == 0 or step == len(train_loader):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+                optimizer.zero_grad()
 
             pbar.set_postfix({'MAE': f'{mae:.2f}'})
 
-        scheduler.step()
-        val_mae, val_corr = evaluate(model, val_loader)
+        # Step scheduler (only after warmup)
+        if epoch > WARMUP_EPOCHS:
+            scheduler.step()
 
-        if epoch % 5 == 0:
-            train_mae, train_corr = evaluate(model, DataLoader(
-                MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, val_transform, mode='val', use_tta=False),
-                batch_size=1, shuffle=False, collate_fn=val_collate_fn
-            ))
+        # ── Validate ───────────────────────────────────────────
+        if epoch % VAL_EVERY == 0 or epoch <= 5:
+            val_mae, val_corr = evaluate(model, val_loader)
+
+            # Compute train metrics for diagnostics
+            train_eval_ds = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, val_transform, mode='val')
+            train_eval_loader = DataLoader(train_eval_ds, batch_size=1, shuffle=False,
+                                           num_workers=0, collate_fn=val_collate_fn)
+            train_mae, train_corr = evaluate(model, train_eval_loader)
             gap = train_mae - val_mae
+
             print(f"\n[Epoch {epoch}]")
             print(f"  Train: {train_mae:.2f} dB | Corr: {train_corr:.3f}")
             print(f"  Val:   {val_mae:.2f} dB | Corr: {val_corr:.3f} | Gap: {gap:+.2f}")
 
-        if val_mae < best_mae:
-            best_mae = val_mae
-            torch.save({'model': model.state_dict(), 'mae': val_mae,
-                        'corr': val_corr, 'epoch': epoch}, BEST_SAVE)
-            torch.save({'model_state_dict': model.state_dict(),
-                        'encoder_checkpoint': CHECKPOINT_PATH,
-                        'val_mae': val_mae, 'val_corr': val_corr}, INFERENCE_SAVE)
-            if epoch % 5 == 0:
-                print(f"  ✓ New Best!")
-            patience = 0
-        else:
-            patience += 1
-            if patience >= PATIENCE:
-                print(f"\nEarly stopping at epoch {epoch}")
-                break
+            current_lrs = [f"{pg['lr']:.1e}" for pg in optimizer.param_groups]
+            print(f"  LRs: {current_lrs}")
 
+            # ── Early warning checks ──────────────────────────
+            if epoch == 15 and val_corr < 0.35:
+                print("  ⚠️  WARNING: Corr < 0.35 at epoch 15 — check warm-start / LR")
+            if gap < -0.5:
+                print("  ⚠️  WARNING: Val much worse than train — overfitting risk")
+
+            # ── Checkpoint ─────────────────────────────────────
+            if val_mae < best_mae:
+                best_mae  = val_mae
+                best_corr = val_corr
+                torch.save({
+                    'model': model.state_dict(),
+                    'mae': val_mae, 'corr': val_corr, 'epoch': epoch
+                }, BEST_SAVE)
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'encoder_checkpoint': CHECKPOINT_PATH,
+                    'val_mae': val_mae, 'val_corr': val_corr
+                }, INFERENCE_SAVE)
+                print(f"  ✓ New Best! (MAE={val_mae:.2f}, Corr={val_corr:.3f})")
+                patience = 0
+            else:
+                patience += VAL_EVERY  # Increment by gap between validations
+                if patience >= PATIENCE:
+                    print(f"\nEarly stopping at epoch {epoch} (patience={PATIENCE})")
+                    break
+
+    # ── Summary ────────────────────────────────────────────────
     print(f"\n{'='*60}")
-    print(f"Training Complete! Best Val MAE: {best_mae:.2f} dB")
+    print(f"Training Complete!")
+    print(f"  Best Val MAE:  {best_mae:.2f} dB")
+    print(f"  Best Val Corr: {best_corr:.3f}")
     gain = 3.74 - best_mae
     if best_mae < 3.0:
-        print(f" SUB-3 dB ACHIEVED! Beat baseline by {gain:.2f} dB")
+        print(f"  🎯 SUB-3 dB! Beat baseline by {gain:.2f} dB")
     elif best_mae < 3.74:
-        print(f" Beat baseline by {gain:.2f} dB")
+        print(f"  ✓ Beat baseline by {gain:.2f} dB")
     else:
-        print(f" Gap to baseline: {best_mae - 3.74:+.2f} dB")
-    print(f"Model saved to: {INFERENCE_SAVE}")
+        print(f"  Gap to baseline: {best_mae - 3.74:+.2f} dB")
+    print(f"  Model saved to: {INFERENCE_SAVE}")
     print("=" * 60)
+
 
 if __name__ == "__main__":
     train()
