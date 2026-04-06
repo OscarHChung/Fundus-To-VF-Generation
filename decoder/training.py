@@ -38,9 +38,9 @@ EPOCHS = 120
 BASE_LR = 5e-4
 WEIGHT_DECAY = 5e-4      # 5x higher — projection head was overfitting
 PATIENCE = 40
-NUM_ENCODER_BLOCKS = 0  # Freeze encoder entirely — fine-tuning overfits on 211 eyes
+NUM_ENCODER_BLOCKS = 3  # Sweet spot — 0 and 6 both performed worse
 MASKED_VALUE_THRESHOLD = 99.0
-DROPOUT_RATE = 0.25  # Reduced from 0.35 — frozen encoder means less overfitting risk
+DROPOUT_RATE = 0.3  # Restored to original baseline value
 
 # Label smoothing: scales targets slightly toward the mean
 LABEL_SMOOTH = 0.05
@@ -58,7 +58,8 @@ OUTLIER_CLIP_RANGE = (0, 35)
 LOW_DB_THRESHOLD = 10.0
 LOW_VALUE_WEIGHT = 2.5
 
-# Decoder unfreezing: projection warm-started so decoder can engage from epoch 1
+# Decoder unfreezes immediately — needs to train with projection for correlation to climb
+# Key: LR must be close to projection LR, not 10x lower
 DECODER_UNFREEZE_EPOCH = 1
 
 # Paths
@@ -225,23 +226,23 @@ class VFAutoDecoder(nn.Module):
             nn.Linear(input_dim, 256),
             nn.LayerNorm(256),
             nn.GELU(),
-            nn.Dropout(0.2),
-            
+            nn.Dropout(0.35),        # Increased from 0.2 — higher LR needs more regularization
+
             nn.Linear(256, 512),
             nn.LayerNorm(512),
             nn.GELU(),
-            nn.Dropout(0.2),
-            
+            nn.Dropout(0.35),
+
             nn.Linear(512, 512),
             nn.LayerNorm(512),
             nn.GELU(),
-            nn.Dropout(0.2),
-            
+            nn.Dropout(0.35),
+
             nn.Linear(512, 256),
             nn.LayerNorm(256),
             nn.GELU(),
-            nn.Dropout(0.2),
-            
+            nn.Dropout(0.35),
+
             nn.Linear(256, input_dim)
         )
         
@@ -488,18 +489,13 @@ def train():
     decoder_unfrozen = False
 
     optimizer = optim.AdamW([
+        {'params': [p for p in model.encoder.parameters() if p.requires_grad],
+         'lr': BASE_LR * 0.05, 'weight_decay': WEIGHT_DECAY * 2},
         {'params': model.projection.parameters(),
-         'lr': BASE_LR * 0.8, 'weight_decay': WEIGHT_DECAY},         # Higher — projection does all representational work now
+         'lr': BASE_LR, 'weight_decay': WEIGHT_DECAY},
     ])
     
-    warmup_epochs = 5
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return float(epoch + 1) / warmup_epochs
-        progress = (epoch - warmup_epochs) / max(1, EPOCHS - warmup_epochs)
-        return max(0.05, 0.5 * (1.0 + np.cos(np.pi * progress)))
-
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2, eta_min=1e-6)
 
     best_mae = float('inf')
     patience = 0
@@ -511,11 +507,11 @@ def train():
             if unfrozen:
                 optimizer.add_param_group({
                     'params': model.decoder.parameters(),
-                    'lr': BASE_LR * 0.15,       # ~3x lower than projection (0.5x) — proportional, not 30x gap
-                    'weight_decay': WEIGHT_DECAY * 0.5
+                    'lr': BASE_LR * 0.5,        # Match projection LR — 4e-5 was too low, caused correlation stall
+                    'weight_decay': WEIGHT_DECAY * 3  # Stronger decay on decoder to control its overfitting
                 })
                 decoder_unfrozen = True
-                print(f"  [Epoch {epoch}] Decoder added to optimizer at LR={BASE_LR * 0.15:.2e}")
+                print(f"  [Epoch {epoch}] Decoder added to optimizer at LR={BASE_LR * 0.5:.2e}")
 
         model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
