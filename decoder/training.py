@@ -1,19 +1,25 @@
 """
-Training v5.1 — Two-phase training with frozen decoder
+Training v6 — Spatial encoder features + compact projection
 
-Phase 1 (ep 1-P): 3 encoder blocks + projection, frozen decoder
-  → Establishes encoder→VF mapping (expect MAE ~4.2-4.3)
-  → Stops when val MAE plateaus (patience_phase1 = 15 epochs)
+Why v5.1 plateaued at 4.25:
+  - CLS token is a single 1024-dim summary of the entire image
+  - VF mapping is spatial: nasal retina → temporal VF, superior → inferior
+  - A global vector loses this spatial correspondence
+  - 671K projection params overfit on 211 eyes
 
-Phase 2 (ep P-end): Unfreeze to 6 blocks, fresh OneCycleLR, lower max LR
-  → More encoder capacity to learn fundus→VF features
-  → Frozen decoder still prevents overfitting
-  → Should push below 4.0 dB
+Changes:
+  1. Use ALL patch tokens (197 × 1024), not just CLS
+     → Average pool to get spatial summary: (1024,)
+     → ALSO keep CLS token → concatenate: (2048,)
+     → This gives the model both global and spatial features
 
-Frozen decoder rationale (proven in v5):
-  - Train-val gap stays tight (±0.3 vs -0.57 with trainable decoder)
-  - Val correlation stable at 0.53 (vs diverging in v4)
-  - Prevents the decoder from overfitting its VF priors away
+  2. Simpler projection: 2048 → 256 → 52 (was 1024 → 512 → 256 → 52)
+     → Fewer params = less overfitting
+     → With 2048 input features, don't need deep MLP
+
+  3. Frozen decoder (proven in v5/v5.1)
+
+  4. Single-phase training (Phase 2 in v5.1 didn't help)
 
 Banned: LoRA, flips/affine, MixUp
 """
@@ -45,23 +51,16 @@ else:
 # ==============================================================
 BATCH_SIZE   = 32
 EPOCHS       = 120
+BASE_LR      = 5e-4
+WEIGHT_DECAY = 1e-3
 PATIENCE     = 30
 
 MASKED_VALUE_THRESHOLD = 99.0
 DROPOUT_RATE = 0.4
 
-# Phase 1: 3 blocks, higher LR
-PHASE1_ENCODER_BLOCKS = 3
-PHASE1_BASE_LR        = 5e-4
-PHASE1_ENCODER_LR     = 2.5e-5    # 0.05x
-PHASE1_WEIGHT_DECAY   = 1e-3
-PHASE1_PATIENCE       = 15        # Switch to phase 2 after 15 epochs no improvement
-
-# Phase 2: 6 blocks, lower LR to not destroy what phase 1 learned
-PHASE2_ENCODER_BLOCKS = 6
-PHASE2_BASE_LR        = 2e-4      # Lower — fine-tuning, not retraining
-PHASE2_ENCODER_LR     = 1e-5      # Very conservative for encoder
-PHASE2_WEIGHT_DECAY   = 1e-3
+# Encoder
+NUM_ENCODER_BLOCKS = 3
+ENCODER_LR_SCALE   = 0.05
 
 # Projection warm-start
 PROJ_INIT_BIAS = 18.0
@@ -244,23 +243,34 @@ class MultiImageModel(nn.Module):
         for p in self.encoder.parameters():
             p.requires_grad = False
 
-        self.unfreeze_blocks(num_blocks)
+        if hasattr(self.encoder, 'blocks'):
+            total = len(self.encoder.blocks)
+            for i in range(max(0, total - num_blocks), total):
+                for p in self.encoder.blocks[i].parameters():
+                    p.requires_grad = True
+            print(f"✓ Unfrozen {num_blocks}/{total} encoder blocks")
 
-        # Projection
+        # Compact projection: CLS+spatial (2048) → 256 → 52
+        # Much fewer params than v5's 1024→512→256→52 (671K → 140K)
         self.projection = nn.Sequential(
-            nn.Linear(1024, 512), nn.LayerNorm(512), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(512, 256),  nn.LayerNorm(256), nn.GELU(), nn.Dropout(dropout * 0.7),
+            nn.Linear(2048, 256), nn.LayerNorm(256), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(256, NUM_VALID_POINTS)
         )
-        for m in list(self.projection.modules())[:-1]:
+
+        # Init
+        for m in self.projection.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+
+        # Warm-start final layer
         final = self.projection[-1]
         nn.init.constant_(final.bias, PROJ_INIT_BIAS)
         nn.init.normal_(final.weight, mean=0.0, std=0.01)
-        print(f"✓ Projection warm-start: final bias = {PROJ_INIT_BIAS} dB")
+
+        proj_params = sum(p.numel() for p in self.projection.parameters())
+        print(f"✓ Projection: 2048→256→52 ({proj_params:,} params, bias={PROJ_INIT_BIAS})")
 
         # Decoder
         self.decoder = VFAutoDecoder(input_dim=NUM_VALID_POINTS)
@@ -272,44 +282,48 @@ class MultiImageModel(nn.Module):
                     for p in self.decoder.parameters():
                         p.requires_grad = False
                     self.decoder_frozen = True
-                    print(f"✓ Pre-trained decoder loaded (FROZEN)")
+                    print(f"✓ Decoder: FROZEN (pretrained)")
                 else:
-                    print(f"✓ Pre-trained decoder loaded (trainable)")
+                    print(f"✓ Decoder: trainable (pretrained)")
             except Exception as e:
                 print(f"⚠️  Decoder load failed: {e}")
         else:
-            print("✓ Decoder from scratch (trainable)")
+            print("✓ Decoder: from scratch")
 
-    def unfreeze_blocks(self, num_blocks):
-        """Unfreeze last N encoder blocks."""
-        if hasattr(self.encoder, 'blocks'):
-            total = len(self.encoder.blocks)
-            for block in self.encoder.blocks:
-                for p in block.parameters():
-                    p.requires_grad = False
-            for i in range(max(0, total - num_blocks), total):
-                for p in self.encoder.blocks[i].parameters():
-                    p.requires_grad = True
-            print(f"✓ Unfrozen {num_blocks}/{total} encoder blocks")
+        # Summary
+        enc  = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
+        proj = sum(p.numel() for p in self.projection.parameters() if p.requires_grad)
+        dec  = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
+        print(f"  Trainable: enc={enc:,} + proj={proj:,} + dec={dec:,} = {enc+proj+dec:,}")
+
+    def encode(self, x):
+        """Extract CLS + spatial features from encoder."""
+        latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
+        # latent shape: (B, 197, 1024) = [CLS] + 196 patch tokens
+        if latent.dim() == 3:
+            cls_token = latent[:, 0, :]           # (B, 1024)
+            patch_tokens = latent[:, 1:, :]       # (B, 196, 1024)
+            spatial_avg = patch_tokens.mean(dim=1) # (B, 1024)
+            combined = torch.cat([cls_token, spatial_avg], dim=1)  # (B, 2048)
+            return combined
+        else:
+            # Fallback if 2D
+            return torch.cat([latent, latent], dim=1)
 
     def forward(self, x, average_multi=True):
         if x.dim() != 4:
             raise ValueError(f"Expected 4D input, got {x.shape}")
-        latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
-        if latent.dim() == 3:
-            latent = latent[:, 0, :]
-        pred = self.decoder(self.projection(latent))
+
+        features = self.encode(x)          # (B, 2048)
+        proj = self.projection(features)   # (B, 52)
+        pred = self.decoder(proj)          # (B, 52)
+
         pred = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
         pred = torch.clamp(pred, OUTLIER_CLIP_RANGE[0], OUTLIER_CLIP_RANGE[1])
+
         if average_multi and pred.shape[0] > 1:
             pred = pred.mean(dim=0, keepdim=True)
         return pred
-
-    def print_trainable(self):
-        enc  = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
-        proj = sum(p.numel() for p in self.projection.parameters() if p.requires_grad)
-        dec  = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
-        print(f"  Trainable: encoder={enc:,} + projection={proj:,} + decoder={dec:,} = {enc+proj+dec:,}")
 
 
 # ============== Loss ==============
@@ -400,52 +414,30 @@ def evaluate(model, loader):
 
 
 # ============== Training ==============
-def make_optimizer_and_scheduler(model, base_lr, encoder_lr, weight_decay,
-                                  epochs_remaining, steps_per_epoch):
-    """Create fresh optimizer + OneCycleLR for a training phase."""
-    param_groups = [
-        {'params': [p for p in model.encoder.parameters() if p.requires_grad],
-         'lr': encoder_lr, 'weight_decay': weight_decay},
-        {'params': model.projection.parameters(),
-         'lr': base_lr, 'weight_decay': weight_decay},
-    ]
-    optimizer = optim.AdamW(param_groups)
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=[encoder_lr, base_lr],
-        epochs=epochs_remaining,
-        steps_per_epoch=steps_per_epoch,
-        pct_start=0.1,
-        anneal_strategy='cos',
-        div_factor=10,
-        final_div_factor=100,
-    )
-    return optimizer, scheduler
-
-
 def train():
     print("=" * 60)
-    print("Training v5.1 — Two-phase with frozen decoder")
+    print("Training v6 — Spatial features + compact projection")
     print("=" * 60)
 
-    print(f"\nPhase 1: {PHASE1_ENCODER_BLOCKS} encoder blocks")
-    print(f"  LR: proj={PHASE1_BASE_LR:.1e} enc={PHASE1_ENCODER_LR:.1e}")
-    print(f"  Plateau patience: {PHASE1_PATIENCE} epochs → switch to Phase 2")
+    print(f"\nKey changes from v5.1:")
+    print(f"  1. CLS + spatial avg pool → 2048-dim input (was CLS-only 1024)")
+    print(f"  2. Compact projection: 2048→256→52 (was 1024→512→256→52)")
+    print(f"  3. Single phase (Phase 2 didn't help in v5.1)")
 
-    print(f"\nPhase 2: {PHASE2_ENCODER_BLOCKS} encoder blocks (progressive unfreeze)")
-    print(f"  LR: proj={PHASE2_BASE_LR:.1e} enc={PHASE2_ENCODER_LR:.1e}")
-    print(f"  Fresh optimizer — gives new blocks room to learn")
-
-    print(f"\nShared: decoder=FROZEN | dropout={DROPOUT_RATE} | WD={PHASE1_WEIGHT_DECAY:.1e}")
-    print(f"  Loss: Huber(δ={HUBER_DELTA}) + {LOW_VALUE_WEIGHT}x <{LOW_DB_THRESHOLD}dB")
+    print(f"\nConfig:")
+    print(f"  Encoder: {NUM_ENCODER_BLOCKS}/24 blocks | LR={BASE_LR * ENCODER_LR_SCALE:.1e}")
+    print(f"  Projection: LR={BASE_LR:.1e} | WD={WEIGHT_DECAY:.1e} | dropout={DROPOUT_RATE}")
+    print(f"  Decoder: FROZEN")
+    print(f"  Loss: Huber + {LOW_VALUE_WEIGHT}x <{LOW_DB_THRESHOLD}dB")
     print(f"  Aug: ±{ROTATION_DEG}° | TTA: {TTA_ROTATIONS}")
+
     print(f"\nBanned: LoRA, flips/affine, MixUp")
 
     print(f"\nExpected:")
-    print(f"  Phase 1 ep 1-15:  MAE 5→4.3  (same as v5)")
-    print(f"  Phase 1 ep 15-30: MAE ~4.2   (plateau → triggers Phase 2)")
-    print(f"  Phase 2 ep 1-20:  MAE 4.2→3.8 (new encoder capacity)")
-    print(f"  Phase 2 ep 20+:   MAE <3.74   (target; CANCEL if stuck >4.0)")
+    print(f"  Ep 1-5:   MAE 5-6     (adapting)")
+    print(f"  Ep 6-15:  MAE 4-5     (spatial features should help here)")
+    print(f"  Ep 15-30: MAE 3.8-4.2 (should beat v5.1's 4.25 plateau)")
+    print(f"  Ep 30-60: MAE <3.74   (target; CANCEL if stuck >4.2 at ep40)")
 
     # ── Data ───────────────────────────────────────────────────
     train_dataset = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, train_transform, mode='train')
@@ -456,37 +448,39 @@ def train():
     val_loader   = DataLoader(val_dataset, batch_size=1, shuffle=False,
                               num_workers=0, collate_fn=val_collate_fn)
 
-    steps_per_epoch = len(train_loader)
-
     # ── Model ──────────────────────────────────────────────────
     model = MultiImageModel(base_model, pretrained_decoder_state,
-                            PHASE1_ENCODER_BLOCKS, DROPOUT_RATE,
+                            NUM_ENCODER_BLOCKS, DROPOUT_RATE,
                             freeze_decoder=DECODER_FROZEN)
     model.to(DEVICE)
-    model.print_trainable()
 
-    # ── Phase 1 setup ──────────────────────────────────────────
-    phase = 1
-    phase1_epochs = 60  # Max epochs for phase 1
-    optimizer, scheduler = make_optimizer_and_scheduler(
-        model, PHASE1_BASE_LR, PHASE1_ENCODER_LR, PHASE1_WEIGHT_DECAY,
-        phase1_epochs, steps_per_epoch
+    # ── Optimizer ──────────────────────────────────────────────
+    optimizer = optim.AdamW([
+        {'params': [p for p in model.encoder.parameters() if p.requires_grad],
+         'lr': BASE_LR * ENCODER_LR_SCALE, 'weight_decay': WEIGHT_DECAY},
+        {'params': model.projection.parameters(),
+         'lr': BASE_LR, 'weight_decay': WEIGHT_DECAY},
+    ])
+
+    steps_per_epoch = len(train_loader)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=[BASE_LR * ENCODER_LR_SCALE, BASE_LR],
+        epochs=EPOCHS,
+        steps_per_epoch=steps_per_epoch,
+        pct_start=0.1,
+        anneal_strategy='cos',
+        div_factor=10,
+        final_div_factor=100,
     )
 
     best_mae  = float('inf')
     best_corr = 0.0
-    phase_patience = 0
-    global_patience = 0
-    epoch = 0
+    patience  = 0
 
-    print(f"\n{'─'*40}")
-    print(f"Phase 1: {PHASE1_ENCODER_BLOCKS} blocks, LR={PHASE1_BASE_LR:.1e}")
-    print(f"{'─'*40}")
-
-    for ep in range(1, EPOCHS + 1):
-        epoch = ep
+    for epoch in range(1, EPOCHS + 1):
         model.train()
-        pbar = tqdm(train_loader, desc=f"Epoch {ep}/{EPOCHS} [P{phase}]")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
 
         for imgs, hvf, lat in pbar:
             imgs = imgs.to(DEVICE)
@@ -501,12 +495,12 @@ def train():
                 try:
                     scheduler.step()
                 except Exception:
-                    pass  # OneCycleLR may raise if past total_steps
+                    pass
 
-            pbar.set_postfix({'MAE': f'{mae:.2f}', 'P': phase})
+            pbar.set_postfix({'MAE': f'{mae:.2f}'})
 
         # ── Validate ───────────────────────────────────────────
-        if ep % VAL_EVERY == 0 or ep <= 3:
+        if epoch % VAL_EVERY == 0 or epoch <= 3:
             val_mae, val_corr = evaluate(model, val_loader)
 
             train_eval = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, val_transform,
@@ -516,7 +510,7 @@ def train():
             train_mae, train_corr = evaluate(model, train_eval_loader)
             gap = train_mae - val_mae
 
-            print(f"\n[Epoch {ep} | Phase {phase}]")
+            print(f"\n[Epoch {epoch}]")
             print(f"  Train: {train_mae:.2f} dB | Corr: {train_corr:.3f}")
             print(f"  Val:   {val_mae:.2f} dB | Corr: {val_corr:.3f} | Gap: {gap:+.2f}")
 
@@ -524,39 +518,16 @@ def train():
                 best_mae  = val_mae
                 best_corr = val_corr
                 torch.save({'model': model.state_dict(), 'mae': val_mae,
-                            'corr': val_corr, 'epoch': ep, 'phase': phase}, BEST_SAVE)
+                            'corr': val_corr, 'epoch': epoch}, BEST_SAVE)
                 torch.save({'model_state_dict': model.state_dict(),
                             'encoder_checkpoint': CHECKPOINT_PATH,
                             'val_mae': val_mae, 'val_corr': val_corr}, INFERENCE_SAVE)
                 print(f"  ✓ New Best! (MAE={val_mae:.2f}, Corr={val_corr:.3f})")
-                phase_patience = 0
-                global_patience = 0
+                patience = 0
             else:
-                phase_patience += VAL_EVERY
-                global_patience += VAL_EVERY
-
-                # Phase 1 → Phase 2 transition
-                if phase == 1 and phase_patience >= PHASE1_PATIENCE:
-                    print(f"\n{'─'*40}")
-                    print(f"Phase 1 plateaued at MAE={best_mae:.2f}")
-                    print(f"Switching to Phase 2: {PHASE2_ENCODER_BLOCKS} blocks")
-                    print(f"{'─'*40}")
-
-                    phase = 2
-                    phase_patience = 0
-                    model.unfreeze_blocks(PHASE2_ENCODER_BLOCKS)
-                    model.print_trainable()
-
-                    remaining = EPOCHS - ep
-                    optimizer, scheduler = make_optimizer_and_scheduler(
-                        model, PHASE2_BASE_LR, PHASE2_ENCODER_LR, PHASE2_WEIGHT_DECAY,
-                        remaining, steps_per_epoch
-                    )
-                    continue
-
-                # Global early stopping
-                if global_patience >= PATIENCE:
-                    print(f"\nEarly stopping at epoch {ep}")
+                patience += VAL_EVERY
+                if patience >= PATIENCE:
+                    print(f"\nEarly stopping at epoch {epoch}")
                     break
 
     # ── Summary ────────────────────────────────────────────────
@@ -564,7 +535,6 @@ def train():
     print(f"Training Complete!")
     print(f"  Best Val MAE:  {best_mae:.2f} dB")
     print(f"  Best Val Corr: {best_corr:.3f}")
-    print(f"  Reached in phase {phase}")
     gain = 3.74 - best_mae
     if best_mae < 3.0:
         print(f"  🎯 SUB-3 dB! Beat baseline by {gain:.2f} dB")
