@@ -1,27 +1,34 @@
 """
-Training v7 — Checkpoint ensemble + snapshot-based SWA
+Training v8 — Per-region VF prediction from spatial patch features
 
-Why: All architectures plateau at ~4.2 dB. The model oscillates during training
-(val MAE bounces 4.2-4.5 across epochs). Averaging predictions from multiple
-good checkpoints smooths out this noise.
+Key insight: All previous versions predicted 52 VF points from a single
+global feature vector (CLS token or CLS+avg pool). This ignores the
+spatial correspondence between retinal regions and VF sectors.
 
-Strategy:
-  1. Train with v6's architecture (spatial features + frozen decoder) — proven best
-  2. Save top-5 checkpoints by val MAE during training
-  3. After training: create an ensemble model that averages weights (SWA-style)
-  4. Also save individual checkpoints for prediction-time ensemble if needed
+The VF has a known anatomical mapping to retinal regions:
+  - Superior retina → inferior VF
+  - Inferior retina → superior VF  
+  - Nasal retina → temporal VF
+  - Temporal retina → nasal VF
 
-Additionally trying:
-  - Slightly higher dropout (0.45) since we're now ensembling
-  - Wider projection hidden (384 instead of 256) to give each checkpoint
-    more expressiveness — ensemble will regularize
-  - CosineAnnealingWarmRestarts instead of OneCycleLR
-    (allows multiple "restarts" → diverse checkpoints near each LR minimum)
+Instead of global→all_points, we:
+  1. Keep the 14×14 = 196 spatial patch tokens from the encoder
+  2. Pool patches into 4 quadrants matching VF anatomy
+  3. Each quadrant head predicts its corresponding VF sector points
+  4. Concatenate sector predictions → full 52-point VF
+  5. Pass through frozen decoder for refinement
+
+This means each VF region is predicted from the retinal patches that
+actually correspond to it anatomically, rather than from a global summary.
+
+Encoder: FULLY FROZEN (features are good enough — proven by v5-v7)
+Decoder: FROZEN (prevents overfitting — proven by v5)
+Only the 4 sector heads + a small fusion layer are trained.
 
 Banned: LoRA, flips/affine, MixUp
 """
 
-import os, sys, json, copy, numpy as np
+import os, sys, json, numpy as np
 import argparse
 import torch
 import torch.nn as nn
@@ -31,7 +38,6 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
-from collections import OrderedDict
 
 # ============== MPS ==============
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
@@ -48,21 +54,16 @@ else:
 # CONFIG
 # ==============================================================
 BATCH_SIZE   = 32
-EPOCHS       = 100            # Enough for 2+ cosine cycles
-BASE_LR      = 5e-4
-WEIGHT_DECAY = 1e-3
-PATIENCE     = 40             # Longer patience — we want diverse snapshots
+EPOCHS       = 100
+BASE_LR      = 1e-3           # Higher LR — small trainable model
+WEIGHT_DECAY = 5e-3
+PATIENCE     = 30
 
 MASKED_VALUE_THRESHOLD = 99.0
-DROPOUT_RATE = 0.45
-
-# Encoder
-NUM_ENCODER_BLOCKS = 3
-ENCODER_LR_SCALE   = 0.05
+DROPOUT_RATE = 0.3
 
 # Projection
-PROJ_INIT_BIAS   = 18.0
-PROJ_HIDDEN_DIM  = 384        # Wider than v6's 256
+PROJ_INIT_BIAS = 18.0
 
 # Augmentation
 ROTATION_DEG = 5
@@ -76,12 +77,8 @@ LOW_DB_THRESHOLD = 10.0
 LOW_VALUE_WEIGHT = 1.5
 HUBER_DELTA      = 1.0
 
-# Decoder: FROZEN
-DECODER_FROZEN = True
-
-# Validation & ensemble
-VAL_EVERY     = 3
-TOP_K_SAVE    = 5             # Save top 5 checkpoints for ensemble
+# Validation
+VAL_EVERY = 2
 
 # Clipping
 OUTLIER_CLIP_RANGE = (0, 35)
@@ -97,7 +94,6 @@ TRAIN_JSON         = os.path.join(BASE_DIR, "data", "vf_tests", "grape_train.jso
 VAL_JSON           = os.path.join(BASE_DIR, "data", "vf_tests", "grape_test.json")
 BEST_SAVE          = os.path.join(CURRENT_DIR, "best_multi_image_model.pth")
 INFERENCE_SAVE     = os.path.join(CURRENT_DIR, "inference_model.pth")
-ENSEMBLE_SAVE      = os.path.join(CURRENT_DIR, "ensemble_model.pth")
 
 # ============== Mask ==============
 mask_OD = np.array([
@@ -115,6 +111,117 @@ valid_indices_od = [i for i, v in enumerate(mask_OD.flatten()) if v]
 mask_OS          = np.fliplr(mask_OD)
 valid_indices_os = [i for i, v in enumerate(mask_OS.flatten()) if v]
 NUM_VALID_POINTS = len(valid_indices_od)  # 52
+
+# ==============================================================
+# VF sector definitions — which of the 52 valid points belong to
+# each anatomical sector. The 8×9 grid rows 0-3 are superior VF
+# (maps to inferior retina), rows 4-7 are inferior VF (maps to
+# superior retina). Left/right split at column ~4.
+#
+# We define 4 sectors: superior-nasal, superior-temporal,
+# inferior-nasal, inferior-temporal (from VF perspective).
+# For OD: nasal = left cols (0-4), temporal = right cols (5-8)
+# For OS: mirrored
+# ==============================================================
+def build_sector_indices():
+    """Build sector-to-valid-index mapping for the 52-point VF."""
+    grid = mask_OD.copy()  # 8×9
+    rows, cols = grid.shape
+
+    # Sector assignments for each grid position
+    # Superior VF = rows 0-3, Inferior VF = rows 4-7
+    # For OD: Nasal = cols 0-4, Temporal = cols 5-8
+    sectors = {
+        'sup_nasal': [],     # Superior VF, nasal side
+        'sup_temporal': [],  # Superior VF, temporal side
+        'inf_nasal': [],     # Inferior VF, nasal side
+        'inf_temporal': [],  # Inferior VF, temporal side
+    }
+
+    valid_count = 0
+    for r in range(rows):
+        for c in range(cols):
+            if grid[r, c]:
+                is_superior = r < 4
+                is_nasal = c <= 4  # For OD; OS will be handled at forward time
+
+                if is_superior and is_nasal:
+                    sectors['sup_nasal'].append(valid_count)
+                elif is_superior and not is_nasal:
+                    sectors['sup_temporal'].append(valid_count)
+                elif not is_superior and is_nasal:
+                    sectors['inf_nasal'].append(valid_count)
+                else:
+                    sectors['inf_temporal'].append(valid_count)
+                valid_count += 1
+
+    return sectors
+
+VF_SECTORS = build_sector_indices()
+
+# Patch quadrant mapping for 14×14 grid
+# The fundus image has INVERTED mapping to VF:
+#   Superior retina (top patches) → Inferior VF
+#   Inferior retina (bottom patches) → Superior VF
+#   Nasal retina → Temporal VF (side depends on OD/OS)
+#   Temporal retina → Nasal VF
+#
+# For OD fundus: nasal = right side of image, temporal = left
+# So: left patches (temporal retina) → nasal VF
+#     right patches (nasal retina) → temporal VF
+#     top patches (superior retina) → inferior VF
+#     bottom patches (inferior retina) → superior VF
+
+def build_patch_quadrants():
+    """Map 14×14 patch grid to 4 retinal quadrants."""
+    quadrants = {
+        # Retinal quadrant → maps to VF sector
+        'sup_retina_nasal': [],     # → inf_temporal VF (OD)
+        'sup_retina_temporal': [],  # → inf_nasal VF (OD)
+        'inf_retina_nasal': [],     # → sup_temporal VF (OD)
+        'inf_retina_temporal': [],  # → sup_nasal VF (OD)
+    }
+
+    for r in range(14):
+        for c in range(14):
+            patch_idx = r * 14 + c
+            is_sup_retina = r < 7
+            is_right = c >= 7  # Right side of image
+
+            # For OD: right side of image = nasal retina
+            if is_sup_retina and is_right:
+                quadrants['sup_retina_nasal'].append(patch_idx)
+            elif is_sup_retina and not is_right:
+                quadrants['sup_retina_temporal'].append(patch_idx)
+            elif not is_sup_retina and is_right:
+                quadrants['inf_retina_nasal'].append(patch_idx)
+            else:
+                quadrants['inf_retina_temporal'].append(patch_idx)
+
+    return quadrants
+
+PATCH_QUADRANTS = build_patch_quadrants()
+
+# For OD: retinal quadrant → VF sector mapping
+# Superior retina nasal → Inferior VF temporal
+# Superior retina temporal → Inferior VF nasal
+# Inferior retina nasal → Superior VF temporal
+# Inferior retina temporal → Superior VF nasal
+RETINA_TO_VF_OD = {
+    'sup_retina_nasal':    'inf_temporal',
+    'sup_retina_temporal': 'inf_nasal',
+    'inf_retina_nasal':    'sup_temporal',
+    'inf_retina_temporal': 'sup_nasal',
+}
+
+# For OS: nasal/temporal are flipped
+RETINA_TO_VF_OS = {
+    'sup_retina_nasal':    'inf_nasal',      # "nasal" in image is actually temporal for OS
+    'sup_retina_temporal': 'inf_temporal',
+    'inf_retina_nasal':    'sup_nasal',
+    'inf_retina_temporal': 'sup_temporal',
+}
+
 
 # ============== Load RETFound ==============
 sys.path.insert(0, RETFOUND_DIR)
@@ -171,14 +278,12 @@ class MultiImageDataset(Dataset):
         self.transform  = transform
         self.mode       = mode
         self.use_tta    = use_tta
-
         self.samples = []
         for item in self.data:
             images     = item['FundusImage'] if isinstance(item['FundusImage'], list) else [item['FundusImage']]
             hvf        = item['hvf']
             laterality = item.get('Laterality', 'OD').strip().upper()
             patient_id = item.get('PatientID', 0)
-
             if self.mode == 'train':
                 for img_path in images:
                     self.samples.append({'image': img_path, 'hvf': hvf,
@@ -186,7 +291,6 @@ class MultiImageDataset(Dataset):
             else:
                 self.samples.append({'images': images, 'hvf': hvf,
                                      'laterality': laterality, 'patient_id': patient_id})
-
         if self.mode == 'train':
             print(f"  Train: {len(self.data)} eyes → {len(self.samples)} images")
         else:
@@ -234,80 +338,141 @@ class VFAutoDecoder(nn.Module):
     def forward(self, x):
         return self.network(x) + self.residual_weight * x
 
+
+# ============== Sector Head ==============
+class SectorHead(nn.Module):
+    """Predicts VF points for one sector from pooled patch features + CLS context."""
+    def __init__(self, input_dim, num_points, dropout=0.3, bias_init=18.0):
+        super().__init__()
+        hidden = max(64, num_points * 4)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden), nn.LayerNorm(hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, num_points)
+        )
+        # Warm-start
+        nn.init.constant_(self.net[-1].bias, bias_init)
+        nn.init.normal_(self.net[-1].weight, mean=0.0, std=0.01)
+
+    def forward(self, x):
+        return self.net(x)
+
+
 # ============== Model ==============
-class MultiImageModel(nn.Module):
-    def __init__(self, encoder, pretrained_state=None, num_blocks=3, dropout=0.3,
-                 freeze_decoder=True, proj_hidden=256):
+class RegionalVFModel(nn.Module):
+    def __init__(self, encoder, pretrained_decoder_state=None, dropout=0.3):
         super().__init__()
         self.encoder = encoder
 
+        # Freeze entire encoder
         for p in self.encoder.parameters():
             p.requires_grad = False
+        print("✓ Encoder: FULLY FROZEN")
 
-        if hasattr(self.encoder, 'blocks'):
-            total = len(self.encoder.blocks)
-            for i in range(max(0, total - num_blocks), total):
-                for p in self.encoder.blocks[i].parameters():
-                    p.requires_grad = True
-            print(f"✓ Unfrozen {num_blocks}/{total} encoder blocks")
+        self.embed_dim = 1024  # RETFound ViT-Large
 
-        # Projection: CLS+spatial → hidden → 52
-        self.projection = nn.Sequential(
-            nn.Linear(2048, proj_hidden), nn.LayerNorm(proj_hidden), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(proj_hidden, NUM_VALID_POINTS)
+        # Register patch indices as buffers
+        for quad_name, indices in PATCH_QUADRANTS.items():
+            self.register_buffer(f'patch_idx_{quad_name}',
+                                 torch.tensor(indices, dtype=torch.long))
+
+        # Register VF sector indices as buffers
+        for sec_name, indices in VF_SECTORS.items():
+            self.register_buffer(f'vf_idx_{sec_name}',
+                                 torch.tensor(indices, dtype=torch.long))
+
+        # Each sector head gets: quadrant_pool(1024) + CLS(1024) = 2048
+        sector_input_dim = self.embed_dim * 2
+        self.sector_heads = nn.ModuleDict()
+        for sec_name, sec_indices in VF_SECTORS.items():
+            n_points = len(sec_indices)
+            self.sector_heads[sec_name] = SectorHead(
+                sector_input_dim, n_points, dropout, PROJ_INIT_BIAS
+            )
+
+        # Fusion: light refinement after concatenating sector outputs
+        self.fusion = nn.Sequential(
+            nn.Linear(NUM_VALID_POINTS, NUM_VALID_POINTS * 2),
+            nn.LayerNorm(NUM_VALID_POINTS * 2),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(NUM_VALID_POINTS * 2, NUM_VALID_POINTS),
         )
-        for m in self.projection.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        final = self.projection[-1]
-        nn.init.constant_(final.bias, PROJ_INIT_BIAS)
-        nn.init.normal_(final.weight, mean=0.0, std=0.01)
+        # Residual weight for fusion
+        self.fusion_alpha = nn.Parameter(torch.tensor(0.3))
+        # Init fusion final to near-identity
+        nn.init.zeros_(self.fusion[-1].weight)
+        nn.init.zeros_(self.fusion[-1].bias)
 
-        proj_params = sum(p.numel() for p in self.projection.parameters())
-        print(f"✓ Projection: 2048→{proj_hidden}→52 ({proj_params:,} params)")
-
-        # Decoder
+        # Decoder: frozen
         self.decoder = VFAutoDecoder(input_dim=NUM_VALID_POINTS)
-        self.decoder_frozen = False
-        if pretrained_state is not None:
+        if pretrained_decoder_state is not None:
             try:
-                self.decoder.load_state_dict(pretrained_state, strict=True)
-                if freeze_decoder:
-                    for p in self.decoder.parameters():
-                        p.requires_grad = False
-                    self.decoder_frozen = True
-                    print(f"✓ Decoder: FROZEN")
-                else:
-                    print(f"✓ Decoder: trainable")
+                self.decoder.load_state_dict(pretrained_decoder_state, strict=True)
+                for p in self.decoder.parameters():
+                    p.requires_grad = False
+                print("✓ Decoder: FROZEN (pretrained)")
             except Exception as e:
                 print(f"⚠️  Decoder load failed: {e}")
-        else:
-            print("✓ Decoder: from scratch")
 
-        enc  = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
-        proj = sum(p.numel() for p in self.projection.parameters() if p.requires_grad)
-        dec  = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
-        print(f"  Trainable: enc={enc:,} + proj={proj:,} + dec={dec:,} = {enc+proj+dec:,}")
+        # Count params
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        frozen    = sum(p.numel() for p in self.parameters() if not p.requires_grad)
+        print(f"  Trainable: {trainable:,} | Frozen: {frozen:,}")
 
-    def encode(self, x):
-        latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
-        if latent.dim() == 3:
-            cls_token = latent[:, 0, :]
-            spatial_avg = latent[:, 1:, :].mean(dim=1)
-            return torch.cat([cls_token, spatial_avg], dim=1)
-        else:
-            return torch.cat([latent, latent], dim=1)
+        # Print sector sizes
+        for sec_name, sec_indices in VF_SECTORS.items():
+            print(f"    {sec_name}: {len(sec_indices)} VF points")
 
-    def forward(self, x, average_multi=True):
+    def extract_features(self, x):
+        """Extract CLS token and patch tokens from frozen encoder."""
+        with torch.no_grad():
+            latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
+        # latent: (B, 197, 1024) = [CLS] + 196 patches
+        cls_token = latent[:, 0, :]      # (B, 1024)
+        patches = latent[:, 1:, :]       # (B, 196, 1024)
+        return cls_token, patches
+
+    def pool_quadrant(self, patches, quad_name):
+        """Average pool patches belonging to a retinal quadrant."""
+        idx = getattr(self, f'patch_idx_{quad_name}')  # (N_patches,)
+        quad_patches = patches[:, idx, :]  # (B, N_patches, 1024)
+        return quad_patches.mean(dim=1)    # (B, 1024)
+
+    def forward(self, x, laterality='OD', average_multi=True):
         if x.dim() != 4:
             raise ValueError(f"Expected 4D input, got {x.shape}")
-        features = self.encode(x)
-        proj = self.projection(features)
-        pred = self.decoder(proj)
+
+        cls_token, patches = self.extract_features(x)  # (B, 1024), (B, 196, 1024)
+
+        # Select mapping based on laterality
+        if isinstance(laterality, str):
+            mapping = RETINA_TO_VF_OD if laterality.startswith('OD') else RETINA_TO_VF_OS
+        else:
+            mapping = RETINA_TO_VF_OD if laterality[0].startswith('OD') else RETINA_TO_VF_OS
+
+        # Predict each VF sector from its corresponding retinal quadrant
+        sector_preds = {}
+        for retina_quad, vf_sector in mapping.items():
+            quad_feat = self.pool_quadrant(patches, retina_quad)  # (B, 1024)
+            head_input = torch.cat([quad_feat, cls_token], dim=1)  # (B, 2048)
+            sector_preds[vf_sector] = self.sector_heads[vf_sector](head_input)
+
+        # Assemble full 52-point prediction
+        pred = torch.zeros(x.shape[0], NUM_VALID_POINTS, device=x.device)
+        for sec_name, sec_pred in sector_preds.items():
+            idx = getattr(self, f'vf_idx_{sec_name}')
+            pred[:, idx] = sec_pred
+
+        # Fusion: light cross-sector refinement with residual
+        fused = self.fusion(pred)
+        pred = pred + self.fusion_alpha * fused
+
+        # Frozen decoder refinement
+        pred = self.decoder(pred)
+
         pred = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
         pred = torch.clamp(pred, OUTLIER_CLIP_RANGE[0], OUTLIER_CLIP_RANGE[1])
+
         if average_multi and pred.shape[0] > 1:
             pred = pred.mean(dim=0, keepdim=True)
         return pred
@@ -378,7 +543,7 @@ def evaluate(model, loader):
         for sample in loader:
             imgs, hvf, lat = sample
             imgs = imgs.to(DEVICE)
-            pred = model(imgs, average_multi=True)
+            pred = model(imgs, laterality=lat, average_multi=True)
             _, mae, nv = compute_loss(pred, hvf, lat)
             total_mae += mae * nv
             n_valid   += nv
@@ -393,58 +558,30 @@ def evaluate(model, loader):
     return total_mae / n_valid, corr
 
 
-# ============== Top-K checkpoint tracker ==============
-class TopKCheckpoints:
-    """Keep the top-K model checkpoints by val MAE (lower is better)."""
-    def __init__(self, k=5):
-        self.k = k
-        self.checkpoints = []  # list of (mae, state_dict, epoch)
-
-    def update(self, mae, model, epoch):
-        state = copy.deepcopy(model.state_dict())
-        self.checkpoints.append((mae, state, epoch))
-        self.checkpoints.sort(key=lambda x: x[0])
-        if len(self.checkpoints) > self.k:
-            self.checkpoints = self.checkpoints[:self.k]
-
-    def get_averaged_state(self):
-        """Average the weights of all saved checkpoints (SWA-style)."""
-        if not self.checkpoints:
-            return None
-        avg_state = OrderedDict()
-        n = len(self.checkpoints)
-        for key in self.checkpoints[0][1]:
-            tensors = [ckpt[1][key].float() for ckpt in self.checkpoints]
-            avg_state[key] = sum(tensors) / n
-        return avg_state
-
-    def summary(self):
-        return [(f"ep{ep}", f"{mae:.2f}") for mae, _, ep in self.checkpoints]
-
-
 # ============== Training ==============
 def train():
     print("=" * 60)
-    print("Training v7 — Checkpoint ensemble")
+    print("Training v8 — Per-region VF prediction")
     print("=" * 60)
 
-    print(f"\nStrategy: train normally, save top-{TOP_K_SAVE} checkpoints,")
-    print(f"  then average their weights (SWA) for final model.")
+    print(f"\nArchitecture:")
+    print(f"  Encoder: FULLY FROZEN → 196 spatial patches (14×14)")
+    print(f"  4 retinal quadrants → pool → 4 sector heads → 52 VF points")
+    print(f"  + Fusion layer for cross-sector refinement")
+    print(f"  + Frozen decoder for VF prior")
 
     print(f"\nConfig:")
-    print(f"  Encoder: {NUM_ENCODER_BLOCKS}/24 blocks | LR={BASE_LR * ENCODER_LR_SCALE:.1e}")
-    print(f"  Projection: 2048→{PROJ_HIDDEN_DIM}→52 | LR={BASE_LR:.1e} | dropout={DROPOUT_RATE}")
-    print(f"  Decoder: FROZEN")
+    print(f"  LR={BASE_LR:.1e} | WD={WEIGHT_DECAY:.1e} | dropout={DROPOUT_RATE}")
     print(f"  Loss: Huber + {LOW_VALUE_WEIGHT}x <{LOW_DB_THRESHOLD}dB")
-    print(f"  Schedule: CosineWarmRestarts T0=20 T_mult=2 (diverse snapshots)")
     print(f"  Aug: ±{ROTATION_DEG}° | TTA: {TTA_ROTATIONS}")
 
     print(f"\nBanned: LoRA, flips/affine, MixUp")
 
     print(f"\nExpected:")
-    print(f"  Ep 1-15:  MAE 5→4.3  (same trajectory as v5/v6)")
-    print(f"  Ep 15-40: MAE ~4.2   (individual checkpoints plateau here)")
-    print(f"  SWA:      MAE ~4.0?  (ensemble should beat best single)")
+    print(f"  Ep 1-10:  MAE 5-6   (sector heads adapting)")
+    print(f"  Ep 10-30: MAE 4-5   (spatial inductive bias should help)")
+    print(f"  Ep 30-60: MAE <4.0  (target — spatial structure is the key)")
+    print(f"  CANCEL if MAE >4.5 at ep 20 (spatial mapping wrong)")
 
     # ── Data ───────────────────────────────────────────────────
     train_dataset = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, train_transform, mode='train')
@@ -456,25 +593,17 @@ def train():
                               num_workers=0, collate_fn=val_collate_fn)
 
     # ── Model ──────────────────────────────────────────────────
-    model = MultiImageModel(base_model, pretrained_decoder_state,
-                            NUM_ENCODER_BLOCKS, DROPOUT_RATE,
-                            freeze_decoder=DECODER_FROZEN,
-                            proj_hidden=PROJ_HIDDEN_DIM)
+    model = RegionalVFModel(base_model, pretrained_decoder_state, DROPOUT_RATE)
     model.to(DEVICE)
 
-    # ── Optimizer with CosineWarmRestarts for diverse snapshots ──
-    optimizer = optim.AdamW([
-        {'params': [p for p in model.encoder.parameters() if p.requires_grad],
-         'lr': BASE_LR * ENCODER_LR_SCALE, 'weight_decay': WEIGHT_DECAY},
-        {'params': model.projection.parameters(),
-         'lr': BASE_LR, 'weight_decay': WEIGHT_DECAY},
-    ])
+    # ── Optimizer: only sector heads + fusion ──────────────────
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(trainable_params, lr=BASE_LR, weight_decay=WEIGHT_DECAY)
 
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=20, T_mult=2, eta_min=1e-6
+        optimizer, T_0=25, T_mult=2, eta_min=1e-5
     )
 
-    topk = TopKCheckpoints(k=TOP_K_SAVE)
     best_mae  = float('inf')
     best_corr = 0.0
     patience  = 0
@@ -485,13 +614,14 @@ def train():
 
         for imgs, hvf, lat in pbar:
             imgs = imgs.to(DEVICE)
-            pred = model(imgs, average_multi=False)
+            pred = model(imgs, laterality=lat, average_multi=False)
             loss, mae, nv = compute_loss(pred, hvf, lat)
 
             if nv > 0:
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad], 1.0)
                 optimizer.step()
 
             pbar.set_postfix({'MAE': f'{mae:.2f}'})
@@ -513,14 +643,14 @@ def train():
             print(f"  Train: {train_mae:.2f} dB | Corr: {train_corr:.3f}")
             print(f"  Val:   {val_mae:.2f} dB | Corr: {val_corr:.3f} | Gap: {gap:+.2f}")
 
-            # Update top-K
-            topk.update(val_mae, model, epoch)
-
             if val_mae < best_mae:
                 best_mae  = val_mae
                 best_corr = val_corr
                 torch.save({'model': model.state_dict(), 'mae': val_mae,
                             'corr': val_corr, 'epoch': epoch}, BEST_SAVE)
+                torch.save({'model_state_dict': model.state_dict(),
+                            'encoder_checkpoint': CHECKPOINT_PATH,
+                            'val_mae': val_mae, 'val_corr': val_corr}, INFERENCE_SAVE)
                 print(f"  ✓ New Best! (MAE={val_mae:.2f}, Corr={val_corr:.3f})")
                 patience = 0
             else:
@@ -529,64 +659,19 @@ def train():
                     print(f"\nEarly stopping at epoch {epoch}")
                     break
 
-    # ── SWA Ensemble ───────────────────────────────────────────
-    print(f"\n{'─'*40}")
-    print(f"Creating SWA ensemble from top-{TOP_K_SAVE} checkpoints...")
-    print(f"  Checkpoints: {topk.summary()}")
-
-    avg_state = topk.get_averaged_state()
-    if avg_state is not None:
-        model.load_state_dict(avg_state)
-        model.to(DEVICE)
-
-        swa_mae, swa_corr = evaluate(model, val_loader)
-        print(f"\n  SWA Ensemble:")
-        print(f"    Val MAE:  {swa_mae:.2f} dB")
-        print(f"    Val Corr: {swa_corr:.3f}")
-        print(f"    vs Best Single: {best_mae:.2f} dB (diff: {swa_mae - best_mae:+.2f})")
-
-        # Save ensemble if it's better
-        if swa_mae < best_mae:
-            print(f"  ✓ Ensemble beats best single!")
-            final_mae  = swa_mae
-            final_corr = swa_corr
-        else:
-            print(f"  Best single checkpoint is still better")
-            # Reload best single
-            best_ckpt = torch.load(BEST_SAVE, map_location='cpu')
-            model.load_state_dict(best_ckpt['model'])
-            final_mae  = best_mae
-            final_corr = best_corr
-
-        # Always save ensemble for comparison
-        torch.save({'model_state_dict': avg_state,
-                    'val_mae': swa_mae, 'val_corr': swa_corr,
-                    'source_checkpoints': topk.summary()}, ENSEMBLE_SAVE)
-
-        # Save best overall as inference model
-        torch.save({'model_state_dict': model.state_dict(),
-                    'encoder_checkpoint': CHECKPOINT_PATH,
-                    'val_mae': final_mae, 'val_corr': final_corr}, INFERENCE_SAVE)
-    else:
-        final_mae  = best_mae
-        final_corr = best_corr
-
     # ── Summary ────────────────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"Training Complete!")
-    print(f"  Best Single:    {best_mae:.2f} dB | Corr: {best_corr:.3f}")
-    if avg_state is not None:
-        print(f"  SWA Ensemble:   {swa_mae:.2f} dB | Corr: {swa_corr:.3f}")
-    print(f"  Final Model:    {final_mae:.2f} dB | Corr: {final_corr:.3f}")
-    gain = 3.74 - final_mae
-    if final_mae < 3.0:
+    print(f"  Best Val MAE:  {best_mae:.2f} dB")
+    print(f"  Best Val Corr: {best_corr:.3f}")
+    gain = 3.74 - best_mae
+    if best_mae < 3.0:
         print(f"  🎯 SUB-3 dB! Beat baseline by {gain:.2f} dB")
-    elif final_mae < 3.74:
+    elif best_mae < 3.74:
         print(f"  ✓ Beat baseline by {gain:.2f} dB")
     else:
-        print(f"  Gap to baseline: {final_mae - 3.74:+.2f} dB")
-    print(f"  Models saved to: {INFERENCE_SAVE}")
-    print(f"                   {ENSEMBLE_SAVE}")
+        print(f"  Gap to baseline: {best_mae - 3.74:+.2f} dB")
+    print(f"  Model saved to: {INFERENCE_SAVE}")
     print("=" * 60)
 
 
