@@ -1,30 +1,27 @@
 """
-Training v6 — Spatial encoder features + compact projection
+Training v7 — Checkpoint ensemble + snapshot-based SWA
 
-Why v5.1 plateaued at 4.25:
-  - CLS token is a single 1024-dim summary of the entire image
-  - VF mapping is spatial: nasal retina → temporal VF, superior → inferior
-  - A global vector loses this spatial correspondence
-  - 671K projection params overfit on 211 eyes
+Why: All architectures plateau at ~4.2 dB. The model oscillates during training
+(val MAE bounces 4.2-4.5 across epochs). Averaging predictions from multiple
+good checkpoints smooths out this noise.
 
-Changes:
-  1. Use ALL patch tokens (197 × 1024), not just CLS
-     → Average pool to get spatial summary: (1024,)
-     → ALSO keep CLS token → concatenate: (2048,)
-     → This gives the model both global and spatial features
+Strategy:
+  1. Train with v6's architecture (spatial features + frozen decoder) — proven best
+  2. Save top-5 checkpoints by val MAE during training
+  3. After training: create an ensemble model that averages weights (SWA-style)
+  4. Also save individual checkpoints for prediction-time ensemble if needed
 
-  2. Simpler projection: 2048 → 256 → 52 (was 1024 → 512 → 256 → 52)
-     → Fewer params = less overfitting
-     → With 2048 input features, don't need deep MLP
-
-  3. Frozen decoder (proven in v5/v5.1)
-
-  4. Single-phase training (Phase 2 in v5.1 didn't help)
+Additionally trying:
+  - Slightly higher dropout (0.45) since we're now ensembling
+  - Wider projection hidden (384 instead of 256) to give each checkpoint
+    more expressiveness — ensemble will regularize
+  - CosineAnnealingWarmRestarts instead of OneCycleLR
+    (allows multiple "restarts" → diverse checkpoints near each LR minimum)
 
 Banned: LoRA, flips/affine, MixUp
 """
 
-import os, sys, json, numpy as np
+import os, sys, json, copy, numpy as np
 import argparse
 import torch
 import torch.nn as nn
@@ -34,6 +31,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
+from collections import OrderedDict
 
 # ============== MPS ==============
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
@@ -50,20 +48,21 @@ else:
 # CONFIG
 # ==============================================================
 BATCH_SIZE   = 32
-EPOCHS       = 120
+EPOCHS       = 100            # Enough for 2+ cosine cycles
 BASE_LR      = 5e-4
 WEIGHT_DECAY = 1e-3
-PATIENCE     = 30
+PATIENCE     = 40             # Longer patience — we want diverse snapshots
 
 MASKED_VALUE_THRESHOLD = 99.0
-DROPOUT_RATE = 0.4
+DROPOUT_RATE = 0.45
 
 # Encoder
 NUM_ENCODER_BLOCKS = 3
 ENCODER_LR_SCALE   = 0.05
 
-# Projection warm-start
-PROJ_INIT_BIAS = 18.0
+# Projection
+PROJ_INIT_BIAS   = 18.0
+PROJ_HIDDEN_DIM  = 384        # Wider than v6's 256
 
 # Augmentation
 ROTATION_DEG = 5
@@ -80,8 +79,9 @@ HUBER_DELTA      = 1.0
 # Decoder: FROZEN
 DECODER_FROZEN = True
 
-# Validation
-VAL_EVERY = 3
+# Validation & ensemble
+VAL_EVERY     = 3
+TOP_K_SAVE    = 5             # Save top 5 checkpoints for ensemble
 
 # Clipping
 OUTLIER_CLIP_RANGE = (0, 35)
@@ -97,6 +97,7 @@ TRAIN_JSON         = os.path.join(BASE_DIR, "data", "vf_tests", "grape_train.jso
 VAL_JSON           = os.path.join(BASE_DIR, "data", "vf_tests", "grape_test.json")
 BEST_SAVE          = os.path.join(CURRENT_DIR, "best_multi_image_model.pth")
 INFERENCE_SAVE     = os.path.join(CURRENT_DIR, "inference_model.pth")
+ENSEMBLE_SAVE      = os.path.join(CURRENT_DIR, "ensemble_model.pth")
 
 # ============== Mask ==============
 mask_OD = np.array([
@@ -236,7 +237,7 @@ class VFAutoDecoder(nn.Module):
 # ============== Model ==============
 class MultiImageModel(nn.Module):
     def __init__(self, encoder, pretrained_state=None, num_blocks=3, dropout=0.3,
-                 freeze_decoder=True):
+                 freeze_decoder=True, proj_hidden=256):
         super().__init__()
         self.encoder = encoder
 
@@ -250,27 +251,22 @@ class MultiImageModel(nn.Module):
                     p.requires_grad = True
             print(f"✓ Unfrozen {num_blocks}/{total} encoder blocks")
 
-        # Compact projection: CLS+spatial (2048) → 256 → 52
-        # Much fewer params than v5's 1024→512→256→52 (671K → 140K)
+        # Projection: CLS+spatial → hidden → 52
         self.projection = nn.Sequential(
-            nn.Linear(2048, 256), nn.LayerNorm(256), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(256, NUM_VALID_POINTS)
+            nn.Linear(2048, proj_hidden), nn.LayerNorm(proj_hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(proj_hidden, NUM_VALID_POINTS)
         )
-
-        # Init
         for m in self.projection.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-
-        # Warm-start final layer
         final = self.projection[-1]
         nn.init.constant_(final.bias, PROJ_INIT_BIAS)
         nn.init.normal_(final.weight, mean=0.0, std=0.01)
 
         proj_params = sum(p.numel() for p in self.projection.parameters())
-        print(f"✓ Projection: 2048→256→52 ({proj_params:,} params, bias={PROJ_INIT_BIAS})")
+        print(f"✓ Projection: 2048→{proj_hidden}→52 ({proj_params:,} params)")
 
         # Decoder
         self.decoder = VFAutoDecoder(input_dim=NUM_VALID_POINTS)
@@ -282,45 +278,36 @@ class MultiImageModel(nn.Module):
                     for p in self.decoder.parameters():
                         p.requires_grad = False
                     self.decoder_frozen = True
-                    print(f"✓ Decoder: FROZEN (pretrained)")
+                    print(f"✓ Decoder: FROZEN")
                 else:
-                    print(f"✓ Decoder: trainable (pretrained)")
+                    print(f"✓ Decoder: trainable")
             except Exception as e:
                 print(f"⚠️  Decoder load failed: {e}")
         else:
             print("✓ Decoder: from scratch")
 
-        # Summary
         enc  = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
         proj = sum(p.numel() for p in self.projection.parameters() if p.requires_grad)
         dec  = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
         print(f"  Trainable: enc={enc:,} + proj={proj:,} + dec={dec:,} = {enc+proj+dec:,}")
 
     def encode(self, x):
-        """Extract CLS + spatial features from encoder."""
         latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
-        # latent shape: (B, 197, 1024) = [CLS] + 196 patch tokens
         if latent.dim() == 3:
-            cls_token = latent[:, 0, :]           # (B, 1024)
-            patch_tokens = latent[:, 1:, :]       # (B, 196, 1024)
-            spatial_avg = patch_tokens.mean(dim=1) # (B, 1024)
-            combined = torch.cat([cls_token, spatial_avg], dim=1)  # (B, 2048)
-            return combined
+            cls_token = latent[:, 0, :]
+            spatial_avg = latent[:, 1:, :].mean(dim=1)
+            return torch.cat([cls_token, spatial_avg], dim=1)
         else:
-            # Fallback if 2D
             return torch.cat([latent, latent], dim=1)
 
     def forward(self, x, average_multi=True):
         if x.dim() != 4:
             raise ValueError(f"Expected 4D input, got {x.shape}")
-
-        features = self.encode(x)          # (B, 2048)
-        proj = self.projection(features)   # (B, 52)
-        pred = self.decoder(proj)          # (B, 52)
-
+        features = self.encode(x)
+        proj = self.projection(features)
+        pred = self.decoder(proj)
         pred = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
         pred = torch.clamp(pred, OUTLIER_CLIP_RANGE[0], OUTLIER_CLIP_RANGE[1])
-
         if average_multi and pred.shape[0] > 1:
             pred = pred.mean(dim=0, keepdim=True)
         return pred
@@ -338,7 +325,6 @@ def compute_loss(pred, target, laterality):
         target = target.unsqueeze(0)
 
     total_loss = total_mae = n_valid = 0
-
     for i, lat in enumerate(laterality):
         valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
         target_52 = target[i][valid_idx]
@@ -346,16 +332,12 @@ def compute_loss(pred, target, laterality):
         mask      = target_52 < MASKED_VALUE_THRESHOLD
         if mask.sum() == 0:
             continue
-
         p = pred_52[mask]
         t = target_52[mask]
-
         weights = torch.ones_like(p)
         weights[t < LOW_DB_THRESHOLD] = LOW_VALUE_WEIGHT
-
         loss = (F.huber_loss(p, t, reduction='none', delta=HUBER_DELTA) * weights).mean()
         mae  = (p - t).abs().mean()
-
         total_loss += loss * mask.sum().item()
         total_mae  += mae.item() * mask.sum().item()
         n_valid    += mask.sum().item()
@@ -373,7 +355,6 @@ def pearson_correlation(pred, target, laterality):
         pred = pred.unsqueeze(0)
     if target.dim() == 1:
         target = target.unsqueeze(0)
-
     for i in range(min(len(laterality), pred.shape[0], target.shape[0])):
         lat       = laterality[i] if i < len(laterality) else laterality[0]
         valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
@@ -383,7 +364,6 @@ def pearson_correlation(pred, target, laterality):
         if mask.sum() > 0:
             all_pred.extend(pred_52[mask].tolist())
             all_target.extend(target_52[mask].tolist())
-
     if len(all_pred) < 2:
         return 0.0
     r = np.corrcoef(np.array(all_pred), np.array(all_target))[0, 1]
@@ -413,31 +393,58 @@ def evaluate(model, loader):
     return total_mae / n_valid, corr
 
 
+# ============== Top-K checkpoint tracker ==============
+class TopKCheckpoints:
+    """Keep the top-K model checkpoints by val MAE (lower is better)."""
+    def __init__(self, k=5):
+        self.k = k
+        self.checkpoints = []  # list of (mae, state_dict, epoch)
+
+    def update(self, mae, model, epoch):
+        state = copy.deepcopy(model.state_dict())
+        self.checkpoints.append((mae, state, epoch))
+        self.checkpoints.sort(key=lambda x: x[0])
+        if len(self.checkpoints) > self.k:
+            self.checkpoints = self.checkpoints[:self.k]
+
+    def get_averaged_state(self):
+        """Average the weights of all saved checkpoints (SWA-style)."""
+        if not self.checkpoints:
+            return None
+        avg_state = OrderedDict()
+        n = len(self.checkpoints)
+        for key in self.checkpoints[0][1]:
+            tensors = [ckpt[1][key].float() for ckpt in self.checkpoints]
+            avg_state[key] = sum(tensors) / n
+        return avg_state
+
+    def summary(self):
+        return [(f"ep{ep}", f"{mae:.2f}") for mae, _, ep in self.checkpoints]
+
+
 # ============== Training ==============
 def train():
     print("=" * 60)
-    print("Training v6 — Spatial features + compact projection")
+    print("Training v7 — Checkpoint ensemble")
     print("=" * 60)
 
-    print(f"\nKey changes from v5.1:")
-    print(f"  1. CLS + spatial avg pool → 2048-dim input (was CLS-only 1024)")
-    print(f"  2. Compact projection: 2048→256→52 (was 1024→512→256→52)")
-    print(f"  3. Single phase (Phase 2 didn't help in v5.1)")
+    print(f"\nStrategy: train normally, save top-{TOP_K_SAVE} checkpoints,")
+    print(f"  then average their weights (SWA) for final model.")
 
     print(f"\nConfig:")
     print(f"  Encoder: {NUM_ENCODER_BLOCKS}/24 blocks | LR={BASE_LR * ENCODER_LR_SCALE:.1e}")
-    print(f"  Projection: LR={BASE_LR:.1e} | WD={WEIGHT_DECAY:.1e} | dropout={DROPOUT_RATE}")
+    print(f"  Projection: 2048→{PROJ_HIDDEN_DIM}→52 | LR={BASE_LR:.1e} | dropout={DROPOUT_RATE}")
     print(f"  Decoder: FROZEN")
     print(f"  Loss: Huber + {LOW_VALUE_WEIGHT}x <{LOW_DB_THRESHOLD}dB")
+    print(f"  Schedule: CosineWarmRestarts T0=20 T_mult=2 (diverse snapshots)")
     print(f"  Aug: ±{ROTATION_DEG}° | TTA: {TTA_ROTATIONS}")
 
     print(f"\nBanned: LoRA, flips/affine, MixUp")
 
     print(f"\nExpected:")
-    print(f"  Ep 1-5:   MAE 5-6     (adapting)")
-    print(f"  Ep 6-15:  MAE 4-5     (spatial features should help here)")
-    print(f"  Ep 15-30: MAE 3.8-4.2 (should beat v5.1's 4.25 plateau)")
-    print(f"  Ep 30-60: MAE <3.74   (target; CANCEL if stuck >4.2 at ep40)")
+    print(f"  Ep 1-15:  MAE 5→4.3  (same trajectory as v5/v6)")
+    print(f"  Ep 15-40: MAE ~4.2   (individual checkpoints plateau here)")
+    print(f"  SWA:      MAE ~4.0?  (ensemble should beat best single)")
 
     # ── Data ───────────────────────────────────────────────────
     train_dataset = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, train_transform, mode='train')
@@ -451,10 +458,11 @@ def train():
     # ── Model ──────────────────────────────────────────────────
     model = MultiImageModel(base_model, pretrained_decoder_state,
                             NUM_ENCODER_BLOCKS, DROPOUT_RATE,
-                            freeze_decoder=DECODER_FROZEN)
+                            freeze_decoder=DECODER_FROZEN,
+                            proj_hidden=PROJ_HIDDEN_DIM)
     model.to(DEVICE)
 
-    # ── Optimizer ──────────────────────────────────────────────
+    # ── Optimizer with CosineWarmRestarts for diverse snapshots ──
     optimizer = optim.AdamW([
         {'params': [p for p in model.encoder.parameters() if p.requires_grad],
          'lr': BASE_LR * ENCODER_LR_SCALE, 'weight_decay': WEIGHT_DECAY},
@@ -462,18 +470,11 @@ def train():
          'lr': BASE_LR, 'weight_decay': WEIGHT_DECAY},
     ])
 
-    steps_per_epoch = len(train_loader)
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=[BASE_LR * ENCODER_LR_SCALE, BASE_LR],
-        epochs=EPOCHS,
-        steps_per_epoch=steps_per_epoch,
-        pct_start=0.1,
-        anneal_strategy='cos',
-        div_factor=10,
-        final_div_factor=100,
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=20, T_mult=2, eta_min=1e-6
     )
 
+    topk = TopKCheckpoints(k=TOP_K_SAVE)
     best_mae  = float('inf')
     best_corr = 0.0
     patience  = 0
@@ -492,12 +493,10 @@ def train():
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-                try:
-                    scheduler.step()
-                except Exception:
-                    pass
 
             pbar.set_postfix({'MAE': f'{mae:.2f}'})
+
+        scheduler.step()
 
         # ── Validate ───────────────────────────────────────────
         if epoch % VAL_EVERY == 0 or epoch <= 3:
@@ -514,14 +513,14 @@ def train():
             print(f"  Train: {train_mae:.2f} dB | Corr: {train_corr:.3f}")
             print(f"  Val:   {val_mae:.2f} dB | Corr: {val_corr:.3f} | Gap: {gap:+.2f}")
 
+            # Update top-K
+            topk.update(val_mae, model, epoch)
+
             if val_mae < best_mae:
                 best_mae  = val_mae
                 best_corr = val_corr
                 torch.save({'model': model.state_dict(), 'mae': val_mae,
                             'corr': val_corr, 'epoch': epoch}, BEST_SAVE)
-                torch.save({'model_state_dict': model.state_dict(),
-                            'encoder_checkpoint': CHECKPOINT_PATH,
-                            'val_mae': val_mae, 'val_corr': val_corr}, INFERENCE_SAVE)
                 print(f"  ✓ New Best! (MAE={val_mae:.2f}, Corr={val_corr:.3f})")
                 patience = 0
             else:
@@ -530,19 +529,64 @@ def train():
                     print(f"\nEarly stopping at epoch {epoch}")
                     break
 
+    # ── SWA Ensemble ───────────────────────────────────────────
+    print(f"\n{'─'*40}")
+    print(f"Creating SWA ensemble from top-{TOP_K_SAVE} checkpoints...")
+    print(f"  Checkpoints: {topk.summary()}")
+
+    avg_state = topk.get_averaged_state()
+    if avg_state is not None:
+        model.load_state_dict(avg_state)
+        model.to(DEVICE)
+
+        swa_mae, swa_corr = evaluate(model, val_loader)
+        print(f"\n  SWA Ensemble:")
+        print(f"    Val MAE:  {swa_mae:.2f} dB")
+        print(f"    Val Corr: {swa_corr:.3f}")
+        print(f"    vs Best Single: {best_mae:.2f} dB (diff: {swa_mae - best_mae:+.2f})")
+
+        # Save ensemble if it's better
+        if swa_mae < best_mae:
+            print(f"  ✓ Ensemble beats best single!")
+            final_mae  = swa_mae
+            final_corr = swa_corr
+        else:
+            print(f"  Best single checkpoint is still better")
+            # Reload best single
+            best_ckpt = torch.load(BEST_SAVE, map_location='cpu')
+            model.load_state_dict(best_ckpt['model'])
+            final_mae  = best_mae
+            final_corr = best_corr
+
+        # Always save ensemble for comparison
+        torch.save({'model_state_dict': avg_state,
+                    'val_mae': swa_mae, 'val_corr': swa_corr,
+                    'source_checkpoints': topk.summary()}, ENSEMBLE_SAVE)
+
+        # Save best overall as inference model
+        torch.save({'model_state_dict': model.state_dict(),
+                    'encoder_checkpoint': CHECKPOINT_PATH,
+                    'val_mae': final_mae, 'val_corr': final_corr}, INFERENCE_SAVE)
+    else:
+        final_mae  = best_mae
+        final_corr = best_corr
+
     # ── Summary ────────────────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"Training Complete!")
-    print(f"  Best Val MAE:  {best_mae:.2f} dB")
-    print(f"  Best Val Corr: {best_corr:.3f}")
-    gain = 3.74 - best_mae
-    if best_mae < 3.0:
+    print(f"  Best Single:    {best_mae:.2f} dB | Corr: {best_corr:.3f}")
+    if avg_state is not None:
+        print(f"  SWA Ensemble:   {swa_mae:.2f} dB | Corr: {swa_corr:.3f}")
+    print(f"  Final Model:    {final_mae:.2f} dB | Corr: {final_corr:.3f}")
+    gain = 3.74 - final_mae
+    if final_mae < 3.0:
         print(f"  🎯 SUB-3 dB! Beat baseline by {gain:.2f} dB")
-    elif best_mae < 3.74:
+    elif final_mae < 3.74:
         print(f"  ✓ Beat baseline by {gain:.2f} dB")
     else:
-        print(f"  Gap to baseline: {best_mae - 3.74:+.2f} dB")
-    print(f"  Model saved to: {INFERENCE_SAVE}")
+        print(f"  Gap to baseline: {final_mae - 3.74:+.2f} dB")
+    print(f"  Models saved to: {INFERENCE_SAVE}")
+    print(f"                   {ENSEMBLE_SAVE}")
     print("=" * 60)
 
 
