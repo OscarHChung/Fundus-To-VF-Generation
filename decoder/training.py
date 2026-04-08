@@ -1,29 +1,21 @@
 """
-Training v8 — Per-region VF prediction from spatial patch features
+Training v9 — Per-region heads + trainable decoder
 
-Key insight: All previous versions predicted 52 VF points from a single
-global feature vector (CLS token or CLS+avg pool). This ignores the
-spatial correspondence between retinal regions and VF sectors.
+v8 hit 4.14 with frozen decoder. The frozen decoder constrains outputs
+to its autoencoder manifold, which may not be optimal for encoder-derived
+predictions. v4 showed trainable decoder overfits with global architecture
+(gap reached -0.57), but v8's per-region heads only have 540K params —
+there's room to also train the decoder.
 
-The VF has a known anatomical mapping to retinal regions:
-  - Superior retina → inferior VF
-  - Inferior retina → superior VF  
-  - Nasal retina → temporal VF
-  - Temporal retina → nasal VF
+Architecture (same as v8):
+  Frozen encoder → 196 spatial patches → 4 quadrant pools
+  → 4 sector heads (CLS + quadrant → sector VF points)
+  → fusion → decoder → 52 VF points
 
-Instead of global→all_points, we:
-  1. Keep the 14×14 = 196 spatial patch tokens from the encoder
-  2. Pool patches into 4 quadrants matching VF anatomy
-  3. Each quadrant head predicts its corresponding VF sector points
-  4. Concatenate sector predictions → full 52-point VF
-  5. Pass through frozen decoder for refinement
-
-This means each VF region is predicted from the retinal patches that
-actually correspond to it anatomically, rather than from a global summary.
-
-Encoder: FULLY FROZEN (features are good enough — proven by v5-v7)
-Decoder: FROZEN (prevents overfitting — proven by v5)
-Only the 4 sector heads + a small fusion layer are trained.
+Key difference: decoder is TRAINABLE with very low LR and high WD.
+  Decoder LR = 1e-4 (10x lower than heads)
+  Decoder WD = 1e-2 (strong regularization)
+  This lets it adapt its refinement while staying close to pretrained priors.
 
 Banned: LoRA, flips/affine, MixUp
 """
@@ -55,12 +47,18 @@ else:
 # ==============================================================
 BATCH_SIZE   = 32
 EPOCHS       = 100
-BASE_LR      = 1e-3           # Higher LR — small trainable model
-WEIGHT_DECAY = 5e-3
 PATIENCE     = 30
 
 MASKED_VALUE_THRESHOLD = 99.0
 DROPOUT_RATE = 0.3
+
+# Heads
+HEADS_LR = 1e-3
+HEADS_WD = 5e-3
+
+# Decoder: trainable but heavily regularized
+DECODER_LR = 1e-4             # 10x lower than heads
+DECODER_WD = 1e-2             # Strong WD keeps it near pretrained
 
 # Projection
 PROJ_INIT_BIAS = 18.0
@@ -110,41 +108,22 @@ mask_OD = np.array([
 valid_indices_od = [i for i, v in enumerate(mask_OD.flatten()) if v]
 mask_OS          = np.fliplr(mask_OD)
 valid_indices_os = [i for i, v in enumerate(mask_OS.flatten()) if v]
-NUM_VALID_POINTS = len(valid_indices_od)  # 52
+NUM_VALID_POINTS = len(valid_indices_od)
 
-# ==============================================================
-# VF sector definitions — which of the 52 valid points belong to
-# each anatomical sector. The 8×9 grid rows 0-3 are superior VF
-# (maps to inferior retina), rows 4-7 are inferior VF (maps to
-# superior retina). Left/right split at column ~4.
-#
-# We define 4 sectors: superior-nasal, superior-temporal,
-# inferior-nasal, inferior-temporal (from VF perspective).
-# For OD: nasal = left cols (0-4), temporal = right cols (5-8)
-# For OS: mirrored
-# ==============================================================
+# ============== VF Sectors & Patch Quadrants ==============
 def build_sector_indices():
-    """Build sector-to-valid-index mapping for the 52-point VF."""
-    grid = mask_OD.copy()  # 8×9
+    grid = mask_OD.copy()
     rows, cols = grid.shape
-
-    # Sector assignments for each grid position
-    # Superior VF = rows 0-3, Inferior VF = rows 4-7
-    # For OD: Nasal = cols 0-4, Temporal = cols 5-8
     sectors = {
-        'sup_nasal': [],     # Superior VF, nasal side
-        'sup_temporal': [],  # Superior VF, temporal side
-        'inf_nasal': [],     # Inferior VF, nasal side
-        'inf_temporal': [],  # Inferior VF, temporal side
+        'sup_nasal': [], 'sup_temporal': [],
+        'inf_nasal': [], 'inf_temporal': [],
     }
-
     valid_count = 0
     for r in range(rows):
         for c in range(cols):
             if grid[r, c]:
                 is_superior = r < 4
-                is_nasal = c <= 4  # For OD; OS will be handled at forward time
-
+                is_nasal = c <= 4
                 if is_superior and is_nasal:
                     sectors['sup_nasal'].append(valid_count)
                 elif is_superior and not is_nasal:
@@ -154,74 +133,40 @@ def build_sector_indices():
                 else:
                     sectors['inf_temporal'].append(valid_count)
                 valid_count += 1
-
     return sectors
 
 VF_SECTORS = build_sector_indices()
 
-# Patch quadrant mapping for 14×14 grid
-# The fundus image has INVERTED mapping to VF:
-#   Superior retina (top patches) → Inferior VF
-#   Inferior retina (bottom patches) → Superior VF
-#   Nasal retina → Temporal VF (side depends on OD/OS)
-#   Temporal retina → Nasal VF
-#
-# For OD fundus: nasal = right side of image, temporal = left
-# So: left patches (temporal retina) → nasal VF
-#     right patches (nasal retina) → temporal VF
-#     top patches (superior retina) → inferior VF
-#     bottom patches (inferior retina) → superior VF
-
 def build_patch_quadrants():
-    """Map 14×14 patch grid to 4 retinal quadrants."""
     quadrants = {
-        # Retinal quadrant → maps to VF sector
-        'sup_retina_nasal': [],     # → inf_temporal VF (OD)
-        'sup_retina_temporal': [],  # → inf_nasal VF (OD)
-        'inf_retina_nasal': [],     # → sup_temporal VF (OD)
-        'inf_retina_temporal': [],  # → sup_nasal VF (OD)
+        'sup_retina_nasal': [], 'sup_retina_temporal': [],
+        'inf_retina_nasal': [], 'inf_retina_temporal': [],
     }
-
     for r in range(14):
         for c in range(14):
             patch_idx = r * 14 + c
-            is_sup_retina = r < 7
-            is_right = c >= 7  # Right side of image
-
-            # For OD: right side of image = nasal retina
-            if is_sup_retina and is_right:
+            is_sup = r < 7
+            is_right = c >= 7
+            if is_sup and is_right:
                 quadrants['sup_retina_nasal'].append(patch_idx)
-            elif is_sup_retina and not is_right:
+            elif is_sup and not is_right:
                 quadrants['sup_retina_temporal'].append(patch_idx)
-            elif not is_sup_retina and is_right:
+            elif not is_sup and is_right:
                 quadrants['inf_retina_nasal'].append(patch_idx)
             else:
                 quadrants['inf_retina_temporal'].append(patch_idx)
-
     return quadrants
 
 PATCH_QUADRANTS = build_patch_quadrants()
 
-# For OD: retinal quadrant → VF sector mapping
-# Superior retina nasal → Inferior VF temporal
-# Superior retina temporal → Inferior VF nasal
-# Inferior retina nasal → Superior VF temporal
-# Inferior retina temporal → Superior VF nasal
 RETINA_TO_VF_OD = {
-    'sup_retina_nasal':    'inf_temporal',
-    'sup_retina_temporal': 'inf_nasal',
-    'inf_retina_nasal':    'sup_temporal',
-    'inf_retina_temporal': 'sup_nasal',
+    'sup_retina_nasal': 'inf_temporal', 'sup_retina_temporal': 'inf_nasal',
+    'inf_retina_nasal': 'sup_temporal', 'inf_retina_temporal': 'sup_nasal',
 }
-
-# For OS: nasal/temporal are flipped
 RETINA_TO_VF_OS = {
-    'sup_retina_nasal':    'inf_nasal',      # "nasal" in image is actually temporal for OS
-    'sup_retina_temporal': 'inf_temporal',
-    'inf_retina_nasal':    'sup_nasal',
-    'inf_retina_temporal': 'sup_temporal',
+    'sup_retina_nasal': 'inf_nasal', 'sup_retina_temporal': 'inf_temporal',
+    'inf_retina_nasal': 'sup_nasal', 'inf_retina_temporal': 'sup_temporal',
 }
-
 
 # ============== Load RETFound ==============
 sys.path.insert(0, RETFOUND_DIR)
@@ -338,10 +283,8 @@ class VFAutoDecoder(nn.Module):
     def forward(self, x):
         return self.network(x) + self.residual_weight * x
 
-
 # ============== Sector Head ==============
 class SectorHead(nn.Module):
-    """Predicts VF points for one sector from pooled patch features + CLS context."""
     def __init__(self, input_dim, num_points, dropout=0.3, bias_init=18.0):
         super().__init__()
         hidden = max(64, num_points * 4)
@@ -349,47 +292,40 @@ class SectorHead(nn.Module):
             nn.Linear(input_dim, hidden), nn.LayerNorm(hidden), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(hidden, num_points)
         )
-        # Warm-start
         nn.init.constant_(self.net[-1].bias, bias_init)
         nn.init.normal_(self.net[-1].weight, mean=0.0, std=0.01)
 
     def forward(self, x):
         return self.net(x)
 
-
 # ============== Model ==============
 class RegionalVFModel(nn.Module):
     def __init__(self, encoder, pretrained_decoder_state=None, dropout=0.3):
         super().__init__()
         self.encoder = encoder
+        self.embed_dim = 1024
 
         # Freeze entire encoder
         for p in self.encoder.parameters():
             p.requires_grad = False
-        print("✓ Encoder: FULLY FROZEN")
+        print("✓ Encoder: FROZEN")
 
-        self.embed_dim = 1024  # RETFound ViT-Large
-
-        # Register patch indices as buffers
         for quad_name, indices in PATCH_QUADRANTS.items():
             self.register_buffer(f'patch_idx_{quad_name}',
                                  torch.tensor(indices, dtype=torch.long))
-
-        # Register VF sector indices as buffers
         for sec_name, indices in VF_SECTORS.items():
             self.register_buffer(f'vf_idx_{sec_name}',
                                  torch.tensor(indices, dtype=torch.long))
 
-        # Each sector head gets: quadrant_pool(1024) + CLS(1024) = 2048
+        # Sector heads
         sector_input_dim = self.embed_dim * 2
         self.sector_heads = nn.ModuleDict()
         for sec_name, sec_indices in VF_SECTORS.items():
-            n_points = len(sec_indices)
             self.sector_heads[sec_name] = SectorHead(
-                sector_input_dim, n_points, dropout, PROJ_INIT_BIAS
+                sector_input_dim, len(sec_indices), dropout, PROJ_INIT_BIAS
             )
 
-        # Fusion: light refinement after concatenating sector outputs
+        # Fusion
         self.fusion = nn.Sequential(
             nn.Linear(NUM_VALID_POINTS, NUM_VALID_POINTS * 2),
             nn.LayerNorm(NUM_VALID_POINTS * 2),
@@ -397,86 +333,66 @@ class RegionalVFModel(nn.Module):
             nn.Dropout(dropout * 0.5),
             nn.Linear(NUM_VALID_POINTS * 2, NUM_VALID_POINTS),
         )
-        # Residual weight for fusion
         self.fusion_alpha = nn.Parameter(torch.tensor(0.3))
-        # Init fusion final to near-identity
         nn.init.zeros_(self.fusion[-1].weight)
         nn.init.zeros_(self.fusion[-1].bias)
 
-        # Decoder: frozen
+        # Decoder: TRAINABLE (pretrained, heavily regularized)
         self.decoder = VFAutoDecoder(input_dim=NUM_VALID_POINTS)
         if pretrained_decoder_state is not None:
             try:
                 self.decoder.load_state_dict(pretrained_decoder_state, strict=True)
-                for p in self.decoder.parameters():
-                    p.requires_grad = False
-                print("✓ Decoder: FROZEN (pretrained)")
+                print(f"✓ Decoder: TRAINABLE (pretrained, LR={DECODER_LR:.1e}, WD={DECODER_WD:.1e})")
             except Exception as e:
                 print(f"⚠️  Decoder load failed: {e}")
+        else:
+            print("✓ Decoder: from scratch")
 
-        # Count params
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        frozen    = sum(p.numel() for p in self.parameters() if not p.requires_grad)
-        print(f"  Trainable: {trainable:,} | Frozen: {frozen:,}")
-
-        # Print sector sizes
-        for sec_name, sec_indices in VF_SECTORS.items():
-            print(f"    {sec_name}: {len(sec_indices)} VF points")
-
-    def extract_features(self, x):
-        """Extract CLS token and patch tokens from frozen encoder."""
-        with torch.no_grad():
-            latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
-        # latent: (B, 197, 1024) = [CLS] + 196 patches
-        cls_token = latent[:, 0, :]      # (B, 1024)
-        patches = latent[:, 1:, :]       # (B, 196, 1024)
-        return cls_token, patches
+        # Param summary
+        heads = sum(p.numel() for p in self.sector_heads.parameters())
+        fus   = sum(p.numel() for p in self.fusion.parameters()) + 1
+        dec   = sum(p.numel() for p in self.decoder.parameters())
+        print(f"  Trainable: heads={heads:,} + fusion={fus:,} + decoder={dec:,} = {heads+fus+dec:,}")
 
     def pool_quadrant(self, patches, quad_name):
-        """Average pool patches belonging to a retinal quadrant."""
-        idx = getattr(self, f'patch_idx_{quad_name}')  # (N_patches,)
-        quad_patches = patches[:, idx, :]  # (B, N_patches, 1024)
-        return quad_patches.mean(dim=1)    # (B, 1024)
+        idx = getattr(self, f'patch_idx_{quad_name}')
+        return patches[:, idx, :].mean(dim=1)
 
     def forward(self, x, laterality='OD', average_multi=True):
         if x.dim() != 4:
             raise ValueError(f"Expected 4D input, got {x.shape}")
 
-        cls_token, patches = self.extract_features(x)  # (B, 1024), (B, 196, 1024)
+        with torch.no_grad():
+            latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
+        cls_token = latent[:, 0, :]
+        patches = latent[:, 1:, :]
 
-        # Select mapping based on laterality
         if isinstance(laterality, str):
             mapping = RETINA_TO_VF_OD if laterality.startswith('OD') else RETINA_TO_VF_OS
         else:
             mapping = RETINA_TO_VF_OD if laterality[0].startswith('OD') else RETINA_TO_VF_OS
 
-        # Predict each VF sector from its corresponding retinal quadrant
         sector_preds = {}
         for retina_quad, vf_sector in mapping.items():
-            quad_feat = self.pool_quadrant(patches, retina_quad)  # (B, 1024)
-            head_input = torch.cat([quad_feat, cls_token], dim=1)  # (B, 2048)
+            quad_feat = self.pool_quadrant(patches, retina_quad)
+            head_input = torch.cat([quad_feat, cls_token], dim=1)
             sector_preds[vf_sector] = self.sector_heads[vf_sector](head_input)
 
-        # Assemble full 52-point prediction
         pred = torch.zeros(x.shape[0], NUM_VALID_POINTS, device=x.device)
         for sec_name, sec_pred in sector_preds.items():
             idx = getattr(self, f'vf_idx_{sec_name}')
             pred[:, idx] = sec_pred
 
-        # Fusion: light cross-sector refinement with residual
         fused = self.fusion(pred)
         pred = pred + self.fusion_alpha * fused
 
-        # Frozen decoder refinement
         pred = self.decoder(pred)
-
         pred = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
         pred = torch.clamp(pred, OUTLIER_CLIP_RANGE[0], OUTLIER_CLIP_RANGE[1])
 
         if average_multi and pred.shape[0] > 1:
             pred = pred.mean(dim=0, keepdim=True)
         return pred
-
 
 # ============== Loss ==============
 def compute_loss(pred, target, laterality):
@@ -561,27 +477,25 @@ def evaluate(model, loader):
 # ============== Training ==============
 def train():
     print("=" * 60)
-    print("Training v8 — Per-region VF prediction")
+    print("Training v9 — Per-region + trainable decoder")
     print("=" * 60)
 
-    print(f"\nArchitecture:")
-    print(f"  Encoder: FULLY FROZEN → 196 spatial patches (14×14)")
-    print(f"  4 retinal quadrants → pool → 4 sector heads → 52 VF points")
-    print(f"  + Fusion layer for cross-sector refinement")
-    print(f"  + Frozen decoder for VF prior")
+    print(f"\nArchitecture: v8 per-region (proven 4.14)")
+    print(f"  Key change: decoder is TRAINABLE (was frozen)")
+    print(f"    Decoder LR={DECODER_LR:.1e} (10x lower than heads)")
+    print(f"    Decoder WD={DECODER_WD:.1e} (strong regularization)")
 
     print(f"\nConfig:")
-    print(f"  LR={BASE_LR:.1e} | WD={WEIGHT_DECAY:.1e} | dropout={DROPOUT_RATE}")
+    print(f"  Encoder: FROZEN | Heads LR={HEADS_LR:.1e} WD={HEADS_WD:.1e}")
     print(f"  Loss: Huber + {LOW_VALUE_WEIGHT}x <{LOW_DB_THRESHOLD}dB")
     print(f"  Aug: ±{ROTATION_DEG}° | TTA: {TTA_ROTATIONS}")
-
     print(f"\nBanned: LoRA, flips/affine, MixUp")
 
     print(f"\nExpected:")
-    print(f"  Ep 1-10:  MAE 5-6   (sector heads adapting)")
-    print(f"  Ep 10-30: MAE 4-5   (spatial inductive bias should help)")
-    print(f"  Ep 30-60: MAE <4.0  (target — spatial structure is the key)")
-    print(f"  CANCEL if MAE >4.5 at ep 20 (spatial mapping wrong)")
+    print(f"  Ep 1-10:  MAE 5→4.3  (same as v8 early trajectory)")
+    print(f"  Ep 10-30: MAE 4.0-4.2 (decoder adapting should help here)")
+    print(f"  Ep 30-60: MAE 3.7-4.0 (target — decoder refinement)")
+    print(f"  WATCH: if gap goes negative by >0.3, decoder is overfitting")
 
     # ── Data ───────────────────────────────────────────────────
     train_dataset = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, train_transform, mode='train')
@@ -596,9 +510,15 @@ def train():
     model = RegionalVFModel(base_model, pretrained_decoder_state, DROPOUT_RATE)
     model.to(DEVICE)
 
-    # ── Optimizer: only sector heads + fusion ──────────────────
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.AdamW(trainable_params, lr=BASE_LR, weight_decay=WEIGHT_DECAY)
+    # ── Optimizer: separate LR for heads vs decoder ────────────
+    head_params = list(model.sector_heads.parameters()) + \
+                  list(model.fusion.parameters()) + [model.fusion_alpha]
+    decoder_params = list(model.decoder.parameters())
+
+    optimizer = optim.AdamW([
+        {'params': head_params, 'lr': HEADS_LR, 'weight_decay': HEADS_WD},
+        {'params': decoder_params, 'lr': DECODER_LR, 'weight_decay': DECODER_WD},
+    ])
 
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=25, T_mult=2, eta_min=1e-5
@@ -642,6 +562,9 @@ def train():
             print(f"\n[Epoch {epoch}]")
             print(f"  Train: {train_mae:.2f} dB | Corr: {train_corr:.3f}")
             print(f"  Val:   {val_mae:.2f} dB | Corr: {val_corr:.3f} | Gap: {gap:+.2f}")
+
+            if gap < -0.4:
+                print(f"  ⚠️  Gap < -0.4 — decoder may be overfitting")
 
             if val_mae < best_mae:
                 best_mae  = val_mae
