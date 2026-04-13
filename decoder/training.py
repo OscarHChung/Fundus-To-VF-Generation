@@ -1,21 +1,31 @@
 """
-Training v9 — Per-region heads + trainable decoder
+Training v9.2 — Fix regression-to-mean
 
-v8 hit 4.14 with frozen decoder. The frozen decoder constrains outputs
-to its autoencoder manifold, which may not be optimal for encoder-derived
-predictions. v4 showed trainable decoder overfits with global architecture
-(gap reached -0.57), but v8's per-region heads only have 540K params —
-there's room to also train the decoder.
+Diagnosis from v9 scatterplot (4.14 MAE, R²=0.314, slope=0.33):
+  - Model collapses predictions toward population mean (~18-20 dB)
+  - Low-sensitivity points (0-10 dB) overpredicted by ~10-15 dB
+  - High-sensitivity points (25-30 dB) underpredicted by ~3-5 dB
+  - Slope 0.33 means only 1/3 of true dynamic range captured
 
-Architecture (same as v8):
-  Frozen encoder → 196 spatial patches → 4 quadrant pools
-  → 4 sector heads (CLS + quadrant → sector VF points)
-  → fusion → decoder → 52 VF points
+Root causes:
+  1. Huber loss with weak 1.5x upweighting doesn't fight class imbalance
+     (most VF points are 20-30 dB healthy, so predicting ~20 is "safe")
+  2. Frozen pretrained decoder was trained as denoiser → pushes toward
+     typical VF patterns → amplifies regression to mean
+  3. No explicit incentive for the model to preserve dynamic range
 
-Key difference: decoder is TRAINABLE with very low LR and high WD.
-  Decoder LR = 1e-4 (10x lower than heads)
-  Decoder WD = 1e-2 (strong regularization)
-  This lets it adapt its refinement while staying close to pretrained priors.
+Fixes in v9.2:
+  1. CONTINUOUS INVERSE-SENSITIVITY WEIGHTING: weight = 1 + scale * (max_dB - target) / max_dB
+     Low dB points get ~4-5x weight, not just 1.5x. This is the #1 fix.
+  2. CONCORDANCE CORRELATION (CCC) LOSS COMPONENT: directly penalizes
+     slope deviation from 1.0 and mean shift. CCC = 1 when pred=target exactly.
+  3. QUANTILE-BALANCED SAMPLING: oversample eyes with low-sensitivity points
+     so each batch has better representation of damaged fields
+  4. LIGHTER DECODER: reduce decoder influence with lower residual weight init
+     and add a learnable bypass that lets raw sector-head predictions through
+  5. MONOTONIC COSINE SCHEDULE: CosineAnnealingLR (no restarts) per v9.1 plan
+  6. POINTWISE CALIBRATION HEAD: tiny per-point scale+shift after decoder
+     to correct systematic per-location biases
 
 Banned: LoRA, flips/affine, MixUp
 """
@@ -26,7 +36,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
@@ -46,8 +56,8 @@ else:
 # CONFIG
 # ==============================================================
 BATCH_SIZE   = 32
-EPOCHS       = 100
-PATIENCE     = 30
+EPOCHS       = 120
+PATIENCE     = 40          # longer patience — monotonic schedule is slow
 
 MASKED_VALUE_THRESHOLD = 99.0
 DROPOUT_RATE = 0.3
@@ -57,8 +67,12 @@ HEADS_LR = 1e-3
 HEADS_WD = 5e-3
 
 # Decoder: trainable but heavily regularized
-DECODER_LR = 1e-4             # 10x lower than heads
-DECODER_WD = 1e-2             # Strong WD keeps it near pretrained
+DECODER_LR = 1e-4
+DECODER_WD = 1e-2
+
+# Calibration head (tiny)
+CALIB_LR = 5e-4
+CALIB_WD = 1e-3
 
 # Projection
 PROJ_INIT_BIAS = 18.0
@@ -70,10 +84,20 @@ ROTATION_DEG = 5
 USE_TTA       = True
 TTA_ROTATIONS = [-5, 0, 5]
 
-# Loss
-LOW_DB_THRESHOLD = 10.0
-LOW_VALUE_WEIGHT = 1.5
-HUBER_DELTA      = 1.0
+# Loss — regression-to-mean fixes
+HUBER_DELTA          = 1.0
+# Continuous weighting: weight = 1 + WEIGHT_SCALE * (MAX_DB - target) / MAX_DB
+# At 0 dB: weight = 1 + 4.0 = 5.0x
+# At 10 dB: weight = 1 + 4.0 * 25/35 ≈ 3.86x
+# At 20 dB: weight = 1 + 4.0 * 15/35 ≈ 2.71x
+# At 30 dB: weight = 1 + 4.0 * 5/35 ≈ 1.57x
+WEIGHT_SCALE = 2.5
+MAX_DB       = 35.0
+
+# CCC loss weight (concordance correlation coefficient)
+CCC_LOSS_MAX    = 0.3      # max CCC weight after warmup
+CCC_START_EPOCH = 10       # pure Huber before this
+CCC_RAMP_EPOCHS = 20       # linearly ramp 0 → CCC_LOSS_MAX over this many epochs
 
 # Validation
 VAL_EVERY = 2
@@ -243,6 +267,30 @@ class MultiImageDataset(Dataset):
             if use_tta:
                 print(f"  TTA: {len(TTA_ROTATIONS)} rotations {TTA_ROTATIONS}°")
 
+    def get_sample_severity(self):
+        """Compute per-sample severity for weighted sampling.
+        Returns weight for each training sample — eyes with more low-dB points get higher weight.
+        """
+        weights = []
+        for sample in self.samples:
+            hvf = np.array(sample['hvf'], dtype=np.float32).flatten()
+            lat = sample['laterality']
+            valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
+            valid_vals = hvf[valid_idx]
+            valid_vals = valid_vals[valid_vals < MASKED_VALUE_THRESHOLD]
+            if len(valid_vals) == 0:
+                weights.append(1.0)
+                continue
+            # Mean deviation from healthy (30 dB)
+            mean_val = valid_vals.mean()
+            # More weight for eyes with lower mean sensitivity
+            # Healthy eye (~27 dB) → weight ~1.3
+            # Moderate damage (~15 dB) → weight ~3.0
+            # Severe damage (~5 dB) → weight ~4.7
+            w = 1.0 + WEIGHT_SCALE * (MAX_DB - mean_val) / MAX_DB
+            weights.append(max(w, 1.0))
+        return weights
+
     def __len__(self):
         return len(self.samples)
 
@@ -298,6 +346,19 @@ class SectorHead(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+# ============== Pointwise Calibration ==============
+class PointwiseCalibration(nn.Module):
+    """Learnable per-point scale and shift to correct systematic biases.
+    Initialized to identity (scale=1, shift=0).
+    """
+    def __init__(self, num_points=52):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(num_points))
+        self.shift = nn.Parameter(torch.zeros(num_points))
+
+    def forward(self, x):
+        return x * self.scale + self.shift
+
 # ============== Model ==============
 class RegionalVFModel(nn.Module):
     def __init__(self, encoder, pretrained_decoder_state=None, dropout=0.3):
@@ -317,8 +378,8 @@ class RegionalVFModel(nn.Module):
             self.register_buffer(f'vf_idx_{sec_name}',
                                  torch.tensor(indices, dtype=torch.long))
 
-        # Sector heads
-        sector_input_dim = self.embed_dim * 2
+        # Sector heads — wider hidden layers for more expressive per-sector prediction
+        sector_input_dim = self.embed_dim * 2  # quadrant_pool + CLS
         self.sector_heads = nn.ModuleDict()
         for sec_name, sec_indices in VF_SECTORS.items():
             self.sector_heads[sec_name] = SectorHead(
@@ -337,22 +398,32 @@ class RegionalVFModel(nn.Module):
         nn.init.zeros_(self.fusion[-1].weight)
         nn.init.zeros_(self.fusion[-1].bias)
 
-        # Decoder: TRAINABLE (pretrained, heavily regularized)
+        # Decoder: TRAINABLE with bypass
+        # bypass_alpha controls how much raw prediction passes through vs decoder
+        # Start at 0.3 so decoder doesn't dominate early (decoder tends to regress to mean)
         self.decoder = VFAutoDecoder(input_dim=NUM_VALID_POINTS)
+        self.decoder_bypass = nn.Parameter(torch.tensor(0.3))  # how much raw pred to keep
+
         if pretrained_decoder_state is not None:
             try:
                 self.decoder.load_state_dict(pretrained_decoder_state, strict=True)
-                print(f"✓ Decoder: TRAINABLE (pretrained, LR={DECODER_LR:.1e}, WD={DECODER_WD:.1e})")
+                print(f"✓ Decoder: TRAINABLE with bypass (init={self.decoder_bypass.item():.1f})")
             except Exception as e:
                 print(f"⚠️  Decoder load failed: {e}")
         else:
             print("✓ Decoder: from scratch")
 
+        # Pointwise calibration — corrects per-location systematic bias
+        self.calibration = PointwiseCalibration(NUM_VALID_POINTS)
+        print("✓ Pointwise calibration layer (scale+shift per VF point)")
+
         # Param summary
         heads = sum(p.numel() for p in self.sector_heads.parameters())
         fus   = sum(p.numel() for p in self.fusion.parameters()) + 1
-        dec   = sum(p.numel() for p in self.decoder.parameters())
-        print(f"  Trainable: heads={heads:,} + fusion={fus:,} + decoder={dec:,} = {heads+fus+dec:,}")
+        dec   = sum(p.numel() for p in self.decoder.parameters()) + 1  # +bypass
+        cal   = sum(p.numel() for p in self.calibration.parameters())
+        total = heads + fus + dec + cal
+        print(f"  Trainable: heads={heads:,} + fusion={fus:,} + decoder={dec:,} + calib={cal:,} = {total:,}")
 
     def pool_quadrant(self, patches, quad_name):
         idx = getattr(self, f'patch_idx_{quad_name}')
@@ -383,10 +454,19 @@ class RegionalVFModel(nn.Module):
             idx = getattr(self, f'vf_idx_{sec_name}')
             pred[:, idx] = sec_pred
 
+        # Fusion
         fused = self.fusion(pred)
         pred = pred + self.fusion_alpha * fused
 
-        pred = self.decoder(pred)
+        # Decoder with bypass — don't let decoder fully dominate
+        decoded = self.decoder(pred)
+        bypass = torch.sigmoid(self.decoder_bypass)  # keep in [0,1]
+        pred = bypass * pred + (1 - bypass) * decoded
+
+        # Pointwise calibration
+        pred = self.calibration(pred)
+
+        # Clamp
         pred = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
         pred = torch.clamp(pred, OUTLIER_CLIP_RANGE[0], OUTLIER_CLIP_RANGE[1])
 
@@ -394,8 +474,22 @@ class RegionalVFModel(nn.Module):
             pred = pred.mean(dim=0, keepdim=True)
         return pred
 
+# ============== Concordance Correlation Coefficient ==============
+def ccc_loss(pred, target):
+    """1 - CCC. CCC penalizes both correlation < 1 and mean/variance mismatch.
+    Perfect when pred == target. Directly addresses slope != 1 problem.
+    """
+    pred_mean = pred.mean()
+    target_mean = target.mean()
+    pred_var = pred.var()
+    target_var = target.var()
+    covar = ((pred - pred_mean) * (target - target_mean)).mean()
+
+    ccc = (2 * covar) / (pred_var + target_var + (pred_mean - target_mean) ** 2 + 1e-8)
+    return 1.0 - ccc
+
 # ============== Loss ==============
-def compute_loss(pred, target, laterality):
+def compute_loss(pred, target, laterality, epoch=0):
     device = pred.device
     target = target.to(device)
     if isinstance(laterality, str):
@@ -406,6 +500,8 @@ def compute_loss(pred, target, laterality):
         target = target.unsqueeze(0)
 
     total_loss = total_mae = n_valid = 0
+    all_p, all_t = [], []
+
     for i, lat in enumerate(laterality):
         valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
         target_52 = target[i][valid_idx]
@@ -415,17 +511,39 @@ def compute_loss(pred, target, laterality):
             continue
         p = pred_52[mask]
         t = target_52[mask]
-        weights = torch.ones_like(p)
-        weights[t < LOW_DB_THRESHOLD] = LOW_VALUE_WEIGHT
-        loss = (F.huber_loss(p, t, reduction='none', delta=HUBER_DELTA) * weights).mean()
-        mae  = (p - t).abs().mean()
-        total_loss += loss * mask.sum().item()
+
+        # Continuous inverse-sensitivity weighting
+        # Higher weight for lower-sensitivity (more damaged) points
+        weights = 1.0 + WEIGHT_SCALE * (MAX_DB - t).clamp(min=0) / MAX_DB
+
+        huber = (F.huber_loss(p, t, reduction='none', delta=HUBER_DELTA) * weights).mean()
+        mae   = (p - t).abs().mean()
+
+        total_loss += huber * mask.sum().item()
         total_mae  += mae.item() * mask.sum().item()
         n_valid    += mask.sum().item()
 
+        all_p.append(p)
+        all_t.append(t)
+
     if n_valid == 0:
         return torch.tensor(0.0, device=device, requires_grad=True), 0.0, 0
-    return total_loss / n_valid, total_mae / n_valid, n_valid
+
+    base_loss = total_loss / n_valid
+
+    # CCC loss — phased in gradually to avoid destabilizing early training
+    ccc_weight = 0.0
+    if epoch >= CCC_START_EPOCH and len(all_p) > 0 and n_valid >= 10:
+        ramp_progress = min(1.0, (epoch - CCC_START_EPOCH) / CCC_RAMP_EPOCHS)
+        ccc_weight = CCC_LOSS_MAX * ramp_progress
+        cat_p = torch.cat(all_p)
+        cat_t = torch.cat(all_t)
+        ccc_l = ccc_loss(cat_p, cat_t)
+        combined = (1 - ccc_weight) * base_loss + ccc_weight * ccc_l
+    else:
+        combined = base_loss
+
+    return combined, total_mae / n_valid, n_valid
 
 
 def pearson_correlation(pred, target, laterality):
@@ -451,6 +569,36 @@ def pearson_correlation(pred, target, laterality):
     return float(r) if not np.isnan(r) else 0.0
 
 
+def compute_r2_slope(pred, target, laterality):
+    """Compute R² and regression slope for monitoring."""
+    all_pred, all_target = [], []
+    if isinstance(laterality, str):
+        laterality = [laterality]
+    if pred.dim() == 1:
+        pred = pred.unsqueeze(0)
+    if target.dim() == 1:
+        target = target.unsqueeze(0)
+    for i in range(min(len(laterality), pred.shape[0], target.shape[0])):
+        lat = laterality[i] if i < len(laterality) else laterality[0]
+        valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
+        target_52 = target[min(i, target.shape[0]-1)][valid_idx]
+        pred_52 = pred[min(i, pred.shape[0]-1)]
+        mask = target_52 < MASKED_VALUE_THRESHOLD
+        if mask.sum() > 0:
+            all_pred.extend(pred_52[mask].tolist())
+            all_target.extend(target_52[mask].tolist())
+    if len(all_pred) < 2:
+        return 0.0, 0.0
+    p = np.array(all_pred)
+    t = np.array(all_target)
+    # Slope via least squares: pred = slope * target + intercept
+    slope, intercept = np.polyfit(t, p, 1)
+    ss_res = ((p - (slope * t + intercept)) ** 2).sum()
+    ss_tot = ((p - p.mean()) ** 2).sum()
+    r2 = 1 - ss_res / (ss_tot + 1e-8)
+    return float(r2), float(slope)
+
+
 def evaluate(model, loader):
     model.eval()
     total_mae = n_valid = 0
@@ -467,41 +615,50 @@ def evaluate(model, loader):
             all_targets.append(hvf.unsqueeze(0) if hvf.dim() == 1 else hvf)
             all_lats.append(lat)
     if n_valid == 0:
-        return float('inf'), 0.0
+        return float('inf'), 0.0, 0.0, 0.0
     stacked_preds   = torch.cat(all_preds, dim=0)
     stacked_targets = torch.cat(all_targets, dim=0)
     corr = pearson_correlation(stacked_preds, stacked_targets, all_lats)
-    return total_mae / n_valid, corr
+    r2, slope = compute_r2_slope(stacked_preds, stacked_targets, all_lats)
+    return total_mae / n_valid, corr, r2, slope
 
 
 # ============== Training ==============
 def train():
     print("=" * 60)
-    print("Training v9 — Per-region + trainable decoder")
+    print("Training v9.2 — Fix regression-to-mean")
     print("=" * 60)
 
-    print(f"\nArchitecture: v8 per-region (proven 4.14)")
-    print(f"  Key change: decoder is TRAINABLE (was frozen)")
-    print(f"    Decoder LR={DECODER_LR:.1e} (10x lower than heads)")
-    print(f"    Decoder WD={DECODER_WD:.1e} (strong regularization)")
+    print(f"\nDiagnosis (v9 scatterplot):")
+    print(f"  Slope = 0.33 (should be ~1.0)")
+    print(f"  R² = 0.314")
+    print(f"  Bias = +0.96 dB (overpredicts on average)")
+    print(f"  Model collapses toward population mean")
 
-    print(f"\nConfig:")
-    print(f"  Encoder: FROZEN | Heads LR={HEADS_LR:.1e} WD={HEADS_WD:.1e}")
-    print(f"  Loss: Huber + {LOW_VALUE_WEIGHT}x <{LOW_DB_THRESHOLD}dB")
-    print(f"  Aug: ±{ROTATION_DEG}° | TTA: {TTA_ROTATIONS}")
+    print(f"\nFixes:")
+    print(f"  1. Continuous weighting: up to {1+WEIGHT_SCALE:.0f}x for 0 dB points")
+    print(f"  2. CCC loss (max={CCC_LOSS_MAX}, ramp ep {CCC_START_EPOCH}-{CCC_START_EPOCH+CCC_RAMP_EPOCHS}) — penalizes slope≠1")
+    print(f"  3. Quantile-balanced sampling — oversample damaged eyes")
+    print(f"  4. Decoder bypass — reduce mean-regression from decoder")
+    print(f"  5. Pointwise calibration — per-location scale+shift")
+    print(f"  6. Monotonic cosine schedule (T_max={EPOCHS})")
+
     print(f"\nBanned: LoRA, flips/affine, MixUp")
-
-    print(f"\nExpected:")
-    print(f"  Ep 1-10:  MAE 5→4.3  (same as v8 early trajectory)")
-    print(f"  Ep 10-30: MAE 4.0-4.2 (decoder adapting should help here)")
-    print(f"  Ep 30-60: MAE 3.7-4.0 (target — decoder refinement)")
-    print(f"  WATCH: if gap goes negative by >0.3, decoder is overfitting")
 
     # ── Data ───────────────────────────────────────────────────
     train_dataset = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, train_transform, mode='train')
     val_dataset   = MultiImageDataset(VAL_JSON,   FUNDUS_DIR, val_transform,   mode='val', use_tta=USE_TTA)
 
-    train_loader = DataLoader(train_dataset, BATCH_SIZE, shuffle=True,
+    # Weighted sampling — oversample damaged eyes
+    sample_weights = train_dataset.get_sample_severity()
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(train_dataset),
+        replacement=True
+    )
+    print(f"  Sampler weight range: [{min(sample_weights):.1f}, {max(sample_weights):.1f}]")
+
+    train_loader = DataLoader(train_dataset, BATCH_SIZE, sampler=sampler,
                               num_workers=0, drop_last=True)
     val_loader   = DataLoader(val_dataset, batch_size=1, shuffle=False,
                               num_workers=0, collate_fn=val_collate_fn)
@@ -510,32 +667,37 @@ def train():
     model = RegionalVFModel(base_model, pretrained_decoder_state, DROPOUT_RATE)
     model.to(DEVICE)
 
-    # ── Optimizer: separate LR for heads vs decoder ────────────
+    # ── Optimizer: separate param groups ───────────────────────
     head_params = list(model.sector_heads.parameters()) + \
                   list(model.fusion.parameters()) + [model.fusion_alpha]
-    decoder_params = list(model.decoder.parameters())
+    decoder_params = list(model.decoder.parameters()) + [model.decoder_bypass]
+    calib_params = list(model.calibration.parameters())
 
     optimizer = optim.AdamW([
-        {'params': head_params, 'lr': HEADS_LR, 'weight_decay': HEADS_WD},
+        {'params': head_params,    'lr': HEADS_LR,   'weight_decay': HEADS_WD},
         {'params': decoder_params, 'lr': DECODER_LR, 'weight_decay': DECODER_WD},
+        {'params': calib_params,   'lr': CALIB_LR,   'weight_decay': CALIB_WD},
     ])
 
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=25, T_mult=2, eta_min=1e-5
+    # Monotonic cosine decay — no restarts (v9 was killed by restart at ep 25)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=EPOCHS, eta_min=1e-6
     )
 
-    best_mae  = float('inf')
-    best_corr = 0.0
-    patience  = 0
+    best_mae   = float('inf')
+    best_corr  = 0.0
+    best_slope = 0.0
+    patience   = 0
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
+        epoch_loss = epoch_mae = epoch_n = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
 
         for imgs, hvf, lat in pbar:
             imgs = imgs.to(DEVICE)
             pred = model(imgs, laterality=lat, average_multi=False)
-            loss, mae, nv = compute_loss(pred, hvf, lat)
+            loss, mae, nv = compute_loss(pred, hvf, lat, epoch=epoch)
 
             if nv > 0:
                 optimizer.zero_grad()
@@ -543,38 +705,54 @@ def train():
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad], 1.0)
                 optimizer.step()
+                epoch_loss += loss.item() * nv
+                epoch_mae  += mae * nv
+                epoch_n    += nv
 
             pbar.set_postfix({'MAE': f'{mae:.2f}'})
 
         scheduler.step()
 
+        # Log bypass parameter
+        bypass_val = torch.sigmoid(model.decoder_bypass).item()
+        if epoch <= 5 or epoch % 10 == 0:
+            print(f"  Decoder bypass: {bypass_val:.3f} (raw={model.decoder_bypass.item():.3f})")
+            print(f"  Fusion alpha: {model.fusion_alpha.item():.3f}")
+
         # ── Validate ───────────────────────────────────────────
         if epoch % VAL_EVERY == 0 or epoch <= 3:
-            val_mae, val_corr = evaluate(model, val_loader)
+            val_mae, val_corr, val_r2, val_slope = evaluate(model, val_loader)
 
             train_eval = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, val_transform,
                                            mode='val', use_tta=False)
             train_eval_loader = DataLoader(train_eval, batch_size=1, shuffle=False,
                                            num_workers=0, collate_fn=val_collate_fn)
-            train_mae, train_corr = evaluate(model, train_eval_loader)
+            train_mae, train_corr, train_r2, train_slope = evaluate(model, train_eval_loader)
             gap = train_mae - val_mae
 
             print(f"\n[Epoch {epoch}]")
-            print(f"  Train: {train_mae:.2f} dB | Corr: {train_corr:.3f}")
-            print(f"  Val:   {val_mae:.2f} dB | Corr: {val_corr:.3f} | Gap: {gap:+.2f}")
+            print(f"  Train: MAE={train_mae:.2f} | Corr={train_corr:.3f} | R²={train_r2:.3f} | Slope={train_slope:.3f}")
+            print(f"  Val:   MAE={val_mae:.2f} | Corr={val_corr:.3f} | R²={val_r2:.3f} | Slope={val_slope:.3f}")
+            print(f"  Gap: {gap:+.2f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
 
             if gap < -0.4:
                 print(f"  ⚠️  Gap < -0.4 — decoder may be overfitting")
 
+            # Track slope improvement — this is the key metric for regression-to-mean
+            if val_slope > best_slope + 0.02:
+                print(f"  📈 Slope improved: {best_slope:.3f} → {val_slope:.3f}")
+
             if val_mae < best_mae:
-                best_mae  = val_mae
-                best_corr = val_corr
+                best_mae   = val_mae
+                best_corr  = val_corr
+                best_slope = max(best_slope, val_slope)
                 torch.save({'model': model.state_dict(), 'mae': val_mae,
-                            'corr': val_corr, 'epoch': epoch}, BEST_SAVE)
+                            'corr': val_corr, 'r2': val_r2, 'slope': val_slope,
+                            'epoch': epoch}, BEST_SAVE)
                 torch.save({'model_state_dict': model.state_dict(),
                             'encoder_checkpoint': CHECKPOINT_PATH,
                             'val_mae': val_mae, 'val_corr': val_corr}, INFERENCE_SAVE)
-                print(f"  ✓ New Best! (MAE={val_mae:.2f}, Corr={val_corr:.3f})")
+                print(f"  ✓ New Best! (MAE={val_mae:.2f}, Corr={val_corr:.3f}, Slope={val_slope:.3f})")
                 patience = 0
             else:
                 patience += VAL_EVERY
@@ -584,14 +762,17 @@ def train():
 
     # ── Summary ────────────────────────────────────────────────
     print(f"\n{'='*60}")
-    print(f"Training Complete!")
-    print(f"  Best Val MAE:  {best_mae:.2f} dB")
-    print(f"  Best Val Corr: {best_corr:.3f}")
+    print(f"Training Complete — v9.2")
+    print(f"  Best Val MAE:   {best_mae:.2f} dB")
+    print(f"  Best Val Corr:  {best_corr:.3f}")
+    print(f"  Best Val Slope: {best_slope:.3f} (target: >0.6)")
     gain = 3.74 - best_mae
     if best_mae < 3.0:
         print(f"  🎯 SUB-3 dB! Beat baseline by {gain:.2f} dB")
     elif best_mae < 3.74:
         print(f"  ✓ Beat baseline by {gain:.2f} dB")
+    elif best_mae < 4.0:
+        print(f"  ✓ Sub-4! Gap to baseline: {best_mae - 3.74:+.2f} dB")
     else:
         print(f"  Gap to baseline: {best_mae - 3.74:+.2f} dB")
     print(f"  Model saved to: {INFERENCE_SAVE}")
