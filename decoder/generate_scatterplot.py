@@ -1,10 +1,10 @@
 """
 VF Scatterplot — Per-point predictions vs ground truth
-Loads inference_model.pth and plots all VF sensitivity points
-(one dot per VF location per patient, not averaged).
+Loads inference_model.pth (v10.2 PerPointVFModel) and plots all VF
+sensitivity points (one dot per VF location per patient).
 """
 
-import os, sys, json, argparse
+import os, sys, json, argparse, math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -17,7 +17,7 @@ import matplotlib.colors as mcolors
 from scipy import stats
 
 # ============================================================
-# PATHS — adjust if your layout differs
+# PATHS
 # ============================================================
 CURRENT_DIR        = os.path.dirname(os.path.abspath(__file__))
 RETFOUND_DIR       = os.path.join(CURRENT_DIR, '..', 'encoder', 'RETFound_MAE')
@@ -29,14 +29,17 @@ VAL_JSON           = os.path.join(BASE_DIR, 'data', 'vf_tests', 'grape_test.json
 OUTPUT_PLOT        = os.path.join(CURRENT_DIR, 'vf_scatterplot_per_point.png')
 
 # ============================================================
-# CONSTANTS (must match training.py)
+# CONSTANTS
 # ============================================================
 MASKED_VALUE_THRESHOLD = 99.0
 OUTLIER_CLIP_RANGE     = (0, 35)
-DROPOUT_RATE           = 0.3
 PROJ_INIT_BIAS         = 18.0
 TTA_ROTATIONS          = [-5, 0, 5]
 USE_TTA                = True
+ATTN_DROPOUT           = 0.4
+HEAD_DROPOUT           = 0.4
+REFINE_DROPOUT         = 0.15
+ATTN_TEMP_INIT         = 2.0
 
 mask_OD = np.array([
     [False, False, False, True,  True,  True,  True,  False, False],
@@ -55,153 +58,173 @@ valid_indices_os = [i for i, v in enumerate(mask_OS.flatten()) if v]
 NUM_VALID_POINTS = len(valid_indices_od)  # 52
 
 # ============================================================
-# SECTOR / QUADRANT HELPERS
+# ANATOMICAL PRIOR
 # ============================================================
-def build_sector_indices():
-    rows, cols = mask_OD.shape
-    sectors = {'sup_nasal': [], 'sup_temporal': [], 'inf_nasal': [], 'inf_temporal': []}
+def build_vf_to_patch_prior():
+    vf_to_patch = {}
     valid_count = 0
-    for r in range(rows):
-        for c in range(cols):
+    for r in range(8):
+        for c in range(9):
             if mask_OD[r, c]:
-                is_superior = r < 4
-                is_nasal    = c <= 4
-                if   is_superior and is_nasal:      sectors['sup_nasal'].append(valid_count)
-                elif is_superior and not is_nasal:  sectors['sup_temporal'].append(valid_count)
-                elif not is_superior and is_nasal:  sectors['inf_nasal'].append(valid_count)
-                else:                               sectors['inf_temporal'].append(valid_count)
+                patch_r = 13 - int(r * 13 / 7)
+                patch_c = 13 - int(c * 13 / 8)
+                vf_to_patch[valid_count] = (patch_r, patch_c)
                 valid_count += 1
-    return sectors
+    return vf_to_patch
 
-VF_SECTORS = build_sector_indices()
-
-def build_patch_quadrants():
-    quadrants = {
-        'sup_retina_nasal': [], 'sup_retina_temporal': [],
-        'inf_retina_nasal': [], 'inf_retina_temporal': [],
-    }
-    for r in range(14):
-        for c in range(14):
-            idx = r * 14 + c
-            if   r < 7 and c >= 7: quadrants['sup_retina_nasal'].append(idx)
-            elif r < 7 and c < 7:  quadrants['sup_retina_temporal'].append(idx)
-            elif r >= 7 and c >= 7: quadrants['inf_retina_nasal'].append(idx)
-            else:                   quadrants['inf_retina_temporal'].append(idx)
-    return quadrants
-
-PATCH_QUADRANTS = build_patch_quadrants()
-
-RETINA_TO_VF_OD = {
-    'sup_retina_nasal': 'inf_temporal', 'sup_retina_temporal': 'inf_nasal',
-    'inf_retina_nasal': 'sup_temporal', 'inf_retina_temporal': 'sup_nasal',
-}
-RETINA_TO_VF_OS = {
-    'sup_retina_nasal': 'inf_nasal',    'sup_retina_temporal': 'inf_temporal',
-    'inf_retina_nasal': 'sup_nasal',    'inf_retina_temporal': 'sup_temporal',
-}
+VF_TO_PATCH_PRIOR = build_vf_to_patch_prior()
 
 # ============================================================
-# MODEL DEFINITION (identical to training.py)
+# MODEL DEFINITION (v10.2 — PerPointVFModel)
 # ============================================================
-class VFAutoDecoder(nn.Module):
-    def __init__(self, input_dim=52):
+class PerPointAttention(nn.Module):
+    def __init__(self, embed_dim=1024, num_points=52, attn_dim=128, dropout=0.4):
         super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, 256), nn.LayerNorm(256), nn.GELU(), nn.Dropout(0.2),
-            nn.Linear(256, 512),       nn.LayerNorm(512), nn.GELU(), nn.Dropout(0.2),
-            nn.Linear(512, 512),       nn.LayerNorm(512), nn.GELU(), nn.Dropout(0.2),
-            nn.Linear(512, 256),       nn.LayerNorm(256), nn.GELU(), nn.Dropout(0.2),
-            nn.Linear(256, input_dim)
-        )
-        self.residual_weight = nn.Parameter(torch.tensor(0.1))
+        self.num_points = num_points
+        self.attn_dim = attn_dim
+        self.queries = nn.Parameter(torch.randn(num_points, attn_dim) * 0.02)
+        self.key_proj = nn.Linear(embed_dim, attn_dim, bias=False)
+        self.val_proj = nn.Linear(embed_dim, attn_dim, bias=False)
+        self.out_proj = nn.Linear(attn_dim, embed_dim)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.scale = math.sqrt(attn_dim)
+        self.temperature = nn.Parameter(torch.tensor(ATTN_TEMP_INIT))
+        self.patch_pos = nn.Parameter(torch.randn(196, attn_dim) * 0.02)
+        self._init_anatomical_prior()
 
-    def forward(self, x):
-        return self.network(x) + self.residual_weight * x
+    def _init_anatomical_prior(self):
+        with torch.no_grad():
+            prior_bias = torch.zeros(self.num_points, 196)
+            for vf_idx, (pr, pc) in VF_TO_PATCH_PRIOR.items():
+                if vf_idx >= self.num_points:
+                    continue
+                for patch_idx in range(196):
+                    patch_r = patch_idx // 14
+                    patch_c = patch_idx % 14
+                    dist_sq = (patch_r - pr) ** 2 + (patch_c - pc) ** 2
+                    prior_bias[vf_idx, patch_idx] = -dist_sq / (2 * 3.0 ** 2)
+            self.register_buffer('attn_prior', prior_bias)
+
+    def forward(self, patches, laterality='OD'):
+        B = patches.shape[0]
+        keys = self.key_proj(patches) + self.patch_pos.unsqueeze(0)
+        vals = self.val_proj(patches)
+        queries = self.queries.unsqueeze(0).expand(B, -1, -1)
+        logits = torch.bmm(queries, keys.transpose(1, 2)) / self.scale
+
+        if isinstance(laterality, str):
+            is_os = not laterality.startswith('OD')
+        else:
+            is_os = not laterality[0].startswith('OD')
+
+        if is_os:
+            flipped_prior = self.attn_prior.clone()
+            flipped_prior_reshaped = flipped_prior.view(self.num_points, 14, 14)
+            flipped_prior_reshaped = flipped_prior_reshaped.flip(2)
+            flipped_prior = flipped_prior_reshaped.view(self.num_points, 196)
+            logits = logits + flipped_prior.unsqueeze(0)
+        else:
+            logits = logits + self.attn_prior.unsqueeze(0)
+
+        temp = F.softplus(self.temperature) + 0.5
+        logits = logits / temp
+        attn_weights = F.softmax(logits, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+        attended = torch.bmm(attn_weights, vals)
+        out = self.out_proj(attended)
+        return out, attn_weights
 
 
-class SectorHead(nn.Module):
-    def __init__(self, input_dim, num_points, dropout=0.3, bias_init=18.0):
+class PointHead(nn.Module):
+    def __init__(self, input_dim=2048, hidden=256, dropout=0.4, bias_init=18.0):
         super().__init__()
-        hidden = max(64, num_points * 4)
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden), nn.LayerNorm(hidden), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden, num_points)
+            nn.Linear(input_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.LayerNorm(hidden // 2),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(hidden // 2, 1)
         )
         nn.init.constant_(self.net[-1].bias, bias_init)
         nn.init.normal_(self.net[-1].weight, mean=0.0, std=0.01)
 
     def forward(self, x):
-        return self.net(x)
+        return self.net(x).squeeze(-1)
 
 
-class RegionalVFModel(nn.Module):
-    def __init__(self, encoder, dropout=0.3):
+class CrossPointRefinement(nn.Module):
+    def __init__(self, num_points=52, hidden=104, dropout=0.15):
         super().__init__()
-        self.encoder   = encoder
+        self.net = nn.Sequential(
+            nn.Linear(num_points, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, num_points)
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+        self.alpha = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x):
+        correction = self.net(x)
+        return x + torch.sigmoid(self.alpha) * correction
+
+
+class PerPointVFModel(nn.Module):
+    def __init__(self, encoder):
+        super().__init__()
+        self.encoder = encoder
         self.embed_dim = 1024
 
         for p in self.encoder.parameters():
             p.requires_grad = False
 
-        for quad_name, indices in PATCH_QUADRANTS.items():
-            self.register_buffer(f'patch_idx_{quad_name}',
-                                 torch.tensor(indices, dtype=torch.long))
-        for sec_name, indices in VF_SECTORS.items():
-            self.register_buffer(f'vf_idx_{sec_name}',
-                                 torch.tensor(indices, dtype=torch.long))
-
-        sector_input_dim = self.embed_dim * 2
-        self.sector_heads = nn.ModuleDict({
-            sec_name: SectorHead(sector_input_dim, len(sec_indices), dropout, PROJ_INIT_BIAS)
-            for sec_name, sec_indices in VF_SECTORS.items()
-        })
-
-        self.fusion = nn.Sequential(
-            nn.Linear(NUM_VALID_POINTS, NUM_VALID_POINTS * 2),
-            nn.LayerNorm(NUM_VALID_POINTS * 2), nn.GELU(), nn.Dropout(dropout * 0.5),
-            nn.Linear(NUM_VALID_POINTS * 2, NUM_VALID_POINTS),
+        self.attention = PerPointAttention(
+            embed_dim=self.embed_dim,
+            num_points=NUM_VALID_POINTS,
+            attn_dim=128,
+            dropout=ATTN_DROPOUT
         )
-        self.fusion_alpha = nn.Parameter(torch.tensor(0.3))
-
-        self.decoder = VFAutoDecoder(input_dim=NUM_VALID_POINTS)
-
-    def pool_quadrant(self, patches, quad_name):
-        idx = getattr(self, f'patch_idx_{quad_name}')
-        return patches[:, idx, :].mean(dim=1)
+        self.point_head = PointHead(
+            input_dim=self.embed_dim * 2,
+            hidden=256,
+            dropout=HEAD_DROPOUT,
+            bias_init=PROJ_INIT_BIAS
+        )
+        self.refinement = CrossPointRefinement(NUM_VALID_POINTS, hidden=104, dropout=REFINE_DROPOUT)
 
     def forward(self, x, laterality='OD', average_multi=True):
+        if x.dim() != 4:
+            raise ValueError(f"Expected 4D input, got {x.shape}")
+
         with torch.no_grad():
             latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
         cls_token = latent[:, 0, :]
-        patches   = latent[:, 1:, :]
+        patches = latent[:, 1:, :]
 
-        mapping = RETINA_TO_VF_OD if (
-            laterality if isinstance(laterality, str) else laterality[0]
-        ).startswith('OD') else RETINA_TO_VF_OS
+        point_feats, _ = self.attention(patches, laterality)
 
-        sector_preds = {}
-        for retina_quad, vf_sector in mapping.items():
-            quad_feat = self.pool_quadrant(patches, retina_quad)
-            head_input = torch.cat([quad_feat, cls_token], dim=1)
-            sector_preds[vf_sector] = self.sector_heads[vf_sector](head_input)
+        B = x.shape[0]
+        cls_expanded = cls_token.unsqueeze(1).expand(B, NUM_VALID_POINTS, self.embed_dim)
+        combined = torch.cat([point_feats, cls_expanded], dim=2)
 
-        pred = torch.zeros(x.shape[0], NUM_VALID_POINTS, device=x.device)
-        for sec_name, sec_pred in sector_preds.items():
-            idx = getattr(self, f'vf_idx_{sec_name}')
-            pred[:, idx] = sec_pred
+        pred = self.point_head(combined)
+        pred = self.refinement(pred)
 
-        fused = self.fusion(pred)
-        pred  = pred + self.fusion_alpha * fused
-        pred  = self.decoder(pred)
-        pred  = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
-        pred  = torch.clamp(pred, OUTLIER_CLIP_RANGE[0], OUTLIER_CLIP_RANGE[1])
+        pred = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
+        pred = torch.clamp(pred, OUTLIER_CLIP_RANGE[0], OUTLIER_CLIP_RANGE[1])
 
         if average_multi and pred.shape[0] > 1:
             pred = pred.mean(dim=0, keepdim=True)
         return pred
 
 # ============================================================
-# DATASET (val-mode, with TTA)
+# DATASET
 # ============================================================
 val_transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -280,14 +303,16 @@ def main():
     encoder.load_state_dict(ckpt['model'], strict=False)
     print('✓ Loaded RETFound encoder')
 
-    # ── Load model ────────────────────────────────────────────
-    model = RegionalVFModel(encoder, DROPOUT_RATE)
+    # ── Load model (v10.2 PerPointVFModel) ────────────────────
+    model = PerPointVFModel(encoder)
     saved = torch.load(INFERENCE_SAVE, map_location='cpu', weights_only=False)
     state = saved.get('model_state_dict', saved.get('model', saved))
     model.load_state_dict(state, strict=True)
     model.to(device)
     model.eval()
-    print(f'✓ Loaded inference model  (val_mae={saved.get("val_mae", "?"):.2f} dB)')
+    val_mae = saved.get("val_mae", None)
+    mae_str = f'{val_mae:.2f} dB' if val_mae is not None else '?'
+    print(f'✓ Loaded inference model  (val_mae={mae_str})')
 
     # ── Run inference ─────────────────────────────────────────
     dataset = ValDataset(VAL_JSON, FUNDUS_DIR, use_tta=USE_TTA)
@@ -300,14 +325,13 @@ def main():
     with torch.no_grad():
         for imgs, hvf, lat in loader:
             imgs = imgs.to(device)
-            pred = model(imgs, laterality=lat, average_multi=True)  # (1, 52)
+            pred = model(imgs, laterality=lat, average_multi=True)
             pred_np = pred.squeeze(0).cpu().numpy()
 
             hvf_np = hvf.numpy().flatten()
             valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
             true_52   = hvf_np[valid_idx]
 
-            # Keep only unmasked points
             mask = true_52 < MASKED_VALUE_THRESHOLD
             all_pred.extend(pred_np[mask].tolist())
             all_true.extend(true_52[mask].tolist())
@@ -327,18 +351,17 @@ def main():
     r2      = r_value ** 2
 
     print(f'\nMetrics:')
-    print(f'  MAE:  {mae:.2f} dB')
-    print(f'  RMSE: {rmse:.2f} dB')
-    print(f'  Bias: {bias:+.2f} dB')
-    print(f'  R²:   {r2:.3f}')
+    print(f'  MAE:   {mae:.2f} dB')
+    print(f'  RMSE:  {rmse:.2f} dB')
+    print(f'  Bias:  {bias:+.2f} dB')
+    print(f'  Slope: {slope:.3f}')
+    print(f'  R²:    {r2:.3f}')
 
     # ── Plot ──────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(8, 8))
 
-    # Color by absolute error (0–10 dB range like the reference)
     cmap   = plt.cm.RdYlGn_r
     norm   = mcolors.Normalize(vmin=0, vmax=10)
-    colors = cmap(norm(abs_err))
 
     sc = ax.scatter(
         all_true, all_pred,
@@ -347,27 +370,24 @@ def main():
         zorder=2
     )
 
-    # Perfect prediction line
     lim = (min(all_true.min(), all_pred.min()) - 1,
            max(all_true.max(), all_pred.max()) + 1)
     lim = (max(-1, lim[0]), min(36, lim[1]))
     ax.plot(lim, lim, 'k--', linewidth=1.5, label='Perfect prediction', zorder=3)
 
-    # Regression line
     x_line = np.linspace(lim[0], lim[1], 200)
     y_line = slope * x_line + intercept
     ax.plot(x_line, y_line, 'r-', linewidth=2,
             label=f'Fit: y={slope:.2f}x+{intercept:.2f} (R²={r2:.3f})', zorder=4)
 
-    # Colorbar
     cb = plt.colorbar(sc, ax=ax, pad=0.02)
     cb.set_label('Absolute Error (dB)', fontsize=11)
     cb.set_ticks(range(0, 11, 2))
 
-    # Text box (top-left, matching reference style)
     info = (
         f'Fit: y={slope:.2f}x+{intercept:.2f} (R²={r2:.3f})\n'
-        f'Bias: {bias:+.2f} dB'
+        f'Bias: {bias:+.2f} dB\n'
+        f'Slope: {slope:.3f}'
     )
     ax.text(0.03, 0.97, info, transform=ax.transAxes,
             fontsize=9, verticalalignment='top',
@@ -379,7 +399,7 @@ def main():
     ax.set_xlabel('True VF Sensitivity (dB)', fontsize=12)
     ax.set_ylabel('Predicted VF Sensitivity (dB)', fontsize=12)
     ax.set_title(
-        f'All Predictions vs Ground Truth\n'
+        f'All Predictions vs Ground Truth (v10.2)\n'
         f'N = {n_points:,} points from {n_samples} samples',
         fontsize=13, fontweight='bold'
     )
