@@ -1,41 +1,28 @@
 """
-Training v10.1 — Per-point spatial attention
+Training v10.2 — Per-point attention + heavy regularization
 
-WHY the architecture must change:
-  v8-v9.4 all use the same bottleneck: 196 patches → 4 quadrant pools → sector heads.
-  Mean-pooling 49 patches per quadrant destroys the spatial detail needed to detect
-  focal scotomas. Each VF point corresponds to a specific nerve fiber bundle path,
-  not a whole quadrant. A scotoma affecting 3 VF points might correspond to 5-10
-  specific patches — their signal gets averaged away with 39-44 healthy patches.
+v10.1 results:
+  Train: MAE=3.57, Slope=0.78 — architecture WORKS
+  Val:   MAE=4.02, Slope=0.38 — but OVERFITS (gap=-0.60)
+  
+  The per-point attention learns patient-specific patterns beautifully
+  on train, but 52 attention patterns × 196 patches = too many degrees
+  of freedom for 211 training eyes. Attention weights memorize individual
+  patients instead of learning generalizable anatomy.
 
-  Result: ~4.1 MAE ceiling regardless of loss function.
+Fixes (architecture unchanged, only regularization):
+  1. ATTENTION DROPOUT 0.2 → 0.4 — main overfitting site
+  2. POINT HEAD DROPOUT 0.25 → 0.4
+  3. WEIGHT DECAY 5e-3 → 1.5e-2 — much stronger
+  4. ATTENTION TEMPERATURE — learnable, initialized at 2.0 (softer attention)
+     Prevents attention from collapsing to 1-2 patches per VF point
+  5. LR 8e-4 → 5e-4 — slower learning = less memorization  
+  6. ATTENTION ENTROPY BONUS — small penalty if attention becomes too peaked
+     Encourages each VF point to use a broader patch neighborhood
+  7. LABEL NOISE — tiny gaussian noise (σ=0.3 dB) on training targets
+     Standard regularization for regression with small datasets
 
-NEW ARCHITECTURE:
-  Each of the 52 VF points gets its own learned attention over all 196 patches.
-  This means VF point #7 can learn "I depend mostly on patches (3,9), (4,9), (4,10)"
-  which corresponds to the actual retinal nerve fiber anatomy.
-
-  Frozen RETFound → 196 patches (1024-dim each) + CLS token
-      ↓
-  Per-point cross-attention: 52 learned query vectors attend to 196 patches
-  Each query produces a 1024-dim weighted combination of patches
-      ↓  
-  Point-wise prediction: [attended_feat_1024 + CLS_1024] → hidden → 1 value per point
-      ↓
-  Lightweight refinement (cross-point, captures neighbor interactions)
-      ↓
-  52 VF sensitivity values
-
-Memory: attention weights are 52 × 196 = 10,192 floats — negligible.
-Trainable params: ~700K (similar to v9's 1.1M, well within 211-eye budget).
-
-KEEPS from v9.4 (proven):
-  - Per-eye CCC loss
-  - Cross-patient variance penalty  
-  - Weighted sampling
-  - No pretrained decoder
-  - Continuous inverse-sensitivity weighting
-  - Monotonic cosine schedule
+Target: close the gap from -0.60 to ~-0.15, yielding val MAE ~3.7-3.9
 
 Banned: LoRA, flips/affine, MixUp
 """
@@ -71,15 +58,18 @@ EPOCHS       = 100
 PATIENCE     = 35
 
 MASKED_VALUE_THRESHOLD = 99.0
-DROPOUT_RATE = 0.25
 
-# Attention + point heads
-ATTN_LR = 8e-4
-ATTN_WD = 5e-3
+# ── Dropout (INCREASED from v10.1) ────────────────────────────
+ATTN_DROPOUT     = 0.4     # was 0.2 — attention is where overfitting happens
+HEAD_DROPOUT     = 0.4     # was 0.25
+REFINE_DROPOUT   = 0.15    # unchanged — refinement is tiny
 
-# Refinement
-REFINE_LR = 5e-4
-REFINE_WD = 5e-3
+# ── Learning rates (DECREASED) ────────────────────────────────
+ATTN_LR = 5e-4             # was 8e-4
+ATTN_WD = 1.5e-2           # was 5e-3 — 3x stronger
+
+REFINE_LR = 3e-4           # was 5e-4
+REFINE_WD = 1e-2            # was 5e-3
 
 # Projection warm start
 PROJ_INIT_BIAS = 18.0
@@ -103,6 +93,13 @@ PER_EYE_CCC_START  = 5
 # Variance penalty
 VARIANCE_WEIGHT = 0.05
 VARIANCE_START  = 8
+
+# ── NEW: Attention regularization ─────────────────────────────
+ATTN_ENTROPY_WEIGHT = 0.01   # small bonus for spread-out attention
+ATTN_TEMP_INIT      = 2.0    # initial temperature (>1 = softer attention)
+
+# ── NEW: Label noise ──────────────────────────────────────────
+LABEL_NOISE_STD = 0.3        # σ=0.3 dB gaussian noise on train targets
 
 # Validation
 VAL_EVERY = 2
@@ -138,26 +135,13 @@ mask_OS          = np.fliplr(mask_OD)
 valid_indices_os = [i for i, v in enumerate(mask_OS.flatten()) if v]
 NUM_VALID_POINTS = len(valid_indices_od)   # 52
 
-# ============== Anatomical priors for attention init ==============
+# ============== Anatomical priors ==============
 def build_vf_to_patch_prior():
-    """Build approximate mapping from VF grid positions to retinal patch positions.
-    
-    VF grid is 8×9, retinal patches are 14×14.
-    Key anatomy: superior retina → inferior VF, nasal retina → temporal VF.
-    For OD: nasal = right side of image (high col), temporal = left.
-    
-    Returns dict mapping each valid VF index (0-51) to approximate
-    (row, col) center in the 14×14 patch grid.
-    """
     vf_to_patch = {}
     valid_count = 0
     for r in range(8):
         for c in range(9):
             if mask_OD[r, c]:
-                # VF (r,c) → retinal position is vertically flipped and
-                # horizontally flipped (for OD, nasal-temporal swap)
-                # Map VF row [0-7] → patch row [13-0] (vertical flip)
-                # Map VF col [0-8] → patch col [13-0] (horizontal flip for OD)
                 patch_r = 13 - int(r * 13 / 7)
                 patch_c = 13 - int(c * 13 / 8)
                 vf_to_patch[valid_count] = (patch_r, patch_c)
@@ -255,7 +239,17 @@ class MultiImageDataset(Dataset):
         if self.mode == 'train':
             img = Image.open(os.path.join(self.fundus_dir, sample['image'])).convert('RGB')
             hvf = np.array(sample['hvf'], dtype=np.float32).flatten()
-            return self.transform(img), torch.tensor(hvf), sample['laterality']
+            hvf_tensor = torch.tensor(hvf)
+            # Label noise — small gaussian perturbation on train targets
+            if LABEL_NOISE_STD > 0:
+                noise = torch.randn_like(hvf_tensor) * LABEL_NOISE_STD
+                # Only add noise to valid (non-masked) values
+                valid_mask = hvf_tensor < MASKED_VALUE_THRESHOLD
+                hvf_tensor = hvf_tensor + noise * valid_mask.float()
+                # Clamp to valid range
+                hvf_tensor = torch.clamp(hvf_tensor, 0.0, 35.0) * valid_mask.float() + \
+                             hvf_tensor * (~valid_mask).float()
+            return self.transform(img), hvf_tensor, sample['laterality']
         else:
             all_imgs = []
             for img_path in sample['images']:
@@ -274,47 +268,32 @@ def val_collate_fn(batch):
 
 # ============== Per-Point Cross-Attention ==============
 class PerPointAttention(nn.Module):
-    """Each of 52 VF points learns which of 196 retinal patches to attend to.
-    
-    Architecture:
-      52 learned query vectors (each 128-dim)
-      Patches projected to 128-dim keys
-      Attention: softmax(Q @ K^T / sqrt(d)) → weighted sum of patch values
-      
-    Initialized with anatomical prior: each query starts with higher attention
-    on patches near its expected retinal location.
-    
-    Memory: 52 × 196 attention matrix = ~10K floats (negligible)
+    """Same as v10.1 but with:
+    - Learnable temperature (softer attention)
+    - Higher dropout
+    - Returns attention weights for entropy regularization
     """
-    def __init__(self, embed_dim=1024, num_points=52, attn_dim=128, dropout=0.2):
+    def __init__(self, embed_dim=1024, num_points=52, attn_dim=128, dropout=0.4):
         super().__init__()
         self.num_points = num_points
         self.attn_dim = attn_dim
         
-        # Learned queries — one per VF point
         self.queries = nn.Parameter(torch.randn(num_points, attn_dim) * 0.02)
-        
-        # Project patches to keys and values
         self.key_proj = nn.Linear(embed_dim, attn_dim, bias=False)
         self.val_proj = nn.Linear(embed_dim, attn_dim, bias=False)
-        
-        # Output projection: attn_dim → embed_dim (to combine with CLS)
         self.out_proj = nn.Linear(attn_dim, embed_dim)
         
         self.attn_dropout = nn.Dropout(dropout)
         self.scale = math.sqrt(attn_dim)
         
-        # Spatial position embedding for patches (14×14 grid)
+        # Learnable temperature — initialized > 1 for softer attention
+        self.temperature = nn.Parameter(torch.tensor(ATTN_TEMP_INIT))
+        
         self.patch_pos = nn.Parameter(torch.randn(196, attn_dim) * 0.02)
         
-        # Initialize attention with anatomical prior
         self._init_anatomical_prior()
     
     def _init_anatomical_prior(self):
-        """Bias initial attention toward anatomically correct patches.
-        Each VF point starts attending to a gaussian blob centered on its
-        expected retinal location. The model can learn to override this.
-        """
         with torch.no_grad():
             prior_bias = torch.zeros(self.num_points, 196)
             for vf_idx, (pr, pc) in VF_TO_PATCH_PRIOR.items():
@@ -324,70 +303,50 @@ class PerPointAttention(nn.Module):
                     patch_r = patch_idx // 14
                     patch_c = patch_idx % 14
                     dist_sq = (patch_r - pr) ** 2 + (patch_c - pc) ** 2
-                    # Gaussian with sigma=3 patches (~20% of grid)
                     prior_bias[vf_idx, patch_idx] = -dist_sq / (2 * 3.0 ** 2)
-            
-            # Encode this prior into query vectors via SVD-like initialization
-            # Simpler: just store as a bias that gets added to attention logits
             self.register_buffer('attn_prior', prior_bias)
     
     def forward(self, patches, laterality='OD'):
-        """
-        patches: (B, 196, 1024)
-        Returns: (B, 52, 1024) — one feature vector per VF point
-        """
         B = patches.shape[0]
         
-        # Project patches to keys and values, add position
-        keys = self.key_proj(patches) + self.patch_pos.unsqueeze(0)   # (B, 196, attn_dim)
-        vals = self.val_proj(patches)                                  # (B, 196, attn_dim)
-        
-        # Queries: (52, attn_dim) → (B, 52, attn_dim)
+        keys = self.key_proj(patches) + self.patch_pos.unsqueeze(0)
+        vals = self.val_proj(patches)
         queries = self.queries.unsqueeze(0).expand(B, -1, -1)
         
-        # Attention logits: (B, 52, 196)
         logits = torch.bmm(queries, keys.transpose(1, 2)) / self.scale
         
-        # Add anatomical prior bias
-        # For OS eyes, flip the prior horizontally (columns 0-13 ↔ 13-0)
+        # Anatomical prior
         if isinstance(laterality, str):
             is_os = not laterality.startswith('OD')
         else:
             is_os = not laterality[0].startswith('OD')
         
         if is_os:
-            # Flip patch columns: patch at (r,c) → (r, 13-c)
-            # patch_idx = r*14 + c → r*14 + (13-c)
             flipped_prior = self.attn_prior.clone()
             flipped_prior_reshaped = flipped_prior.view(self.num_points, 14, 14)
-            flipped_prior_reshaped = flipped_prior_reshaped.flip(2)  # flip columns
+            flipped_prior_reshaped = flipped_prior_reshaped.flip(2)
             flipped_prior = flipped_prior_reshaped.view(self.num_points, 196)
             logits = logits + flipped_prior.unsqueeze(0)
         else:
             logits = logits + self.attn_prior.unsqueeze(0)
         
-        # Softmax attention
-        attn_weights = F.softmax(logits, dim=-1)      # (B, 52, 196)
-        attn_weights = self.attn_dropout(attn_weights)
+        # Temperature scaling — higher temp = softer attention = less overfitting
+        temp = F.softplus(self.temperature) + 0.5  # ensure temp >= 0.5
+        logits = logits / temp
         
-        # Weighted sum of values
-        attended = torch.bmm(attn_weights, vals)       # (B, 52, attn_dim)
+        attn_weights = F.softmax(logits, dim=-1)
+        attn_weights_dropped = self.attn_dropout(attn_weights)
         
-        # Project back to embed_dim
-        out = self.out_proj(attended)                   # (B, 52, embed_dim)
+        attended = torch.bmm(attn_weights_dropped, vals)
+        out = self.out_proj(attended)
         
-        return out
+        # Return attention weights for entropy regularization
+        return out, attn_weights
 
 
 # ============== Point-wise Prediction Head ==============
 class PointHead(nn.Module):
-    """Shared MLP that maps per-point features to a single dB value.
-    Input: [attended_feat (1024) + CLS (1024)] = 2048 per point
-    Output: 1 value per point
-    
-    Shared across all 52 points (weight sharing = regularization).
-    """
-    def __init__(self, input_dim=2048, hidden=256, dropout=0.25, bias_init=18.0):
+    def __init__(self, input_dim=2048, hidden=256, dropout=0.4, bias_init=18.0):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden),
@@ -404,16 +363,11 @@ class PointHead(nn.Module):
         nn.init.normal_(self.net[-1].weight, mean=0.0, std=0.01)
     
     def forward(self, x):
-        """x: (B, 52, 2048) → (B, 52)"""
         return self.net(x).squeeze(-1)
 
 
 # ============== Cross-Point Refinement ==============
 class CrossPointRefinement(nn.Module):
-    """Light cross-point layer: captures spatial dependencies between 
-    neighboring VF points (e.g., scotomas are spatially contiguous).
-    Initialized near-identity.
-    """
     def __init__(self, num_points=52, hidden=104, dropout=0.15):
         super().__init__()
         self.net = nn.Sequential(
@@ -434,39 +388,34 @@ class CrossPointRefinement(nn.Module):
 
 # ============== Full Model ==============
 class PerPointVFModel(nn.Module):
-    def __init__(self, encoder, dropout=0.25):
+    def __init__(self, encoder):
         super().__init__()
         self.encoder = encoder
         self.embed_dim = 1024
         
-        # Freeze encoder
         for p in self.encoder.parameters():
             p.requires_grad = False
         print("✓ Encoder: FROZEN")
         
-        # Per-point cross-attention
         self.attention = PerPointAttention(
             embed_dim=self.embed_dim,
             num_points=NUM_VALID_POINTS,
             attn_dim=128,
-            dropout=dropout
+            dropout=ATTN_DROPOUT
         )
-        print("✓ Per-point attention (52 queries × 196 patches)")
+        print(f"✓ Per-point attention (dropout={ATTN_DROPOUT}, temp_init={ATTN_TEMP_INIT})")
         
-        # Shared point prediction head
         self.point_head = PointHead(
-            input_dim=self.embed_dim * 2,  # attended + CLS
+            input_dim=self.embed_dim * 2,
             hidden=256,
-            dropout=dropout,
+            dropout=HEAD_DROPOUT,
             bias_init=PROJ_INIT_BIAS
         )
-        print("✓ Shared point head (2048 → 256 → 128 → 1)")
+        print(f"✓ Shared point head (dropout={HEAD_DROPOUT})")
         
-        # Cross-point refinement
-        self.refinement = CrossPointRefinement(NUM_VALID_POINTS, hidden=104, dropout=0.15)
+        self.refinement = CrossPointRefinement(NUM_VALID_POINTS, hidden=104, dropout=REFINE_DROPOUT)
         print("✓ Cross-point refinement")
         
-        # Param summary
         attn_p = sum(p.numel() for p in self.attention.parameters())
         head_p = sum(p.numel() for p in self.point_head.parameters())
         ref_p  = sum(p.numel() for p in self.refinement.parameters())
@@ -479,29 +428,27 @@ class PerPointVFModel(nn.Module):
         
         with torch.no_grad():
             latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
-        cls_token = latent[:, 0, :]       # (B, 1024)
-        patches   = latent[:, 1:, :]      # (B, 196, 1024)
+        cls_token = latent[:, 0, :]
+        patches   = latent[:, 1:, :]
         
-        # Per-point attention: each VF point attends to relevant patches
-        point_feats = self.attention(patches, laterality)  # (B, 52, 1024)
+        point_feats, attn_weights = self.attention(patches, laterality)
         
-        # Concatenate CLS to each point's feature
         B = x.shape[0]
         cls_expanded = cls_token.unsqueeze(1).expand(B, NUM_VALID_POINTS, self.embed_dim)
-        combined = torch.cat([point_feats, cls_expanded], dim=2)  # (B, 52, 2048)
+        combined = torch.cat([point_feats, cls_expanded], dim=2)
         
-        # Predict per-point values
-        pred = self.point_head(combined)    # (B, 52)
-        
-        # Cross-point refinement
+        pred = self.point_head(combined)
         pred = self.refinement(pred)
         
-        # Clamp
         pred = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
         pred = torch.clamp(pred, OUTLIER_CLIP_RANGE[0], OUTLIER_CLIP_RANGE[1])
         
         if average_multi and pred.shape[0] > 1:
             pred = pred.mean(dim=0, keepdim=True)
+        
+        # Store attention weights for regularization (only during training)
+        self._last_attn_weights = attn_weights
+        
         return pred
 
 
@@ -520,8 +467,27 @@ def per_eye_ccc(pred_52, target_52, mask):
     return 1.0 - ccc
 
 
+# ============== Attention Entropy ==============
+def attention_entropy_loss(attn_weights):
+    """Penalize if attention is too peaked (low entropy).
+    Encourages each VF point to attend to a neighborhood of patches,
+    not just 1-2 specific ones (which leads to memorization).
+    
+    attn_weights: (B, 52, 196) — softmax probabilities
+    Returns negative mean entropy (minimize this = maximize entropy)
+    """
+    # Entropy per query: -sum(p * log(p))
+    entropy = -(attn_weights * (attn_weights + 1e-8).log()).sum(dim=-1)  # (B, 52)
+    # Max possible entropy = log(196) ≈ 5.28
+    # We want entropy to stay above ~3.0 (attending to ~20 patches)
+    max_entropy = math.log(196)
+    # Normalized: 0 = max entropy, 1 = completely peaked
+    normalized = 1.0 - entropy / max_entropy  # (B, 52)
+    return normalized.mean()
+
+
 # ============== Loss ==============
-def compute_loss(pred, target, laterality, epoch=0):
+def compute_loss(pred, target, laterality, epoch=0, attn_weights=None):
     device = pred.device
     target = target.to(device)
     if isinstance(laterality, str):
@@ -545,7 +511,6 @@ def compute_loss(pred, target, laterality, epoch=0):
         t = target_52[mask]
 
         weights = 1.0 + WEIGHT_SCALE * (MAX_DB - t).clamp(min=0) / MAX_DB
-
         huber = (F.huber_loss(p, t, reduction='none', delta=HUBER_DELTA) * weights).mean()
         mae   = (p - t).abs().mean()
 
@@ -562,10 +527,12 @@ def compute_loss(pred, target, laterality, epoch=0):
 
     loss = total_huber / n_valid
 
+    # Per-eye CCC
     if len(eye_ccc_losses) > 0:
         mean_eye_ccc = torch.stack(eye_ccc_losses).mean()
         loss = loss + PER_EYE_CCC_WEIGHT * mean_eye_ccc
 
+    # Variance penalty
     if epoch >= VARIANCE_START and pred.shape[0] >= 4:
         pred_var_per_point = pred.var(dim=0).mean()
         target_52_list = []
@@ -582,6 +549,11 @@ def compute_loss(pred, target, laterality, epoch=0):
                 if var_ratio < 1.0:
                     variance_penalty = (1.0 - var_ratio) ** 2
                     loss = loss + VARIANCE_WEIGHT * variance_penalty
+
+    # Attention entropy regularization
+    if attn_weights is not None and ATTN_ENTROPY_WEIGHT > 0:
+        entropy_loss = attention_entropy_loss(attn_weights)
+        loss = loss + ATTN_ENTROPY_WEIGHT * entropy_loss
 
     return loss, total_mae / n_valid, n_valid
 
@@ -690,17 +662,20 @@ def evaluate(model, loader):
 # ============== Training ==============
 def train():
     print("=" * 60)
-    print("Training v10.1 — Per-point spatial attention")
+    print("Training v10.2 — Per-point attention + heavy regularization")
     print("=" * 60)
 
-    print(f"\nArchitecture change:")
-    print(f"  OLD: 196 patches → 4 quadrant pools → 4 sector heads")
-    print(f"  NEW: 196 patches → 52-point cross-attention → shared point head")
-    print(f"  Each VF point learns which patches to attend to")
-    print(f"  Initialized with anatomical prior (gaussian centered on expected location)")
+    print(f"\nv10.1 showed: train MAE=3.57 (works!), val MAE=4.02 (overfits)")
+    print(f"Same architecture, more regularization to close the gap")
 
-    print(f"\nLoss (from v9.4):")
-    print(f"  Huber + {WEIGHT_SCALE}x weighting + per-eye CCC + variance penalty")
+    print(f"\nRegularization:")
+    print(f"  Attention dropout: {ATTN_DROPOUT} (was 0.2)")
+    print(f"  Head dropout:      {HEAD_DROPOUT} (was 0.25)")
+    print(f"  Weight decay:      {ATTN_WD} (was 0.005)")
+    print(f"  Attention temp:    {ATTN_TEMP_INIT} (learnable, softens attention)")
+    print(f"  Entropy penalty:   {ATTN_ENTROPY_WEIGHT} (prevents peaked attention)")
+    print(f"  Label noise:       σ={LABEL_NOISE_STD} dB")
+    print(f"  LR:                {ATTN_LR} (was 8e-4)")
 
     print(f"\nBanned: LoRA, flips/affine, MixUp")
 
@@ -722,7 +697,7 @@ def train():
                               num_workers=0, collate_fn=val_collate_fn)
 
     # ── Model ──────────────────────────────────────────────────
-    model = PerPointVFModel(base_model, DROPOUT_RATE)
+    model = PerPointVFModel(base_model)
     model.to(DEVICE)
 
     # ── Optimizer ──────────────────────────────────────────────
@@ -752,7 +727,11 @@ def train():
         for imgs, hvf, lat in pbar:
             imgs = imgs.to(DEVICE)
             pred = model(imgs, laterality=lat, average_multi=False)
-            loss, mae, nv = compute_loss(pred, hvf, lat, epoch=epoch)
+            
+            # Get stored attention weights for entropy regularization
+            attn_w = model._last_attn_weights if hasattr(model, '_last_attn_weights') else None
+            
+            loss, mae, nv = compute_loss(pred, hvf, lat, epoch=epoch, attn_weights=attn_w)
 
             if nv > 0:
                 optimizer.zero_grad()
@@ -767,7 +746,8 @@ def train():
 
         if epoch <= 5 or epoch % 10 == 0:
             ref_alpha = torch.sigmoid(model.refinement.alpha).item()
-            print(f"  Refinement alpha: {ref_alpha:.3f}")
+            temp = F.softplus(model.attention.temperature).item() + 0.5
+            print(f"  Refinement alpha: {ref_alpha:.3f} | Attn temp: {temp:.3f}")
 
         # ── Validate ───────────────────────────────────────────
         if epoch % VAL_EVERY == 0 or epoch <= 3:
@@ -819,7 +799,7 @@ def train():
 
     # ── Summary ────────────────────────────────────────────────
     print(f"\n{'='*60}")
-    print(f"Training Complete — v10.1")
+    print(f"Training Complete — v10.2")
     print(f"  Best Val MAE:      {best_mae:.2f} dB")
     print(f"  Best Val Corr:     {best_corr:.3f}")
     print(f"  Best Val Slope:    {best_slope:.3f}")
