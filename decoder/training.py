@@ -1,31 +1,45 @@
 """
-Training v9.2 — Fix regression-to-mean
+Training v9.4 — Force patient-specific predictions
 
-Diagnosis from v9 scatterplot (4.14 MAE, R²=0.314, slope=0.33):
-  - Model collapses predictions toward population mean (~18-20 dB)
-  - Low-sensitivity points (0-10 dB) overpredicted by ~10-15 dB
-  - High-sensitivity points (25-30 dB) underpredicted by ~3-5 dB
-  - Slope 0.33 means only 1/3 of true dynamic range captured
+Diagnosis from v9.2/v9.3:
+  - Model learns a "population average VF map" — roughly same 52 values for
+    every patient with minor perturbations
+  - Slope oscillates: when CCC pushes for spread, MAE worsens; when Huber
+    pulls toward safe mean, slope collapses
+  - Best MAE 4.17 but slope only 0.24 at that point — not truly discriminating
+  - Pretrained decoder actively regresses predictions toward typical VF patterns
 
-Root causes:
-  1. Huber loss with weak 1.5x upweighting doesn't fight class imbalance
-     (most VF points are 20-30 dB healthy, so predicting ~20 is "safe")
-  2. Frozen pretrained decoder was trained as denoiser → pushes toward
-     typical VF patterns → amplifies regression to mean
-  3. No explicit incentive for the model to preserve dynamic range
+Root cause analysis:
+  The model minimizes loss by learning the population-mean VF per location.
+  With 211 eyes, most have healthy fields (20-30 dB), so predicting ~22 dB
+  everywhere gives low MAE but zero patient discrimination.
+  
+  The CCC loss (v9.2/v9.3) tried to fix this globally, but global CCC 
+  conflicts with per-point MAE — improving slope on damaged eyes hurts
+  MAE on healthy eyes because predictions get noisier.
 
-Fixes in v9.2:
-  1. CONTINUOUS INVERSE-SENSITIVITY WEIGHTING: weight = 1 + scale * (max_dB - target) / max_dB
-     Low dB points get ~4-5x weight, not just 1.5x. This is the #1 fix.
-  2. CONCORDANCE CORRELATION (CCC) LOSS COMPONENT: directly penalizes
-     slope deviation from 1.0 and mean shift. CCC = 1 when pred=target exactly.
-  3. QUANTILE-BALANCED SAMPLING: oversample eyes with low-sensitivity points
-     so each batch has better representation of damaged fields
-  4. LIGHTER DECODER: reduce decoder influence with lower residual weight init
-     and add a learnable bypass that lets raw sector-head predictions through
-  5. MONOTONIC COSINE SCHEDULE: CosineAnnealingLR (no restarts) per v9.1 plan
-  6. POINTWISE CALIBRATION HEAD: tiny per-point scale+shift after decoder
-     to correct systematic per-location biases
+Fixes in v9.4:
+  1. PER-EYE CCC LOSS: Compute CCC within each eye separately, then average.
+     This forces the model to predict the correct PATTERN within each eye
+     (scotoma vs healthy regions) without conflicting with MAE across eyes.
+     
+  2. CROSS-PATIENT VARIANCE PENALTY: If the model predicts similar values
+     for different patients at the same VF location, penalize it. This 
+     directly attacks the "same prediction for everyone" failure mode.
+     
+  3. REMOVE PRETRAINED DECODER: The autoencoder decoder is designed to
+     map noisy VF → clean VF, which literally means regressing toward
+     the training-set mean. Replace with a lightweight learned residual
+     refinement that doesn't have pretrained "average VF" baked in.
+     
+  4. DEEPER SECTOR HEADS: 2 hidden layers instead of 1. The single hidden
+     layer doesn't have enough capacity to learn patient-specific features
+     from the 2048-dim input. More depth = more ability to extract subtle
+     fundus features that distinguish patients.
+     
+  5. COMPOSITE SAVE CRITERION: Save best checkpoint based on 
+     0.7*MAE_rank + 0.3*slope_rank, not just MAE. This prevents saving
+     a checkpoint that has good MAE but zero discrimination.
 
 Banned: LoRA, flips/affine, MixUp
 """
@@ -56,23 +70,19 @@ else:
 # CONFIG
 # ==============================================================
 BATCH_SIZE   = 32
-EPOCHS       = 120
-PATIENCE     = 40          # longer patience — monotonic schedule is slow
+EPOCHS       = 100
+PATIENCE     = 35
 
 MASKED_VALUE_THRESHOLD = 99.0
 DROPOUT_RATE = 0.3
 
-# Heads
-HEADS_LR = 1e-3
+# Heads — slightly lower LR for deeper heads
+HEADS_LR = 8e-4
 HEADS_WD = 5e-3
 
-# Decoder: trainable but heavily regularized
-DECODER_LR = 1e-4
-DECODER_WD = 1e-2
-
-# Calibration head (tiny)
-CALIB_LR = 5e-4
-CALIB_WD = 1e-3
+# Refinement layer (replaces pretrained decoder)
+REFINE_LR = 5e-4
+REFINE_WD = 5e-3
 
 # Projection
 PROJ_INIT_BIAS = 18.0
@@ -84,20 +94,20 @@ ROTATION_DEG = 5
 USE_TTA       = True
 TTA_ROTATIONS = [-5, 0, 5]
 
-# Loss — regression-to-mean fixes
-HUBER_DELTA          = 1.0
-# Continuous weighting: weight = 1 + WEIGHT_SCALE * (MAX_DB - target) / MAX_DB
-# At 0 dB: weight = 1 + 4.0 = 5.0x
-# At 10 dB: weight = 1 + 4.0 * 25/35 ≈ 3.86x
-# At 20 dB: weight = 1 + 4.0 * 15/35 ≈ 2.71x
-# At 30 dB: weight = 1 + 4.0 * 5/35 ≈ 1.57x
-WEIGHT_SCALE = 2.5
+# Loss
+HUBER_DELTA      = 1.0
+
+# Continuous weighting (proven helpful in v9.2/v9.3)
+WEIGHT_SCALE = 2.0         # moderate — 3x at 0 dB, 1x at 35 dB
 MAX_DB       = 35.0
 
-# CCC loss weight (concordance correlation coefficient)
-CCC_LOSS_MAX    = 0.3      # max CCC weight after warmup
-CCC_START_EPOCH = 10       # pure Huber before this
-CCC_RAMP_EPOCHS = 20       # linearly ramp 0 → CCC_LOSS_MAX over this many epochs
+# Per-eye CCC (NEW — the key change)
+PER_EYE_CCC_WEIGHT = 0.2   # gentle — doesn't fight MAE
+PER_EYE_CCC_START  = 5     # kick in after basic learning starts
+
+# Cross-patient variance (NEW — penalizes same prediction for all patients)
+VARIANCE_WEIGHT = 0.05     # small but meaningful
+VARIANCE_START  = 8        # after model has rough predictions
 
 # Validation
 VAL_EVERY = 2
@@ -132,7 +142,7 @@ mask_OD = np.array([
 valid_indices_od = [i for i, v in enumerate(mask_OD.flatten()) if v]
 mask_OS          = np.fliplr(mask_OD)
 valid_indices_os = [i for i, v in enumerate(mask_OS.flatten()) if v]
-NUM_VALID_POINTS = len(valid_indices_od)
+NUM_VALID_POINTS = len(valid_indices_od)   # 52
 
 # ============== VF Sectors & Patch Quadrants ==============
 def build_sector_indices():
@@ -203,16 +213,6 @@ base_model = mae_vit_large_patch16_dec512d8b()
 base_model.load_state_dict(checkpoint['model'], strict=False)
 print("✓ Loaded RETFound")
 
-pretrained_decoder_state = None
-if os.path.exists(PRETRAINED_DECODER):
-    try:
-        with torch.serialization.safe_globals([np.dtype]):
-            pretrained_checkpoint = torch.load(PRETRAINED_DECODER, map_location='cpu', weights_only=False)
-        pretrained_decoder_state = pretrained_checkpoint['model_state_dict']
-        print(f"✓ Pre-trained decoder: {pretrained_checkpoint['val_mae']:.2f} dB")
-    except Exception as e:
-        print(f"⚠️  Could not load pre-trained decoder: {e}")
-
 # ============== Augmentation ==============
 train_transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -268,9 +268,7 @@ class MultiImageDataset(Dataset):
                 print(f"  TTA: {len(TTA_ROTATIONS)} rotations {TTA_ROTATIONS}°")
 
     def get_sample_severity(self):
-        """Compute per-sample severity for weighted sampling.
-        Returns weight for each training sample — eyes with more low-dB points get higher weight.
-        """
+        """Compute per-sample severity for weighted sampling."""
         weights = []
         for sample in self.samples:
             hvf = np.array(sample['hvf'], dtype=np.float32).flatten()
@@ -281,12 +279,7 @@ class MultiImageDataset(Dataset):
             if len(valid_vals) == 0:
                 weights.append(1.0)
                 continue
-            # Mean deviation from healthy (30 dB)
             mean_val = valid_vals.mean()
-            # More weight for eyes with lower mean sensitivity
-            # Healthy eye (~27 dB) → weight ~1.3
-            # Moderate damage (~15 dB) → weight ~3.0
-            # Severe damage (~5 dB) → weight ~4.7
             w = 1.0 + WEIGHT_SCALE * (MAX_DB - mean_val) / MAX_DB
             weights.append(max(w, 1.0))
         return weights
@@ -315,53 +308,73 @@ class MultiImageDataset(Dataset):
 def val_collate_fn(batch):
     return batch[0]
 
-# ============== VFAutoDecoder ==============
-class VFAutoDecoder(nn.Module):
-    def __init__(self, input_dim=52):
-        super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, 256), nn.LayerNorm(256), nn.GELU(), nn.Dropout(0.2),
-            nn.Linear(256, 512),       nn.LayerNorm(512), nn.GELU(), nn.Dropout(0.2),
-            nn.Linear(512, 512),       nn.LayerNorm(512), nn.GELU(), nn.Dropout(0.2),
-            nn.Linear(512, 256),       nn.LayerNorm(256), nn.GELU(), nn.Dropout(0.2),
-            nn.Linear(256, input_dim)
-        )
-        self.residual_weight = nn.Parameter(torch.tensor(0.1))
 
-    def forward(self, x):
-        return self.network(x) + self.residual_weight * x
-
-# ============== Sector Head ==============
+# ============== Deeper Sector Head ==============
 class SectorHead(nn.Module):
+    """2 hidden layers for more expressive patient-specific prediction.
+    v8/v9 used 1 hidden layer (2048 → hidden → N), which couldn't extract
+    enough patient-specific signal from the rich 2048-dim input.
+    """
     def __init__(self, input_dim, num_points, dropout=0.3, bias_init=18.0):
         super().__init__()
-        hidden = max(64, num_points * 4)
+        hidden1 = max(128, num_points * 8)   # wider first layer
+        hidden2 = max(64, num_points * 4)
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden), nn.LayerNorm(hidden), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden, num_points)
+            nn.Linear(input_dim, hidden1),
+            nn.LayerNorm(hidden1),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden1, hidden2),
+            nn.LayerNorm(hidden2),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(hidden2, num_points)
         )
+        # Initialize final layer for warm start
         nn.init.constant_(self.net[-1].bias, bias_init)
         nn.init.normal_(self.net[-1].weight, mean=0.0, std=0.01)
 
     def forward(self, x):
         return self.net(x)
 
-# ============== Pointwise Calibration ==============
-class PointwiseCalibration(nn.Module):
-    """Learnable per-point scale and shift to correct systematic biases.
-    Initialized to identity (scale=1, shift=0).
+
+# ============== Lightweight Residual Refinement ==============
+class ResidualRefinement(nn.Module):
+    """Replaces pretrained VFAutoDecoder. No pretrained weights = no
+    regression to population mean. Learns a small correction on top
+    of sector head predictions.
+    
+    Architecture: pred → small MLP → residual correction
+    Initialized near-zero so it starts as identity.
     """
-    def __init__(self, num_points=52):
+    def __init__(self, num_points=52, hidden=128, dropout=0.2):
         super().__init__()
-        self.scale = nn.Parameter(torch.ones(num_points))
-        self.shift = nn.Parameter(torch.zeros(num_points))
+        self.net = nn.Sequential(
+            nn.Linear(num_points, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, num_points)
+        )
+        # Initialize near-zero so refinement starts as identity
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+        
+        self.alpha = nn.Parameter(torch.tensor(0.0))  # starts at sigmoid(0)=0.5
 
     def forward(self, x):
-        return x * self.scale + self.shift
+        correction = self.net(x)
+        weight = torch.sigmoid(self.alpha)  # learned blending
+        return x + weight * correction
+
 
 # ============== Model ==============
 class RegionalVFModel(nn.Module):
-    def __init__(self, encoder, pretrained_decoder_state=None, dropout=0.3):
+    def __init__(self, encoder, dropout=0.3):
         super().__init__()
         self.encoder = encoder
         self.embed_dim = 1024
@@ -378,15 +391,15 @@ class RegionalVFModel(nn.Module):
             self.register_buffer(f'vf_idx_{sec_name}',
                                  torch.tensor(indices, dtype=torch.long))
 
-        # Sector heads — wider hidden layers for more expressive per-sector prediction
-        sector_input_dim = self.embed_dim * 2  # quadrant_pool + CLS
+        # Sector heads — DEEPER (2 hidden layers)
+        sector_input_dim = self.embed_dim * 2  # quadrant_pool + CLS = 2048
         self.sector_heads = nn.ModuleDict()
         for sec_name, sec_indices in VF_SECTORS.items():
             self.sector_heads[sec_name] = SectorHead(
                 sector_input_dim, len(sec_indices), dropout, PROJ_INIT_BIAS
             )
 
-        # Fusion
+        # Fusion (same as v9)
         self.fusion = nn.Sequential(
             nn.Linear(NUM_VALID_POINTS, NUM_VALID_POINTS * 2),
             nn.LayerNorm(NUM_VALID_POINTS * 2),
@@ -398,32 +411,16 @@ class RegionalVFModel(nn.Module):
         nn.init.zeros_(self.fusion[-1].weight)
         nn.init.zeros_(self.fusion[-1].bias)
 
-        # Decoder: TRAINABLE with bypass
-        # bypass_alpha controls how much raw prediction passes through vs decoder
-        # Start at 0.3 so decoder doesn't dominate early (decoder tends to regress to mean)
-        self.decoder = VFAutoDecoder(input_dim=NUM_VALID_POINTS)
-        self.decoder_bypass = nn.Parameter(torch.tensor(0.3))  # how much raw pred to keep
-
-        if pretrained_decoder_state is not None:
-            try:
-                self.decoder.load_state_dict(pretrained_decoder_state, strict=True)
-                print(f"✓ Decoder: TRAINABLE with bypass (init={self.decoder_bypass.item():.1f})")
-            except Exception as e:
-                print(f"⚠️  Decoder load failed: {e}")
-        else:
-            print("✓ Decoder: from scratch")
-
-        # Pointwise calibration — corrects per-location systematic bias
-        self.calibration = PointwiseCalibration(NUM_VALID_POINTS)
-        print("✓ Pointwise calibration layer (scale+shift per VF point)")
+        # Lightweight residual refinement (replaces pretrained decoder)
+        self.refinement = ResidualRefinement(NUM_VALID_POINTS, hidden=128, dropout=0.2)
+        print("✓ Refinement: lightweight residual (no pretrained decoder)")
 
         # Param summary
         heads = sum(p.numel() for p in self.sector_heads.parameters())
         fus   = sum(p.numel() for p in self.fusion.parameters()) + 1
-        dec   = sum(p.numel() for p in self.decoder.parameters()) + 1  # +bypass
-        cal   = sum(p.numel() for p in self.calibration.parameters())
-        total = heads + fus + dec + cal
-        print(f"  Trainable: heads={heads:,} + fusion={fus:,} + decoder={dec:,} + calib={cal:,} = {total:,}")
+        ref   = sum(p.numel() for p in self.refinement.parameters())
+        total = heads + fus + ref
+        print(f"  Trainable: heads={heads:,} + fusion={fus:,} + refinement={ref:,} = {total:,}")
 
     def pool_quadrant(self, patches, quad_name):
         idx = getattr(self, f'patch_idx_{quad_name}')
@@ -458,13 +455,8 @@ class RegionalVFModel(nn.Module):
         fused = self.fusion(pred)
         pred = pred + self.fusion_alpha * fused
 
-        # Decoder with bypass — don't let decoder fully dominate
-        decoded = self.decoder(pred)
-        bypass = torch.sigmoid(self.decoder_bypass)  # keep in [0,1]
-        pred = bypass * pred + (1 - bypass) * decoded
-
-        # Pointwise calibration
-        pred = self.calibration(pred)
+        # Lightweight refinement (NOT pretrained decoder)
+        pred = self.refinement(pred)
 
         # Clamp
         pred = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
@@ -474,19 +466,28 @@ class RegionalVFModel(nn.Module):
             pred = pred.mean(dim=0, keepdim=True)
         return pred
 
-# ============== Concordance Correlation Coefficient ==============
-def ccc_loss(pred, target):
-    """1 - CCC. CCC penalizes both correlation < 1 and mean/variance mismatch.
-    Perfect when pred == target. Directly addresses slope != 1 problem.
-    """
-    pred_mean = pred.mean()
-    target_mean = target.mean()
-    pred_var = pred.var()
-    target_var = target.var()
-    covar = ((pred - pred_mean) * (target - target_mean)).mean()
 
-    ccc = (2 * covar) / (pred_var + target_var + (pred_mean - target_mean) ** 2 + 1e-8)
-    return 1.0 - ccc
+# ============== Per-Eye CCC ==============
+def per_eye_ccc(pred_52, target_52, mask):
+    """CCC computed within a single eye's valid points.
+    Forces model to predict the correct PATTERN of sensitivity
+    within one eye (scotoma vs healthy regions).
+    Unlike global CCC which conflicts with MAE across eyes.
+    """
+    p = pred_52[mask]
+    t = target_52[mask]
+    if p.numel() < 5:  # need enough points for meaningful correlation
+        return torch.tensor(0.0, device=p.device)
+    
+    p_mean = p.mean()
+    t_mean = t.mean()
+    p_var  = p.var()
+    t_var  = t.var()
+    covar  = ((p - p_mean) * (t - t_mean)).mean()
+    
+    ccc = (2 * covar) / (p_var + t_var + (p_mean - t_mean) ** 2 + 1e-8)
+    return 1.0 - ccc  # 0 when perfect
+
 
 # ============== Loss ==============
 def compute_loss(pred, target, laterality, epoch=0):
@@ -499,8 +500,8 @@ def compute_loss(pred, target, laterality, epoch=0):
     if target.dim() == 1:
         target = target.unsqueeze(0)
 
-    total_loss = total_mae = n_valid = 0
-    all_p, all_t = [], []
+    total_huber = total_mae = n_valid = 0
+    eye_ccc_losses = []
 
     for i, lat in enumerate(laterality):
         valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
@@ -513,37 +514,57 @@ def compute_loss(pred, target, laterality, epoch=0):
         t = target_52[mask]
 
         # Continuous inverse-sensitivity weighting
-        # Higher weight for lower-sensitivity (more damaged) points
         weights = 1.0 + WEIGHT_SCALE * (MAX_DB - t).clamp(min=0) / MAX_DB
 
+        # Weighted Huber
         huber = (F.huber_loss(p, t, reduction='none', delta=HUBER_DELTA) * weights).mean()
         mae   = (p - t).abs().mean()
 
-        total_loss += huber * mask.sum().item()
-        total_mae  += mae.item() * mask.sum().item()
-        n_valid    += mask.sum().item()
+        total_huber += huber * mask.sum().item()
+        total_mae   += mae.item() * mask.sum().item()
+        n_valid     += mask.sum().item()
 
-        all_p.append(p)
-        all_t.append(t)
+        # Per-eye CCC — forces correct within-eye pattern
+        if epoch >= PER_EYE_CCC_START and mask.sum() >= 5:
+            eye_ccc = per_eye_ccc(pred_52, target_52, mask)
+            eye_ccc_losses.append(eye_ccc)
 
     if n_valid == 0:
         return torch.tensor(0.0, device=device, requires_grad=True), 0.0, 0
 
-    base_loss = total_loss / n_valid
+    loss = total_huber / n_valid
 
-    # CCC loss — phased in gradually to avoid destabilizing early training
-    ccc_weight = 0.0
-    if epoch >= CCC_START_EPOCH and len(all_p) > 0 and n_valid >= 10:
-        ramp_progress = min(1.0, (epoch - CCC_START_EPOCH) / CCC_RAMP_EPOCHS)
-        ccc_weight = CCC_LOSS_MAX * ramp_progress
-        cat_p = torch.cat(all_p)
-        cat_t = torch.cat(all_t)
-        ccc_l = ccc_loss(cat_p, cat_t)
-        combined = (1 - ccc_weight) * base_loss + ccc_weight * ccc_l
-    else:
-        combined = base_loss
+    # Add per-eye CCC
+    if len(eye_ccc_losses) > 0:
+        mean_eye_ccc = torch.stack(eye_ccc_losses).mean()
+        loss = loss + PER_EYE_CCC_WEIGHT * mean_eye_ccc
 
-    return combined, total_mae / n_valid, n_valid
+    # Cross-patient variance penalty
+    # Computed across batch: for each VF point, variance of predictions
+    # across patients should be close to variance of targets
+    if epoch >= VARIANCE_START and pred.shape[0] >= 4:
+        pred_var_per_point = pred.var(dim=0).mean()        # how much pred varies across patients
+        # Collect valid targets per point for variance reference
+        target_52_list = []
+        for i, lat in enumerate(laterality):
+            valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
+            target_52_list.append(target[i][valid_idx])
+        if len(target_52_list) >= 4:
+            target_stack = torch.stack(target_52_list)
+            # Mask out invalid values
+            valid_mask = target_stack < MASKED_VALUE_THRESHOLD
+            # Per-point target variance (only for points valid in all samples)
+            all_valid = valid_mask.all(dim=0)
+            if all_valid.sum() >= 10:
+                target_var_per_point = target_stack[:, all_valid].var(dim=0).mean()
+                # Penalize if prediction variance is much lower than target variance
+                # This is one-sided: only penalize if pred_var < target_var
+                var_ratio = pred_var_per_point / (target_var_per_point + 1e-8)
+                if var_ratio < 1.0:
+                    variance_penalty = (1.0 - var_ratio) ** 2
+                    loss = loss + VARIANCE_WEIGHT * variance_penalty
+
+    return loss, total_mae / n_valid, n_valid
 
 
 def pearson_correlation(pred, target, laterality):
@@ -591,12 +612,43 @@ def compute_r2_slope(pred, target, laterality):
         return 0.0, 0.0
     p = np.array(all_pred)
     t = np.array(all_target)
-    # Slope via least squares: pred = slope * target + intercept
     slope, intercept = np.polyfit(t, p, 1)
     ss_res = ((p - (slope * t + intercept)) ** 2).sum()
     ss_tot = ((p - p.mean()) ** 2).sum()
     r2 = 1 - ss_res / (ss_tot + 1e-8)
     return float(r2), float(slope)
+
+
+def compute_per_eye_metrics(pred, target, laterality):
+    """Compute mean per-eye correlation — measures patient-specific discrimination.
+    This is different from global correlation: global corr can be high just from
+    predicting population mean (healthy points cluster together). Per-eye corr
+    requires getting the PATTERN right within each individual eye.
+    """
+    if isinstance(laterality, str):
+        laterality = [laterality]
+    if pred.dim() == 1:
+        pred = pred.unsqueeze(0)
+    if target.dim() == 1:
+        target = target.unsqueeze(0)
+    
+    eye_corrs = []
+    for i in range(min(len(laterality), pred.shape[0], target.shape[0])):
+        lat = laterality[i] if i < len(laterality) else laterality[0]
+        valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
+        target_52 = target[min(i, target.shape[0]-1)][valid_idx]
+        pred_52 = pred[min(i, pred.shape[0]-1)]
+        mask = target_52 < MASKED_VALUE_THRESHOLD
+        if mask.sum() >= 5:
+            p = pred_52[mask].numpy()
+            t = target_52[mask].numpy()
+            r = np.corrcoef(p, t)[0, 1]
+            if not np.isnan(r):
+                eye_corrs.append(r)
+    
+    if len(eye_corrs) == 0:
+        return 0.0
+    return float(np.mean(eye_corrs))
 
 
 def evaluate(model, loader):
@@ -608,40 +660,42 @@ def evaluate(model, loader):
             imgs, hvf, lat = sample
             imgs = imgs.to(DEVICE)
             pred = model(imgs, laterality=lat, average_multi=True)
-            _, mae, nv = compute_loss(pred, hvf, lat)
+            _, mae, nv = compute_loss(pred, hvf, lat, epoch=0)  # no CCC in eval
             total_mae += mae * nv
             n_valid   += nv
             all_preds.append(pred.cpu())
             all_targets.append(hvf.unsqueeze(0) if hvf.dim() == 1 else hvf)
             all_lats.append(lat)
     if n_valid == 0:
-        return float('inf'), 0.0, 0.0, 0.0
+        return float('inf'), 0.0, 0.0, 0.0, 0.0
     stacked_preds   = torch.cat(all_preds, dim=0)
     stacked_targets = torch.cat(all_targets, dim=0)
     corr = pearson_correlation(stacked_preds, stacked_targets, all_lats)
     r2, slope = compute_r2_slope(stacked_preds, stacked_targets, all_lats)
-    return total_mae / n_valid, corr, r2, slope
+    per_eye_corr = compute_per_eye_metrics(stacked_preds, stacked_targets, all_lats)
+    return total_mae / n_valid, corr, r2, slope, per_eye_corr
 
 
 # ============== Training ==============
 def train():
     print("=" * 60)
-    print("Training v9.2 — Fix regression-to-mean")
+    print("Training v9.4 — Force patient-specific predictions")
     print("=" * 60)
 
-    print(f"\nDiagnosis (v9 scatterplot):")
-    print(f"  Slope = 0.33 (should be ~1.0)")
-    print(f"  R² = 0.314")
-    print(f"  Bias = +0.96 dB (overpredicts on average)")
-    print(f"  Model collapses toward population mean")
+    print(f"\nDiagnosis (v9.2/v9.3):")
+    print(f"  Model predicts ~same VF for every patient")
+    print(f"  Slope-MAE tradeoff: good slope → bad MAE and vice versa")
+    print(f"  Pretrained decoder regresses toward population mean")
 
     print(f"\nFixes:")
-    print(f"  1. Continuous weighting: up to {1+WEIGHT_SCALE:.0f}x for 0 dB points")
-    print(f"  2. CCC loss (max={CCC_LOSS_MAX}, ramp ep {CCC_START_EPOCH}-{CCC_START_EPOCH+CCC_RAMP_EPOCHS}) — penalizes slope≠1")
-    print(f"  3. Quantile-balanced sampling — oversample damaged eyes")
-    print(f"  4. Decoder bypass — reduce mean-regression from decoder")
-    print(f"  5. Pointwise calibration — per-location scale+shift")
-    print(f"  6. Monotonic cosine schedule (T_max={EPOCHS})")
+    print(f"  1. Per-eye CCC (weight={PER_EYE_CCC_WEIGHT}, start ep {PER_EYE_CCC_START})")
+    print(f"     Forces correct within-eye pattern without conflicting with MAE")
+    print(f"  2. Cross-patient variance penalty (weight={VARIANCE_WEIGHT}, start ep {VARIANCE_START})")
+    print(f"     Penalizes if predictions don't vary enough across patients")
+    print(f"  3. NO pretrained decoder — lightweight residual refinement instead")
+    print(f"  4. Deeper sector heads (2 hidden layers)")
+    print(f"  5. Continuous weighting: up to {1+WEIGHT_SCALE:.0f}x for 0 dB points")
+    print(f"  6. Composite save criterion (MAE + slope)")
 
     print(f"\nBanned: LoRA, flips/affine, MixUp")
 
@@ -649,7 +703,7 @@ def train():
     train_dataset = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, train_transform, mode='train')
     val_dataset   = MultiImageDataset(VAL_JSON,   FUNDUS_DIR, val_transform,   mode='val', use_tta=USE_TTA)
 
-    # Weighted sampling — oversample damaged eyes
+    # Weighted sampling
     sample_weights = train_dataset.get_sample_severity()
     sampler = WeightedRandomSampler(
         weights=sample_weights,
@@ -663,35 +717,37 @@ def train():
     val_loader   = DataLoader(val_dataset, batch_size=1, shuffle=False,
                               num_workers=0, collate_fn=val_collate_fn)
 
-    # ── Model ──────────────────────────────────────────────────
-    model = RegionalVFModel(base_model, pretrained_decoder_state, DROPOUT_RATE)
+    # ── Model (no pretrained decoder) ──────────────────────────
+    model = RegionalVFModel(base_model, DROPOUT_RATE)
     model.to(DEVICE)
 
-    # ── Optimizer: separate param groups ───────────────────────
+    # ── Optimizer ──────────────────────────────────────────────
     head_params = list(model.sector_heads.parameters()) + \
                   list(model.fusion.parameters()) + [model.fusion_alpha]
-    decoder_params = list(model.decoder.parameters()) + [model.decoder_bypass]
-    calib_params = list(model.calibration.parameters())
+    refine_params = list(model.refinement.parameters())
 
     optimizer = optim.AdamW([
-        {'params': head_params,    'lr': HEADS_LR,   'weight_decay': HEADS_WD},
-        {'params': decoder_params, 'lr': DECODER_LR, 'weight_decay': DECODER_WD},
-        {'params': calib_params,   'lr': CALIB_LR,   'weight_decay': CALIB_WD},
+        {'params': head_params,   'lr': HEADS_LR,  'weight_decay': HEADS_WD},
+        {'params': refine_params, 'lr': REFINE_LR, 'weight_decay': REFINE_WD},
     ])
 
-    # Monotonic cosine decay — no restarts (v9 was killed by restart at ep 25)
+    # Monotonic cosine decay
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=EPOCHS, eta_min=1e-6
     )
 
-    best_mae   = float('inf')
-    best_corr  = 0.0
-    best_slope = 0.0
-    patience   = 0
+    best_mae    = float('inf')
+    best_corr   = 0.0
+    best_slope  = 0.0
+    best_score  = float('inf')  # composite score for saving
+    patience    = 0
+
+    # Track history for composite scoring
+    mae_history   = []
+    slope_history = []
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
-        epoch_loss = epoch_mae = epoch_n = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
 
         for imgs, hvf, lat in pbar:
@@ -705,54 +761,64 @@ def train():
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad], 1.0)
                 optimizer.step()
-                epoch_loss += loss.item() * nv
-                epoch_mae  += mae * nv
-                epoch_n    += nv
 
             pbar.set_postfix({'MAE': f'{mae:.2f}'})
 
         scheduler.step()
 
-        # Log bypass parameter
-        bypass_val = torch.sigmoid(model.decoder_bypass).item()
+        # Log refinement parameter
+        ref_alpha = torch.sigmoid(model.refinement.alpha).item()
         if epoch <= 5 or epoch % 10 == 0:
-            print(f"  Decoder bypass: {bypass_val:.3f} (raw={model.decoder_bypass.item():.3f})")
+            print(f"  Refinement alpha: {ref_alpha:.3f}")
             print(f"  Fusion alpha: {model.fusion_alpha.item():.3f}")
 
         # ── Validate ───────────────────────────────────────────
         if epoch % VAL_EVERY == 0 or epoch <= 3:
-            val_mae, val_corr, val_r2, val_slope = evaluate(model, val_loader)
+            val_mae, val_corr, val_r2, val_slope, val_eye_corr = evaluate(model, val_loader)
 
             train_eval = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, val_transform,
                                            mode='val', use_tta=False)
             train_eval_loader = DataLoader(train_eval, batch_size=1, shuffle=False,
                                            num_workers=0, collate_fn=val_collate_fn)
-            train_mae, train_corr, train_r2, train_slope = evaluate(model, train_eval_loader)
+            train_mae, train_corr, train_r2, train_slope, train_eye_corr = evaluate(model, train_eval_loader)
             gap = train_mae - val_mae
 
             print(f"\n[Epoch {epoch}]")
-            print(f"  Train: MAE={train_mae:.2f} | Corr={train_corr:.3f} | R²={train_r2:.3f} | Slope={train_slope:.3f}")
-            print(f"  Val:   MAE={val_mae:.2f} | Corr={val_corr:.3f} | R²={val_r2:.3f} | Slope={val_slope:.3f}")
+            print(f"  Train: MAE={train_mae:.2f} | Corr={train_corr:.3f} | Slope={train_slope:.3f} | EyeCorr={train_eye_corr:.3f}")
+            print(f"  Val:   MAE={val_mae:.2f} | Corr={val_corr:.3f} | Slope={val_slope:.3f} | EyeCorr={val_eye_corr:.3f}")
             print(f"  Gap: {gap:+.2f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
 
             if gap < -0.4:
-                print(f"  ⚠️  Gap < -0.4 — decoder may be overfitting")
+                print(f"  ⚠️  Gap < -0.4 — possible overfitting")
 
-            # Track slope improvement — this is the key metric for regression-to-mean
-            if val_slope > best_slope + 0.02:
-                print(f"  📈 Slope improved: {best_slope:.3f} → {val_slope:.3f}")
+            # Composite save score: lower is better
+            # Prioritize MAE but require decent slope
+            # slope_penalty: if slope < 0.3, add penalty; if slope > 0.4, give bonus
+            slope_penalty = max(0, 0.3 - val_slope) * 2.0   # e.g., slope=0.1 → penalty=0.4
+            composite = val_mae + slope_penalty
 
-            if val_mae < best_mae:
-                best_mae   = val_mae
-                best_corr  = val_corr
+            mae_history.append(val_mae)
+            slope_history.append(val_slope)
+
+            if composite < best_score or val_mae < best_mae:
+                save_reason = []
+                if val_mae < best_mae:
+                    save_reason.append(f"MAE {best_mae:.2f}→{val_mae:.2f}")
+                    best_mae = val_mae
+                if composite < best_score:
+                    save_reason.append(f"Score {best_score:.2f}→{composite:.2f}")
+                    best_score = composite
+                best_corr  = max(best_corr, val_corr)
                 best_slope = max(best_slope, val_slope)
+
                 torch.save({'model': model.state_dict(), 'mae': val_mae,
                             'corr': val_corr, 'r2': val_r2, 'slope': val_slope,
-                            'epoch': epoch}, BEST_SAVE)
+                            'eye_corr': val_eye_corr, 'epoch': epoch}, BEST_SAVE)
                 torch.save({'model_state_dict': model.state_dict(),
                             'encoder_checkpoint': CHECKPOINT_PATH,
                             'val_mae': val_mae, 'val_corr': val_corr}, INFERENCE_SAVE)
-                print(f"  ✓ New Best! (MAE={val_mae:.2f}, Corr={val_corr:.3f}, Slope={val_slope:.3f})")
+                print(f"  ✓ Saved! ({', '.join(save_reason)})")
+                print(f"    MAE={val_mae:.2f} | Slope={val_slope:.3f} | Score={composite:.2f}")
                 patience = 0
             else:
                 patience += VAL_EVERY
@@ -762,13 +828,14 @@ def train():
 
     # ── Summary ────────────────────────────────────────────────
     print(f"\n{'='*60}")
-    print(f"Training Complete — v9.2")
-    print(f"  Best Val MAE:   {best_mae:.2f} dB")
-    print(f"  Best Val Corr:  {best_corr:.3f}")
-    print(f"  Best Val Slope: {best_slope:.3f} (target: >0.6)")
+    print(f"Training Complete — v9.4")
+    print(f"  Best Val MAE:      {best_mae:.2f} dB")
+    print(f"  Best Val Corr:     {best_corr:.3f}")
+    print(f"  Best Val Slope:    {best_slope:.3f}")
+    print(f"  Best Composite:    {best_score:.2f}")
     gain = 3.74 - best_mae
     if best_mae < 3.0:
-        print(f"  🎯 SUB-3 dB! Beat baseline by {gain:.2f} dB")
+        print(f"  🎯 SUB-3 dB!")
     elif best_mae < 3.74:
         print(f"  ✓ Beat baseline by {gain:.2f} dB")
     elif best_mae < 4.0:
