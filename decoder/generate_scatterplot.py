@@ -360,8 +360,21 @@ def main():
     # ── Plot ──────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(8, 8))
 
-    cmap   = plt.cm.RdYlGn_r
-    norm   = mcolors.Normalize(vmin=0, vmax=10)
+    # Custom colormap: dark green (0 dB error) → muted gold (5 dB) → slate/brown (10 dB).
+    # Replaces the neon yellow of RdYlGn_r with a darker gold that prints clearly,
+    # and replaces the saturated red with a muted slate-brown to reduce visual dominance.
+    cmap = mcolors.LinearSegmentedColormap.from_list(
+        'vf_err',
+        [
+            '#1a7d3a',   # 0 dB  — deep green
+            '#5aab4e',   # 2 dB  — mid green
+            '#b5b800',   # 4 dB  — dark olive-gold (replaces neon yellow)
+            '#c97a20',   # 6 dB  — warm amber-orange
+            '#8b4a3a',   # 8 dB  — muted rust
+            '#5c3348',   # 10 dB — dark plum-brown (replaces bright red)
+        ]
+    )
+    norm = mcolors.Normalize(vmin=0, vmax=10)
 
     sc = ax.scatter(
         all_true, all_pred,
@@ -377,7 +390,7 @@ def main():
 
     x_line = np.linspace(lim[0], lim[1], 200)
     y_line = slope * x_line + intercept
-    ax.plot(x_line, y_line, 'r-', linewidth=2,
+    ax.plot(x_line, y_line, color='#1a5276', linewidth=2,
             label=f'Fit: y={slope:.2f}x+{intercept:.2f} (R²={r2:.3f})', zorder=4)
 
     cb = plt.colorbar(sc, ax=ax, pad=0.02)
