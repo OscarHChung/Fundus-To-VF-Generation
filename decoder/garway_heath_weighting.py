@@ -462,8 +462,13 @@ def _load_perpoint_model(model_path, device):
 
     Reuses training.py's encoder load + model class (single 1.2 GB encoder load)."""
     import training as T  # noqa: heavy import; loads RETFound encoder once
-    model = T.PerPointVFModel(T.base_model)
     ckpt  = torch.load(model_path, map_location="cpu", weights_only=False)
+    # Honor the distributional-head config saved at train time, so evaluation
+    # uses the SAME blended prediction that was trained/validated (not the
+    # scalar head alone). Defaults reproduce the original scalar model.
+    use_dist   = bool(ckpt.get("use_dist", False))
+    dist_blend = float(ckpt.get("dist_blend", 0.5))
+    model = T.PerPointVFModel(T.base_model, use_dist=use_dist, dist_blend=dist_blend)
     state = ckpt.get("model_state_dict", ckpt.get("model", ckpt))
     model.load_state_dict(state, strict=False)
     model.to(device)

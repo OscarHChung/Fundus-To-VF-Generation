@@ -109,6 +109,32 @@ FORCE_VAL_EVERY = 10    # validate every N epochs regardless of gate (sanity / m
 # Clipping
 OUTLIER_CLIP_RANGE = (0, 35)
 
+# ══════════════════════════════════════════════════════════════
+# TIER-1 IMPROVEMENTS (opt-in; see decoder/specs/severe_point_improvement_plan.md)
+# ══════════════════════════════════════════════════════════════
+# M1 — Distributional / ordinal per-point head.
+#   The scalar Huber head structurally regresses rare deep points toward the
+#   mean (RC-1). A parallel head predicts a DISTRIBUTION over dB bins trained
+#   with soft cross-entropy, whose gradient pulls mass to the correct deep bin
+#   regardless of rarity. Final pred = (1-blend)*scalar + blend*E[dist].
+DIST_BIN_CENTERS = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 13.0, 16.0,
+                    20.0, 24.0, 28.0, 32.0, 35.0]   # 13 bins, finer near the floor
+DIST_LABEL_SIGMA = 3.0     # dB; width of the Gaussian soft label over bin centers
+DIST_HIDDEN      = 128     # small head to limit added params on 211 eyes
+DIST_BLEND       = 0.5     # default weight on E[dist] in the blended prediction
+DIST_LOSS_WEIGHT = 0.5     # default λ on the soft-CE term in compute_loss
+
+# M2 — Label-Distribution-Smoothing (LDS) reweighting.
+#   Replaces the hand-tuned value weight + floor_boost with a principled
+#   inverse-(smoothed)-density weight derived from the train label distribution.
+LDS_SIGMA_DB = 2.0         # dB; Gaussian kernel σ for smoothing the label density
+LDS_MAX_WEIGHT = 6.0       # cap on any single bin's weight (post-norm headroom ~+25%)
+
+# Goal-aware self-stop — give up when the run is clearly not going to hit target.
+SUBGOAL_TARGET_MAE     = 4.0    # the MAE we are trying to beat (sub-4)
+GOAL_PLATEAU_CHECKS    = 8      # val checks of no MEANINGFUL gain before stopping
+GOAL_PLATEAU_MIN_DELTA = 0.05   # dB; improvement smaller than this doesn't count
+
 # ── Paths ──────────────────────────────────────────────────────
 CURRENT_DIR        = os.path.dirname(os.path.abspath(__file__))
 RETFOUND_DIR       = os.path.join(CURRENT_DIR, '..', 'encoder', 'RETFound_MAE')
@@ -347,6 +373,95 @@ class PerPointAttention(nn.Module):
 
 
 # ============== Point-wise Prediction Head ==============
+# ══════════════════════════════════════════════════════════════
+# TIER-1 HELPERS — distributional head + LDS reweighting (pure functions)
+# ══════════════════════════════════════════════════════════════
+def dist_bin_centers(device=None):
+    """Fixed dB bin centers for the distributional head, as a tensor."""
+    t = torch.tensor(DIST_BIN_CENTERS, dtype=torch.float32)
+    return t.to(device) if device is not None else t
+
+
+def build_soft_targets(values, centers, sigma=DIST_LABEL_SIGMA):
+    """Gaussian soft labels over `centers` for each true value (DLDL-style).
+
+    values (...,) true dB → (..., K) row-normalized distribution peaked at the
+    nearest bin. This is label-smoothing in value space: deep bins receive
+    gradient without the mean-collapse that L1/Huber imposes on rare values."""
+    values = values.to(centers.device).unsqueeze(-1)             # (...,1)
+    logits = -((centers - values) ** 2) / (2.0 * sigma * sigma)  # (...,K)
+    return torch.softmax(logits, dim=-1)
+
+
+def dist_expectation(logits, centers):
+    """E[value] under softmax(logits) over `centers`. logits (...,K) → (...)."""
+    centers = centers.to(logits.device)
+    return (torch.softmax(logits, dim=-1) * centers).sum(dim=-1)
+
+
+def dist_soft_ce(logits, values, centers, sigma=DIST_LABEL_SIGMA, weight=None):
+    """Soft cross-entropy between the predicted bin distribution and the Gaussian
+    soft target for each true value. logits (N,K), values (N,), optional
+    per-point `weight` (N,). Returns a scalar."""
+    centers = centers.to(logits.device)
+    soft = build_soft_targets(values, centers, sigma)           # (N,K)
+    logp = torch.log_softmax(logits, dim=-1)                    # (N,K)
+    ce = -(soft * logp).sum(dim=-1)                             # (N,)
+    if weight is not None:
+        weight = weight.to(ce.device)
+        return (ce * weight).sum() / (weight.sum() + 1e-8)
+    return ce.mean()
+
+
+def compute_lds_weights(values, sigma_db=LDS_SIGMA_DB, vmin=0.0, vmax=35.0,
+                        max_weight=LDS_MAX_WEIGHT):
+    """Label-Distribution-Smoothing per-bin loss weights (Yang et al. 2021).
+
+    1-dB bins over [vmin,vmax); empirical density → Gaussian-smoothed density →
+    inverse → normalized so the empirical-weighted mean is 1 (keeps loss on the
+    dB scale). Weights are CAPPED at `max_weight` (then re-normalized) so a rare
+    deep/near-empty bin can't blow up the batch loss — the bias-oscillation risk
+    on a 211-eye set. The principled replacement for value weight + floor_boost."""
+    values = np.asarray(values, dtype=np.float64)
+    edges  = np.arange(vmin, vmax + 1e-6, 1.0)
+    counts, _ = np.histogram(np.clip(values, vmin, vmax - 1e-6), bins=edges)
+    counts = counts.astype(np.float64)
+    radius = max(1, int(round(3 * sigma_db)))
+    kx = np.arange(-radius, radius + 1)
+    kernel = np.exp(-(kx ** 2) / (2.0 * sigma_db * sigma_db))
+    kernel /= kernel.sum()
+    smooth = np.convolve(counts, kernel, mode='same')
+    raw = 1.0 / (smooth + 1e-6)
+    N = counts.sum()
+    emp_mean = (counts * raw).sum() / (N + 1e-8)                # weighted mean
+    w = raw / (emp_mean + 1e-8)                                 # → mean 1
+    if max_weight is not None:
+        w = np.minimum(w, max_weight)                          # cap extremes
+        emp2 = (counts * w).sum() / (N + 1e-8)
+        w = w / (emp2 + 1e-8)                                  # restore mean 1
+    return torch.tensor(w, dtype=torch.float32)
+
+
+def lds_lookup(weights, values):
+    """Per-point LDS weight: bin each value (1-dB bins) and gather. values any
+    shape → same shape. Clamped to the valid bin range."""
+    idx = torch.clamp(values.long(), 0, weights.numel() - 1)
+    return weights.to(values.device)[idx]
+
+
+def load_train_db_values(json_path):
+    """Flatten all valid (unmasked) dB sensitivities from a GRAPE-format JSON.
+    Used once at startup to build the LDS weights from the train distribution."""
+    with open(json_path) as f:
+        data = json.load(f)
+    records = data.values() if isinstance(data, dict) else data
+    vals = []
+    for rec in records:
+        arr = np.array(rec['hvf'], dtype=np.float32).flatten()
+        vals.extend(arr[arr < MASKED_VALUE_THRESHOLD].tolist())
+    return np.array(vals, dtype=np.float32)
+
+
 class PointHead(nn.Module):
     def __init__(self, input_dim=2048, hidden=256, dropout=0.4, bias_init=18.0):
         super().__init__()
@@ -366,6 +481,30 @@ class PointHead(nn.Module):
     
     def forward(self, x):
         return self.net(x).squeeze(-1)
+
+
+# ============== Distributional Point Head (M1) ==============
+class DistPointHead(nn.Module):
+    """Per-point distribution over dB bins, shared across all 52 points.
+
+    Trained with soft cross-entropy (dist_soft_ce); its gradient pulls mass to
+    the correct deep bin regardless of rarity, so deep points are not collapsed
+    toward the mean the way the scalar Huber head collapses them (RC-1)."""
+    def __init__(self, input_dim=2048, hidden=DIST_HIDDEN,
+                 n_bins=len(DIST_BIN_CENTERS), dropout=0.4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, n_bins),
+        )
+        nn.init.normal_(self.net[-1].weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x):
+        return self.net(x)   # (...,K) logits
 
 
 # ============== Cross-Point Refinement ==============
@@ -390,15 +529,15 @@ class CrossPointRefinement(nn.Module):
 
 # ============== Full Model ==============
 class PerPointVFModel(nn.Module):
-    def __init__(self, encoder):
+    def __init__(self, encoder, use_dist=False, dist_blend=DIST_BLEND):
         super().__init__()
         self.encoder = encoder
         self.embed_dim = 1024
-        
+
         for p in self.encoder.parameters():
             p.requires_grad = False
         print("✓ Encoder: FROZEN")
-        
+
         self.attention = PerPointAttention(
             embed_dim=self.embed_dim,
             num_points=NUM_VALID_POINTS,
@@ -406,7 +545,7 @@ class PerPointVFModel(nn.Module):
             dropout=ATTN_DROPOUT
         )
         print(f"✓ Per-point attention (dropout={ATTN_DROPOUT}, temp_init={ATTN_TEMP_INIT})")
-        
+
         self.point_head = PointHead(
             input_dim=self.embed_dim * 2,
             hidden=256,
@@ -414,40 +553,74 @@ class PerPointVFModel(nn.Module):
             bias_init=PROJ_INIT_BIAS
         )
         print(f"✓ Shared point head (dropout={HEAD_DROPOUT})")
-        
+
+        # M1 — distributional head. Always built (so checkpoints load with
+        # strict=False either way); only USED when use_dist=True.
+        self.use_dist   = use_dist
+        self.dist_blend = dist_blend
+        self.dist_head  = DistPointHead(input_dim=self.embed_dim * 2,
+                                        hidden=DIST_HIDDEN,
+                                        n_bins=len(DIST_BIN_CENTERS),
+                                        dropout=HEAD_DROPOUT)
+        self.register_buffer('dist_centers',
+                             torch.tensor(DIST_BIN_CENTERS, dtype=torch.float32))
+        self._last_dist_logits = None
+        if use_dist:
+            print(f"✓ Distributional head ON (bins={len(DIST_BIN_CENTERS)}, "
+                  f"blend={dist_blend})")
+
         self.refinement = CrossPointRefinement(NUM_VALID_POINTS, hidden=104, dropout=REFINE_DROPOUT)
         print("✓ Cross-point refinement")
-        
+
         attn_p = sum(p.numel() for p in self.attention.parameters())
         head_p = sum(p.numel() for p in self.point_head.parameters())
         ref_p  = sum(p.numel() for p in self.refinement.parameters())
         total  = attn_p + head_p + ref_p
-        print(f"  Trainable: attention={attn_p:,} + head={head_p:,} + refinement={ref_p:,} = {total:,}")
-    
+        if use_dist:
+            dist_p = sum(p.numel() for p in self.dist_head.parameters())
+            total += dist_p
+            print(f"  Trainable: attention={attn_p:,} + head={head_p:,} + "
+                  f"dist={dist_p:,} + refinement={ref_p:,} = {total:,}")
+        else:
+            print(f"  Trainable: attention={attn_p:,} + head={head_p:,} + refinement={ref_p:,} = {total:,}")
+
+    def _apply_heads(self, point_feats, cls_token, B):
+        """Scalar (+ optional distributional) heads → blended per-point pred.
+        Stores the per-image dist logits on self._last_dist_logits."""
+        cls_expanded = cls_token.unsqueeze(1).expand(B, NUM_VALID_POINTS, self.embed_dim)
+        combined = torch.cat([point_feats, cls_expanded], dim=2)
+        scalar = self.point_head(combined)                          # (B,52)
+        if self.use_dist:
+            logits = self.dist_head(combined)                       # (B,52,K)
+            e = dist_expectation(logits, self.dist_centers)         # (B,52)
+            pred = (1.0 - self.dist_blend) * scalar + self.dist_blend * e
+            self._last_dist_logits = logits
+        else:
+            pred = scalar
+            self._last_dist_logits = None
+        return pred
+
+    def _finish(self, pred, average_multi):
+        pred = self.refinement(pred)
+        pred = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
+        pred = torch.clamp(pred, OUTLIER_CLIP_RANGE[0], OUTLIER_CLIP_RANGE[1])
+        if average_multi and pred.shape[0] > 1:
+            pred = pred.mean(dim=0, keepdim=True)
+        return pred
+
     def forward(self, x, laterality='OD', average_multi=True):
         if x.dim() != 4:
             raise ValueError(f"Expected 4D input, got {x.shape}")
-        
+
         with torch.no_grad():
             latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
         cls_token = latent[:, 0, :]
         patches   = latent[:, 1:, :]
-        
+
         point_feats, attn_weights = self.attention(patches, laterality)
-        
-        B = x.shape[0]
-        cls_expanded = cls_token.unsqueeze(1).expand(B, NUM_VALID_POINTS, self.embed_dim)
-        combined = torch.cat([point_feats, cls_expanded], dim=2)
-        
-        pred = self.point_head(combined)
-        pred = self.refinement(pred)
-        
-        pred = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
-        pred = torch.clamp(pred, OUTLIER_CLIP_RANGE[0], OUTLIER_CLIP_RANGE[1])
-        
-        if average_multi and pred.shape[0] > 1:
-            pred = pred.mean(dim=0, keepdim=True)
-        
+        pred = self._apply_heads(point_feats, cls_token, x.shape[0])
+        pred = self._finish(pred, average_multi)
+
         # Store attention weights for regularization (only during training)
         self._last_attn_weights = attn_weights
 
@@ -458,19 +631,13 @@ class PerPointVFModel(nn.Module):
 
         Skips the frozen 1.2 GB RETFound encoder entirely — used by
         evaluate_from_cache() so val/train-eval passes cost only the small
-        attention + head + refinement modules (~1 M params, ~50× faster)."""
+        attention + head + refinement modules (~1 M params, ~50× faster).
+        Applies the same scalar/dist blend as forward()."""
         cls_token = latent[:, 0, :]
         patches   = latent[:, 1:, :]
         point_feats, attn_weights = self.attention(patches, laterality)
-        B = latent.shape[0]
-        cls_expanded = cls_token.unsqueeze(1).expand(B, NUM_VALID_POINTS, self.embed_dim)
-        combined = torch.cat([point_feats, cls_expanded], dim=2)
-        pred = self.point_head(combined)
-        pred = self.refinement(pred)
-        pred = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
-        pred = torch.clamp(pred, OUTLIER_CLIP_RANGE[0], OUTLIER_CLIP_RANGE[1])
-        if average_multi and pred.shape[0] > 1:
-            pred = pred.mean(dim=0, keepdim=True)
+        pred = self._apply_heads(point_feats, cls_token, latent.shape[0])
+        pred = self._finish(pred, average_multi)
         self._last_attn_weights = attn_weights
         return pred
 
@@ -511,7 +678,8 @@ def attention_entropy_loss(attn_weights):
 
 # ============== Loss ==============
 def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
-                 sector_weights=None, sector_combine='both', deep_cfg=None):
+                 sector_weights=None, sector_combine='both', deep_cfg=None,
+                 dist_logits=None, dist_cfg=None, lds_weights=None):
     """Weighted Huber loss (+ CCC / variance / attention-entropy terms).
 
     Garway–Heath sector weighting is opt-in and fully backward-compatible:
@@ -540,6 +708,7 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
         target = target.unsqueeze(0)
 
     total_huber = total_mae = n_valid = 0
+    total_dist_ce = 0.0
     eye_ccc_losses = []
 
     for i, lat in enumerate(laterality):
@@ -552,15 +721,19 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
         p = pred_52[mask]
         t = target_52[mask]
 
-        # Existing value-based (severity) weight.
-        value_w = 1.0 + WEIGHT_SCALE * (MAX_DB - t).clamp(min=0) / MAX_DB
-        # Deep-floor boost (goal-1 rescue) — additive extra weight on the deepest
-        # GT points, layered onto the severity weight. deep_cfg=None (baseline)
-        # leaves value_w untouched.
-        if deep_cfg is not None and deep_cfg.get('floor_boost', 0.0) > 0:
-            floor_db = deep_cfg['floor_db']
-            value_w = value_w + deep_cfg['floor_boost'] * \
-                      (floor_db - t).clamp(min=0) / floor_db
+        if lds_weights is not None:
+            # M2 — LDS inverse-density weight (replaces value weight + floor_boost).
+            value_w = lds_lookup(lds_weights, t)
+        else:
+            # Existing value-based (severity) weight.
+            value_w = 1.0 + WEIGHT_SCALE * (MAX_DB - t).clamp(min=0) / MAX_DB
+            # Deep-floor boost (goal-1 rescue) — additive extra weight on the
+            # deepest GT points, layered onto the severity weight. deep_cfg=None
+            # (baseline) leaves value_w untouched.
+            if deep_cfg is not None and deep_cfg.get('floor_boost', 0.0) > 0:
+                floor_db = deep_cfg['floor_db']
+                value_w = value_w + deep_cfg['floor_boost'] * \
+                          (floor_db - t).clamp(min=0) / floor_db
         # New spatial (Garway–Heath) weight, layered in behind the flag.
         if sector_weights is not None:
             eye = 'OD' if lat.startswith('OD') else 'OS'
@@ -590,6 +763,16 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
         total_mae   += mae.item() * mask.sum().item()
         n_valid     += mask.sum().item()
 
+        # M1 — distributional soft cross-entropy on the deep-aware-weighted
+        # points. dist_logits are in query order (same as pred_52), so gather by
+        # the same mask. This term, not the Huber, is what moves deep points.
+        if dist_logits is not None and dist_cfg is not None:
+            dl = dist_logits[i][mask]                            # (nv, K)
+            ce = dist_soft_ce(dl, t, dist_cfg['centers'],
+                              sigma=dist_cfg.get('sigma', DIST_LABEL_SIGMA),
+                              weight=weights.detach())
+            total_dist_ce = total_dist_ce + ce * mask.sum().item()
+
         if epoch >= PER_EYE_CCC_START and mask.sum() >= 5:
             eye_ccc = per_eye_ccc(pred_52, target_52, mask)
             eye_ccc_losses.append(eye_ccc)
@@ -598,6 +781,11 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
         return torch.tensor(0.0, device=device, requires_grad=True), 0.0, 0
 
     loss = total_huber / n_valid
+
+    # M1 — distributional soft-CE term (the geometry-preserving deep-point loss).
+    if dist_logits is not None and dist_cfg is not None and \
+       isinstance(total_dist_ce, torch.Tensor):
+        loss = loss + dist_cfg.get('weight', DIST_LOSS_WEIGHT) * (total_dist_ce / n_valid)
 
     # Per-eye CCC
     if len(eye_ccc_losses) > 0:
@@ -824,7 +1012,7 @@ def evaluate_from_cache(model, cache, device, detailed=False):
     return mae, corr, r2, slope, per_eye_corr, extra
 
 
-def diagnose_training(history):
+def diagnose_training(history, target_mae=SUBGOAL_TARGET_MAE):
     """Inspect the validation trajectory and decide whether to auto-stop with a
     plain-English reason. Pure function of the recorded history dict (lists keyed
     by 'val_mae','val_slope','val_bias','val_floor').
@@ -862,6 +1050,28 @@ def diagnose_training(history):
                       f"to a constant. Ease regularization (dropout/weight-decay) "
                       f"or the variance penalty."), warns
 
+    # Hard stop 4 — goal plateau (clearly won't reach the MAE target). Counts
+    # only MEANINGFUL improvements (>GOAL_PLATEAU_MIN_DELTA) so a trickle of
+    # 0.01 dB gains can't keep a doomed run alive (the loophole seen in run-3).
+    finite_mae = [m for m in mae if np.isfinite(m)]
+    if len(mae) >= GOAL_PLATEAU_CHECKS + 1 and finite_mae:
+        running_best = float('inf')
+        last_improve = 0
+        for idx, m in enumerate(mae):
+            if np.isfinite(m) and m < running_best - GOAL_PLATEAU_MIN_DELTA:
+                running_best = m
+                last_improve = idx
+            elif np.isfinite(m) and m < running_best:
+                running_best = m   # tiny gain updates best but not "last_improve"
+        checks_since = (len(mae) - 1) - last_improve
+        best_so_far  = min(finite_mae)
+        if checks_since >= GOAL_PLATEAU_CHECKS and best_so_far > target_mae + 0.05:
+            return True, (f"GOAL PLATEAU — no meaningful val-MAE gain "
+                          f"(>{GOAL_PLATEAU_MIN_DELTA} dB) for {checks_since} checks; "
+                          f"best {best_so_far:.2f} dB stays above the {target_mae:.1f} dB "
+                          f"target. Further training won't reach it — switch methods "
+                          f"(decoder/specs/severe_point_improvement_plan.md)."), warns
+
     # Soft warnings (printed live; do NOT stop).
     # Guard: require ≥5 checks so uninitialized-model noise doesn't fire these.
     if len(slope) >= 5 and cur_slope < 0.20:
@@ -882,7 +1092,9 @@ def diagnose_training(history):
 
 # ============== Training ==============
 def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
-          out_best=BEST_SAVE, out_inference=INFERENCE_SAVE, deep_cfg=None):
+          out_best=BEST_SAVE, out_inference=INFERENCE_SAVE, deep_cfg=None,
+          use_dist=False, dist_blend=DIST_BLEND, dist_loss_weight=DIST_LOSS_WEIGHT,
+          reweight='value', lds_sigma=LDS_SIGMA_DB, target_mae=SUBGOAL_TARGET_MAE):
     print("=" * 60)
     print("Training v10.2 — Per-point attention + heavy regularization")
     print("=" * 60)
@@ -910,6 +1122,28 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
     else:
         deep_cfg = None
         print("✓ Weighting: baseline (value-based only)")
+
+    # ── Tier-1 improvements (opt-in) ───────────────────────────
+    # M2 — LDS reweighting replaces the value weight + floor_boost with a
+    # principled, capped inverse-density weight from the train distribution.
+    lds_weights = None
+    if reweight == 'lds':
+        vals = load_train_db_values(TRAIN_JSON)
+        lds_weights = compute_lds_weights(vals, sigma_db=lds_sigma).to(DEVICE)
+        deep_cfg = None   # LDS subsumes floor_boost; drop the asymmetric overpred
+                          # penalty that drove the bias oscillation in run-2/3.
+        print(f"✓ M2 LDS reweighting ON (σ={lds_sigma} dB, cap={LDS_MAX_WEIGHT}, "
+              f"range=[{lds_weights.min():.2f},{lds_weights.max():.2f}]) "
+              f"— floor_boost/overpred disabled")
+    # M1 — distributional head + soft-CE term.
+    dist_cfg = None
+    if use_dist:
+        dist_cfg = {'centers': dist_bin_centers(DEVICE),
+                    'sigma': DIST_LABEL_SIGMA, 'weight': dist_loss_weight}
+        print(f"✓ M1 distributional head ON (bins={len(DIST_BIN_CENTERS)}, "
+              f"blend={dist_blend}, ce_weight={dist_loss_weight})")
+    print(f"✓ Goal self-stop: give up if no >{GOAL_PLATEAU_MIN_DELTA} dB val gain "
+          f"for {GOAL_PLATEAU_CHECKS} checks while best > {target_mae} dB")
 
     print(f"\nv10.1 showed: train MAE=3.57 (works!), val MAE=4.02 (overfits)")
     print(f"Same architecture, more regularization to close the gap")
@@ -943,7 +1177,7 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
                               num_workers=0, collate_fn=val_collate_fn)
 
     # ── Model ──────────────────────────────────────────────────
-    model = PerPointVFModel(base_model)
+    model = PerPointVFModel(base_model, use_dist=use_dist, dist_blend=dist_blend)
     model.to(DEVICE)
 
     # ── Pre-cache frozen encoder features (one-time cost) ──────
@@ -966,6 +1200,8 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
     # ── Optimizer ──────────────────────────────────────────────
     attn_head_params = list(model.attention.parameters()) + \
                        list(model.point_head.parameters())
+    if use_dist:
+        attn_head_params += list(model.dist_head.parameters())
     refine_params = list(model.refinement.parameters())
 
     optimizer = optim.AdamW([
@@ -1002,10 +1238,14 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
 
             attn_w = model._last_attn_weights if hasattr(model, '_last_attn_weights') else None
 
+            dist_logits = model._last_dist_logits if use_dist else None
+
             loss, mae, nv = compute_loss(pred, hvf, lat, epoch=epoch, attn_weights=attn_w,
                                          sector_weights=sector_weights,
                                          sector_combine=sector_combine,
-                                         deep_cfg=deep_cfg)
+                                         deep_cfg=deep_cfg,
+                                         dist_logits=dist_logits, dist_cfg=dist_cfg,
+                                         lds_weights=lds_weights)
 
             if nv > 0:
                 optimizer.zero_grad()
@@ -1069,7 +1309,7 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
             if gap < -0.4:
                 print(f"  ⚠️  Gap < -0.4 — possible overfitting")
 
-            should_stop, stop_reason, warns = diagnose_training(history)
+            should_stop, stop_reason, warns = diagnose_training(history, target_mae=target_mae)
             for w in warns:
                 print(f"  ⚠️  {w}")
 
@@ -1091,10 +1331,12 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
                               'deep_mae': val_deep}
                 torch.save({'model': model.state_dict(), 'mae': val_mae,
                             'corr': val_corr, 'r2': val_r2, 'slope': val_slope,
-                            'eye_corr': val_eye_corr, 'epoch': epoch}, out_best)
+                            'eye_corr': val_eye_corr, 'epoch': epoch,
+                            'use_dist': use_dist, 'dist_blend': dist_blend}, out_best)
                 torch.save({'model_state_dict': model.state_dict(),
                             'encoder_checkpoint': CHECKPOINT_PATH,
-                            'val_mae': val_mae, 'val_corr': val_corr}, out_inference)
+                            'val_mae': val_mae, 'val_corr': val_corr,
+                            'use_dist': use_dist, 'dist_blend': dist_blend}, out_inference)
                 print(f"  ✓ Saved! ({', '.join(save_reason)})")
                 print(f"    MAE={val_mae:.2f} | Slope={val_slope:.3f} | EyeCorr={val_eye_corr:.3f} | Score={composite:.2f}")
                 patience = 0
@@ -1198,6 +1440,24 @@ if __name__ == "__main__":
     parser.add_argument('--floor-db', type=float, default=None,
                         help="GH only: GT threshold (dB) defining the 'deep floor' for "
                              "the boost/penalty. Default from module.")
+    # ── Tier-1 improvements (see decoder/specs/severe_point_improvement_plan.md) ──
+    parser.add_argument('--head', choices=['scalar', 'distributional'], default='scalar',
+                        help="'scalar' = original Huber regression head (default); "
+                             "'distributional' = M1: add a per-point dB-bin head trained "
+                             "with soft-CE (attacks deep-point mean-collapse).")
+    parser.add_argument('--dist-blend', type=float, default=DIST_BLEND,
+                        help="M1: weight on E[dist] in the blended prediction "
+                             "(0=scalar only, 1=dist only). Default %(default)s.")
+    parser.add_argument('--dist-loss-weight', type=float, default=DIST_LOSS_WEIGHT,
+                        help="M1: λ on the soft-CE term. Default %(default)s.")
+    parser.add_argument('--reweight', choices=['value', 'lds'], default='value',
+                        help="'value' = original value/severity weight (default); "
+                             "'lds' = M2: capped inverse-density (LDS) weight from the "
+                             "train distribution (disables floor_boost/overpred).")
+    parser.add_argument('--lds-sigma', type=float, default=LDS_SIGMA_DB,
+                        help="M2: Gaussian kernel σ (dB) for LDS smoothing. Default %(default)s.")
+    parser.add_argument('--target-mae', type=float, default=SUBGOAL_TARGET_MAE,
+                        help="Goal MAE for the goal-plateau self-stop. Default %(default)s.")
     args = parser.parse_args()
 
     deep_cfg = None
@@ -1215,4 +1475,7 @@ if __name__ == "__main__":
 
     train(weighting=args.weighting, sector_combine=args.sector_combine,
           epochs=args.epochs, out_best=out_best, out_inference=out_inference,
-          deep_cfg=deep_cfg)
+          deep_cfg=deep_cfg,
+          use_dist=(args.head == 'distributional'), dist_blend=args.dist_blend,
+          dist_loss_weight=args.dist_loss_weight,
+          reweight=args.reweight, lds_sigma=args.lds_sigma, target_mae=args.target_mae)
