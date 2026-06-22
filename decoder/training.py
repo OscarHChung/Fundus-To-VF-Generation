@@ -1109,14 +1109,62 @@ def diagnose_training(history, target_mae=SUBGOAL_TARGET_MAE):
     return False, None, warns
 
 
+# ============== Champion tracking (best-ever model + methods) ==============
+CHAMPION_DIR = os.path.join(CURRENT_DIR, "results", "champion")
+
+def _update_champion(best_mae, best_extra, config, model_src):
+    """Persist the best-ever model + the exact methods that produced it.
+
+    Keeps decoder/results/champion/{best_model.pth, champion.json}. Only
+    overwrites when this run's best val MAE strictly beats the stored champion,
+    so the all-time-best survives across autonomous iterations."""
+    import shutil, datetime
+    os.makedirs(CHAMPION_DIR, exist_ok=True)
+    rec_path = os.path.join(CHAMPION_DIR, "champion.json")
+    prev = None
+    if os.path.exists(rec_path):
+        try:
+            with open(rec_path) as f:
+                prev = json.load(f)
+        except Exception:
+            prev = None
+    prev_mae = prev.get('val_mae', float('inf')) if prev else float('inf')
+
+    if np.isfinite(best_mae) and best_mae < prev_mae:
+        if model_src and os.path.exists(model_src):
+            shutil.copy(model_src, os.path.join(CHAMPION_DIR, "best_model.pth"))
+        rec = {'val_mae': float(best_mae),
+               'severe': best_extra or {},
+               'methods': config,
+               'previous_best': (None if not np.isfinite(prev_mae) else float(prev_mae)),
+               'timestamp': datetime.datetime.now().isoformat(timespec='seconds')}
+        with open(rec_path, 'w') as f:
+            json.dump(rec, f, indent=2, default=str)
+        prev_str = f"{prev_mae:.3f}" if np.isfinite(prev_mae) else "—"
+        print(f"\n🏆 NEW CHAMPION: val MAE {best_mae:.3f} dB (prev {prev_str}). "
+              f"Model + methods → {CHAMPION_DIR}")
+        return True
+    prev_str = f"{prev_mae:.3f}" if np.isfinite(prev_mae) else "—"
+    cur_str  = f"{best_mae:.3f}" if np.isfinite(best_mae) else "inf"
+    print(f"\n(Champion unchanged: this run {cur_str} ≥ best-ever {prev_str} dB)")
+    return False
+
+
 # ============== Training ==============
 def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
           out_best=BEST_SAVE, out_inference=INFERENCE_SAVE, deep_cfg=None,
           use_dist=False, dist_blend=DIST_BLEND, dist_loss_weight=DIST_LOSS_WEIGHT,
           reweight='value', lds_sigma=LDS_SIGMA_DB, target_mae=SUBGOAL_TARGET_MAE,
-          bias_penalty=BIAS_PENALTY_WEIGHT):
+          bias_penalty=BIAS_PENALTY_WEIGHT,
+          attn_dropout=None, head_dropout=None, weight_decay=None):
+    # Regularization overrides (for fast autonomous sweeps without code edits).
+    global ATTN_DROPOUT, HEAD_DROPOUT, ATTN_WD
+    if attn_dropout is not None: ATTN_DROPOUT = attn_dropout
+    if head_dropout is not None: HEAD_DROPOUT = head_dropout
+    if weight_decay is not None: ATTN_WD = weight_decay
+
     print("=" * 60)
-    print("Training v10.2 — Per-point attention + heavy regularization")
+    print("Training v10.2 — Per-point attention + Garway–Heath")
     print("=" * 60)
 
     # ── Garway–Heath sector weighting (opt-in) ─────────────────
@@ -1448,6 +1496,20 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
           f"`python decoder/garway_heath_weighting.py --evaluate`")
     print("=" * 60)
 
+    # ── Champion: keep the best-ever model + methods across all runs ───
+    run_config = {
+        'weighting': weighting, 'sector_combine': sector_combine,
+        'head': 'distributional' if use_dist else 'scalar',
+        'dist_blend': (dist_blend if use_dist else None),
+        'dist_loss_weight': (dist_loss_weight if use_dist else None),
+        'reweight': reweight, 'lds_sigma': (lds_sigma if reweight == 'lds' else None),
+        'bias_penalty': bias_penalty, 'deep_cfg': deep_cfg,
+        'attn_dropout': ATTN_DROPOUT, 'head_dropout': HEAD_DROPOUT,
+        'attn_weight_decay': ATTN_WD, 'epochs': epochs,
+    }
+    _update_champion(best_mae, best_extra, run_config, out_inference)
+    return best_mae, best_extra
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train v10.2 PerPointVFModel (GRAPE)")
@@ -1491,6 +1553,11 @@ if __name__ == "__main__":
     parser.add_argument('--bias-penalty', type=float, default=BIAS_PENALTY_WEIGHT,
                         help="Per-eye mean-error penalty weight; pins the global level so "
                              "deep emphasis can't shift it down. 0 disables. Default %(default)s.")
+    parser.add_argument('--dropout', type=float, default=None,
+                        help="Override attention & head dropout (regularization sweep). "
+                             "Default keeps the module constants (0.4).")
+    parser.add_argument('--weight-decay', type=float, default=None,
+                        help="Override attention/head weight decay. Default keeps 0.015.")
     args = parser.parse_args()
 
     deep_cfg = None
@@ -1512,4 +1579,6 @@ if __name__ == "__main__":
           use_dist=(args.head == 'distributional'), dist_blend=args.dist_blend,
           dist_loss_weight=args.dist_loss_weight,
           reweight=args.reweight, lds_sigma=args.lds_sigma, target_mae=args.target_mae,
-          bias_penalty=args.bias_penalty)
+          bias_penalty=args.bias_penalty,
+          attn_dropout=args.dropout, head_dropout=args.dropout,
+          weight_decay=args.weight_decay)
