@@ -13,6 +13,39 @@ crop) and Tier 3 remain design-only standby for the next push.
 
 ---
 
+## 0. Run 4 — Tier-1 first attempt: deep floor FIXED, overall MAE regressed
+
+First Tier-1 run (`--head distributional --reweight lds`, LDS cap 6, weighted
+soft-CE, severity sampler still on, no bias control):
+
+| Metric | Old GH | Run-4 best (e20) | Run-4 e26 |
+|---|---|---|---|
+| floor(0–10) | ~10–11 | 9.4 | **6.6** ✓✓ |
+| deep(<16) | ~9.5 | 7.4 | **5.4** ✓✓ |
+| bias | ~0 | −1.7 | **−4.0** ✗ |
+| overall MAE | 4.25 | 4.89 ✗ | 5.96 (auto-stopped, diverging) |
+
+**Goal 1 worked spectacularly; goal 2 failed via a negative-bias runaway.**
+Root cause: deep emphasis was **triple-counted** — (1) the severity
+`WeightedRandomSampler` (1.3–3×), (2) LDS per-point weight (≤8×), (3) the soft-CE
+*also* weighted by those deep-heavy weights. Stacked, they made "predict
+everything low" the optimum; nothing pinned the global mean, so the level slid
+down (−4 dB) — deepening scotomata (great for floor) but under-predicting healthy
+points (wrecking MAE). The bias runaway *was* the divergence.
+
+**Fixes applied (run-5), decoupling level from shape:**
+1. **Per-eye bias penalty** (`BIAS_PENALTY_WEIGHT=0.1`, `--bias-penalty`) — pins
+   each eye's mean so deep emphasis shapes the distribution without shifting the
+   level. The hero fix; makes bias a directly-optimized target.
+2. **Uniform sampling under `--reweight lds`** — LDS replaces resampling (Yang et
+   al.), not stacks on it. Removes compounding #1.
+3. **Unweighted soft-CE** — the distributional gradient already handles deep
+   points per-point; weighting it was redundant. Removes compounding #3.
+4. **LDS cap 6→4** — trims raw emphasis magnitude.
+
+Keeps the deep-floor mechanism (cap-4 LDS + active dist head) while preventing
+the level shift. Early signal: epoch-1 train MAE 8.5→7.1.
+
 ## 1. Why the deep floor is stuck (root causes, grounded in the code)
 
 **RC-1 — The loss structurally regresses to the mean.**

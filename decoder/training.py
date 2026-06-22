@@ -128,7 +128,13 @@ DIST_LOSS_WEIGHT = 0.5     # default λ on the soft-CE term in compute_loss
 #   Replaces the hand-tuned value weight + floor_boost with a principled
 #   inverse-(smoothed)-density weight derived from the train label distribution.
 LDS_SIGMA_DB = 2.0         # dB; Gaussian kernel σ for smoothing the label density
-LDS_MAX_WEIGHT = 6.0       # cap on any single bin's weight (post-norm headroom ~+25%)
+LDS_MAX_WEIGHT = 4.0       # cap on any single bin's weight (run-4: 6 over-deepened)
+
+# Bias control — per-eye mean-error penalty. Decouples "deep points should be
+# deep" (goal 1) from "the whole field is shifted down" (the −4 dB bias runaway
+# in run-4). Pins each eye's mean sensitivity so deep emphasis shapes the
+# distribution without shifting the level. Set 0 to disable.
+BIAS_PENALTY_WEIGHT = 0.1
 
 # Goal-aware self-stop — give up when the run is clearly not going to hit target.
 SUBGOAL_TARGET_MAE     = 4.0    # the MAE we are trying to beat (sub-4)
@@ -679,7 +685,8 @@ def attention_entropy_loss(attn_weights):
 # ============== Loss ==============
 def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
                  sector_weights=None, sector_combine='both', deep_cfg=None,
-                 dist_logits=None, dist_cfg=None, lds_weights=None):
+                 dist_logits=None, dist_cfg=None, lds_weights=None,
+                 bias_penalty=BIAS_PENALTY_WEIGHT):
     """Weighted Huber loss (+ CCC / variance / attention-entropy terms).
 
     Garway–Heath sector weighting is opt-in and fully backward-compatible:
@@ -710,6 +717,7 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
     total_huber = total_mae = n_valid = 0
     total_dist_ce = 0.0
     eye_ccc_losses = []
+    bias_sq_terms  = []
 
     for i, lat in enumerate(laterality):
         valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
@@ -763,15 +771,21 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
         total_mae   += mae.item() * mask.sum().item()
         n_valid     += mask.sum().item()
 
-        # M1 — distributional soft cross-entropy on the deep-aware-weighted
-        # points. dist_logits are in query order (same as pred_52), so gather by
-        # the same mask. This term, not the Huber, is what moves deep points.
+        # M1 — distributional soft cross-entropy. dist_logits are in query order
+        # (same as pred_52), gathered by the same mask. UNWEIGHTED: the soft-CE
+        # already gives every deep point a full-strength per-point gradient (its
+        # whole advantage); weighting it by the deep-heavy LDS weights triple-
+        # counted the deep emphasis and drove the −4 dB bias runaway in run-4.
         if dist_logits is not None and dist_cfg is not None:
             dl = dist_logits[i][mask]                            # (nv, K)
             ce = dist_soft_ce(dl, t, dist_cfg['centers'],
                               sigma=dist_cfg.get('sigma', DIST_LABEL_SIGMA),
-                              weight=weights.detach())
+                              weight=None)
             total_dist_ce = total_dist_ce + ce * mask.sum().item()
+
+        # Bias control — per-eye squared mean error (pins the eye's level).
+        if bias_penalty > 0:
+            bias_sq_terms.append((p - t).mean() ** 2)
 
         if epoch >= PER_EYE_CCC_START and mask.sum() >= 5:
             eye_ccc = per_eye_ccc(pred_52, target_52, mask)
@@ -786,6 +800,11 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
     if dist_logits is not None and dist_cfg is not None and \
        isinstance(total_dist_ce, torch.Tensor):
         loss = loss + dist_cfg.get('weight', DIST_LOSS_WEIGHT) * (total_dist_ce / n_valid)
+
+    # Bias-control term — drives each eye's mean error toward 0 (decouples the
+    # global level from the deep-point emphasis; the run-4 negative-bias fix).
+    if bias_penalty > 0 and len(bias_sq_terms) > 0:
+        loss = loss + bias_penalty * torch.stack(bias_sq_terms).mean()
 
     # Per-eye CCC
     if len(eye_ccc_losses) > 0:
@@ -1094,7 +1113,8 @@ def diagnose_training(history, target_mae=SUBGOAL_TARGET_MAE):
 def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
           out_best=BEST_SAVE, out_inference=INFERENCE_SAVE, deep_cfg=None,
           use_dist=False, dist_blend=DIST_BLEND, dist_loss_weight=DIST_LOSS_WEIGHT,
-          reweight='value', lds_sigma=LDS_SIGMA_DB, target_mae=SUBGOAL_TARGET_MAE):
+          reweight='value', lds_sigma=LDS_SIGMA_DB, target_mae=SUBGOAL_TARGET_MAE,
+          bias_penalty=BIAS_PENALTY_WEIGHT):
     print("=" * 60)
     print("Training v10.2 — Per-point attention + heavy regularization")
     print("=" * 60)
@@ -1142,6 +1162,9 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
                     'sigma': DIST_LABEL_SIGMA, 'weight': dist_loss_weight}
         print(f"✓ M1 distributional head ON (bins={len(DIST_BIN_CENTERS)}, "
               f"blend={dist_blend}, ce_weight={dist_loss_weight})")
+    if bias_penalty > 0:
+        print(f"✓ Bias-control penalty ON (weight={bias_penalty}) — pins per-eye "
+              f"mean so deep emphasis can't shift the global level")
     print(f"✓ Goal self-stop: give up if no >{GOAL_PLATEAU_MIN_DELTA} dB val gain "
           f"for {GOAL_PLATEAU_CHECKS} checks while best > {target_mae} dB")
 
@@ -1163,16 +1186,23 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
     train_dataset = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, train_transform, mode='train')
     val_dataset   = MultiImageDataset(VAL_JSON,   FUNDUS_DIR, val_transform,   mode='val', use_tta=USE_TTA)
 
-    sample_weights = train_dataset.get_sample_severity()
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(train_dataset),
-        replacement=True
-    )
-    print(f"  Sampler weight range: [{min(sample_weights):.1f}, {max(sample_weights):.1f}]")
-
-    train_loader = DataLoader(train_dataset, BATCH_SIZE, sampler=sampler,
-                              num_workers=0, drop_last=True)
+    if reweight == 'lds':
+        # LDS reweights at the LOSS level, so it REPLACES severity resampling
+        # (Yang et al. 2021). Stacking both triple-counted the deep emphasis and
+        # drove the run-4 bias runaway → use uniform sampling here.
+        train_loader = DataLoader(train_dataset, BATCH_SIZE, shuffle=True,
+                                  num_workers=0, drop_last=True)
+        print(f"  Sampler: UNIFORM (LDS handles imbalance at the loss level)")
+    else:
+        sample_weights = train_dataset.get_sample_severity()
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(train_dataset),
+            replacement=True
+        )
+        print(f"  Sampler weight range: [{min(sample_weights):.1f}, {max(sample_weights):.1f}]")
+        train_loader = DataLoader(train_dataset, BATCH_SIZE, sampler=sampler,
+                                  num_workers=0, drop_last=True)
     val_loader   = DataLoader(val_dataset, batch_size=1, shuffle=False,
                               num_workers=0, collate_fn=val_collate_fn)
 
@@ -1245,7 +1275,7 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
                                          sector_combine=sector_combine,
                                          deep_cfg=deep_cfg,
                                          dist_logits=dist_logits, dist_cfg=dist_cfg,
-                                         lds_weights=lds_weights)
+                                         lds_weights=lds_weights, bias_penalty=bias_penalty)
 
             if nv > 0:
                 optimizer.zero_grad()
@@ -1458,6 +1488,9 @@ if __name__ == "__main__":
                         help="M2: Gaussian kernel σ (dB) for LDS smoothing. Default %(default)s.")
     parser.add_argument('--target-mae', type=float, default=SUBGOAL_TARGET_MAE,
                         help="Goal MAE for the goal-plateau self-stop. Default %(default)s.")
+    parser.add_argument('--bias-penalty', type=float, default=BIAS_PENALTY_WEIGHT,
+                        help="Per-eye mean-error penalty weight; pins the global level so "
+                             "deep emphasis can't shift it down. 0 disables. Default %(default)s.")
     args = parser.parse_args()
 
     deep_cfg = None
@@ -1478,4 +1511,5 @@ if __name__ == "__main__":
           deep_cfg=deep_cfg,
           use_dist=(args.head == 'distributional'), dist_blend=args.dist_blend,
           dist_loss_weight=args.dist_loss_weight,
-          reweight=args.reweight, lds_sigma=args.lds_sigma, target_mae=args.target_mae)
+          reweight=args.reweight, lds_sigma=args.lds_sigma, target_mae=args.target_mae,
+          bias_penalty=args.bias_penalty)
