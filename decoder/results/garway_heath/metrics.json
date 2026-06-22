@@ -1,0 +1,110 @@
+{
+  "n_samples": 47,
+  "n_points": 2444,
+  "plain_mae": 4.0404986198473285,
+  "weighted_mae": 4.036080603865324,
+  "bias": 0.7299279026723727,
+  "rmse": 5.740546169185182,
+  "pearson_r": 0.5977963383272022,
+  "r2": 0.3573604621175229,
+  "slope": 0.4100735708365475,
+  "per_eye_corr": 0.44585835483143776,
+  "per_sector": {
+    "0": {
+      "sector_id": 0,
+      "sector": "Central-Superior",
+      "mae": 3.7165331066922938,
+      "n_points": 188
+    },
+    "1": {
+      "sector_id": 1,
+      "sector": "Central-Inferior",
+      "mae": 3.920300785531389,
+      "n_points": 188
+    },
+    "2": {
+      "sector_id": 2,
+      "sector": "Superonasal",
+      "mae": 4.486754852497107,
+      "n_points": 329
+    },
+    "3": {
+      "sector_id": 3,
+      "sector": "Superior-arcuate",
+      "mae": 4.124618643538115,
+      "n_points": 376
+    },
+    "4": {
+      "sector_id": 4,
+      "sector": "Inferonasal",
+      "mae": 4.601897444043841,
+      "n_points": 329
+    },
+    "5": {
+      "sector_id": 5,
+      "sector": "Inferior-arcuate",
+      "mae": 3.5421276904167014,
+      "n_points": 376
+    },
+    "6": {
+      "sector_id": 6,
+      "sector": "Nasal-periphery",
+      "mae": 4.392528490394565,
+      "n_points": 282
+    },
+    "7": {
+      "sector_id": 7,
+      "sector": "Temporal-wedge",
+      "mae": 3.5311106216717274,
+      "n_points": 376
+    }
+  },
+  "severity_pointwise": {
+    "0-10dB": {
+      "gt_lo": 0,
+      "gt_hi": 10,
+      "n_points": 160,
+      "mae": 12.415009377337991
+    },
+    "10-20dB": {
+      "gt_lo": 10,
+      "gt_hi": 20,
+      "n_points": 421,
+      "mae": 5.706988368068342
+    },
+    "20-30dB": {
+      "gt_lo": 20,
+      "gt_hi": 30,
+      "n_points": 1737,
+      "mae": 2.6934154502399776
+    },
+    "30-36dB": {
+      "gt_lo": 30,
+      "gt_hi": 36,
+      "n_points": 66,
+      "mae": 3.6653981642289595
+    },
+    "deep(<16)": {
+      "n_points": 386,
+      "mae": 9.721630510579736
+    },
+    "preserved(>=16)": {
+      "n_points": 2058,
+      "mae": 2.9749413264446516
+    }
+  },
+  "severity_per_eye": {
+    "severe(<16)": {
+      "n_eyes": 7,
+      "mae": 7.487823089891738
+    },
+    "moderate(16-26)": {
+      "n_eyes": 35,
+      "mae": 3.541463728265448
+    },
+    "early(>26)": {
+      "n_eyes": 5,
+      "mae": 2.707488602858324
+    }
+  }
+}

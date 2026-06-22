@@ -277,70 +277,15 @@ def collate_fn(batch):
     return batch[0]
 
 # ============================================================
-# MAIN
+# SCATTER PLOT  (Figure 4) — reusable so other scripts (e.g. the
+# Garway–Heath path) can render an identical-style figure from their
+# own predictions. Behavior for this script's own main() is unchanged.
 # ============================================================
-def main():
-    os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-    os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
-
-    if torch.backends.mps.is_available():
-        device = torch.device('mps')
-        print('✓ Using MPS')
-    elif torch.cuda.is_available():
-        device = torch.device('cuda')
-        print('✓ Using CUDA')
-    else:
-        device = torch.device('cpu')
-        print('⚠  Using CPU')
-
-    # ── Load encoder ──────────────────────────────────────────
-    sys.path.insert(0, RETFOUND_DIR)
-    from models_mae import mae_vit_large_patch16_dec512d8b
-
-    with torch.serialization.safe_globals([argparse.Namespace]):
-        ckpt = torch.load(CHECKPOINT_PATH, map_location='cpu', weights_only=False)
-    encoder = mae_vit_large_patch16_dec512d8b()
-    encoder.load_state_dict(ckpt['model'], strict=False)
-    print('✓ Loaded RETFound encoder')
-
-    # ── Load model (v10.2 PerPointVFModel) ────────────────────
-    model = PerPointVFModel(encoder)
-    saved = torch.load(INFERENCE_SAVE, map_location='cpu', weights_only=False)
-    state = saved.get('model_state_dict', saved.get('model', saved))
-    model.load_state_dict(state, strict=True)
-    model.to(device)
-    model.eval()
-    val_mae = saved.get("val_mae", None)
-    mae_str = f'{val_mae:.2f} dB' if val_mae is not None else '?'
-    print(f'✓ Loaded inference model  (val_mae={mae_str})')
-
-    # ── Run inference ─────────────────────────────────────────
-    dataset = ValDataset(VAL_JSON, FUNDUS_DIR, use_tta=USE_TTA)
-    loader  = DataLoader(dataset, batch_size=1, shuffle=False,
-                         num_workers=0, collate_fn=collate_fn)
-
-    all_pred, all_true = [], []
-    n_samples = 0
-
-    with torch.no_grad():
-        for imgs, hvf, lat in loader:
-            imgs = imgs.to(device)
-            pred = model(imgs, laterality=lat, average_multi=True)
-            pred_np = pred.squeeze(0).cpu().numpy()
-
-            hvf_np = hvf.numpy().flatten()
-            valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
-            true_52   = hvf_np[valid_idx]
-
-            mask = true_52 < MASKED_VALUE_THRESHOLD
-            all_pred.extend(pred_np[mask].tolist())
-            all_true.extend(true_52[mask].tolist())
-            n_samples += 1
-
-    all_pred = np.array(all_pred)
-    all_true = np.array(all_true)
+def plot_vf_scatter(all_true, all_pred, out_path, n_samples,
+                    title_tag='v10.2', show=False):
+    all_pred = np.asarray(all_pred)
+    all_true = np.asarray(all_true)
     n_points = len(all_pred)
-    print(f'✓ Collected {n_points:,} VF points from {n_samples} samples')
 
     # ── Metrics ───────────────────────────────────────────────
     abs_err = np.abs(all_pred - all_true)
@@ -412,7 +357,7 @@ def main():
     ax.set_xlabel('True VF Sensitivity (dB)', fontsize=12)
     ax.set_ylabel('Predicted VF Sensitivity (dB)', fontsize=12)
     ax.set_title(
-        f'All Predictions vs Ground Truth (v10.2)\n'
+        f'All Predictions vs Ground Truth ({title_tag})\n'
         f'N = {n_points:,} points from {n_samples} samples',
         fontsize=13, fontweight='bold'
     )
@@ -421,9 +366,86 @@ def main():
     ax.set_aspect('equal')
 
     plt.tight_layout()
-    plt.savefig(OUTPUT_PLOT, dpi=150, bbox_inches='tight')
-    print(f'\n✓ Saved → {OUTPUT_PLOT}')
-    plt.show()
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    print(f'\n✓ Saved → {out_path}')
+    if show:
+        plt.show()
+    plt.close(fig)
+
+    return {'mae': float(mae), 'rmse': float(rmse), 'bias': float(bias),
+            'slope': float(slope), 'intercept': float(intercept), 'r2': float(r2),
+            'n_points': n_points, 'n_samples': n_samples}
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+    os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
+
+    if torch.backends.mps.is_available():
+        device = torch.device('mps')
+        print('✓ Using MPS')
+    elif torch.cuda.is_available():
+        device = torch.device('cuda')
+        print('✓ Using CUDA')
+    else:
+        device = torch.device('cpu')
+        print('⚠  Using CPU')
+
+    # ── Load encoder ──────────────────────────────────────────
+    sys.path.insert(0, RETFOUND_DIR)
+    from models_mae import mae_vit_large_patch16_dec512d8b
+
+    with torch.serialization.safe_globals([argparse.Namespace]):
+        ckpt = torch.load(CHECKPOINT_PATH, map_location='cpu', weights_only=False)
+    encoder = mae_vit_large_patch16_dec512d8b()
+    encoder.load_state_dict(ckpt['model'], strict=False)
+    print('✓ Loaded RETFound encoder')
+
+    # ── Load model (v10.2 PerPointVFModel) ────────────────────
+    model = PerPointVFModel(encoder)
+    saved = torch.load(INFERENCE_SAVE, map_location='cpu', weights_only=False)
+    state = saved.get('model_state_dict', saved.get('model', saved))
+    model.load_state_dict(state, strict=True)
+    model.to(device)
+    model.eval()
+    val_mae = saved.get("val_mae", None)
+    mae_str = f'{val_mae:.2f} dB' if val_mae is not None else '?'
+    print(f'✓ Loaded inference model  (val_mae={mae_str})')
+
+    # ── Run inference ─────────────────────────────────────────
+    dataset = ValDataset(VAL_JSON, FUNDUS_DIR, use_tta=USE_TTA)
+    loader  = DataLoader(dataset, batch_size=1, shuffle=False,
+                         num_workers=0, collate_fn=collate_fn)
+
+    all_pred, all_true = [], []
+    n_samples = 0
+
+    with torch.no_grad():
+        for imgs, hvf, lat in loader:
+            imgs = imgs.to(device)
+            pred = model(imgs, laterality=lat, average_multi=True)
+            pred_np = pred.squeeze(0).cpu().numpy()
+
+            hvf_np = hvf.numpy().flatten()
+            valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
+            true_52   = hvf_np[valid_idx]
+
+            mask = true_52 < MASKED_VALUE_THRESHOLD
+            all_pred.extend(pred_np[mask].tolist())
+            all_true.extend(true_52[mask].tolist())
+            n_samples += 1
+
+    all_pred = np.array(all_pred)
+    all_true = np.array(all_true)
+    n_points = len(all_pred)
+    print(f'✓ Collected {n_points:,} VF points from {n_samples} samples')
+
+    # ── Metrics + Plot (Figure 4) ─────────────────────────────
+    plot_vf_scatter(all_true, all_pred, OUTPUT_PLOT, n_samples,
+                    title_tag='v10.2', show=True)
 
 
 if __name__ == '__main__':

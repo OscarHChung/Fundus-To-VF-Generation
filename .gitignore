@@ -3,3 +3,11 @@ data/fundus/grape_fundus_images/*.jpg
 data/*.pt
 decoder/*.pth
 encoder/*.pth
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated checkpoint binaries inside results
+decoder/results/**/*.pth

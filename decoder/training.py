@@ -487,7 +487,26 @@ def attention_entropy_loss(attn_weights):
 
 
 # ============== Loss ==============
-def compute_loss(pred, target, laterality, epoch=0, attn_weights=None):
+def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
+                 sector_weights=None, sector_combine='both', deep_cfg=None):
+    """Weighted Huber loss (+ CCC / variance / attention-entropy terms).
+
+    Garway–Heath sector weighting is opt-in and fully backward-compatible:
+      * sector_weights=None (default)  → IDENTICAL to the original baseline.
+      * sector_weights={'OD':t52,'OS':t52} (query-order, e.g. from
+        garway_heath_weighting.sector_weight_tensors) layers a spatial weight on
+        top of the existing value-based weight. `sector_combine` controls the
+        interaction: 'both' (value × sector), 'sector_only', or 'value_only'.
+
+    Deep-floor shaping is also opt-in (deep_cfg=None → baseline). When given
+    (from garway_heath_weighting.deep_loss_config) it (1) adds an additive
+    'floor boost' weight to the deepest GT points and (2) applies an asymmetric
+    extra Huber penalty when the model OVER-predicts a deep point — together
+    targeting the 0-10 dB underestimation / positive-bias seen in the first run.
+
+    Only the per-point Huber term is affected; the returned MAE stays unweighted
+    so validation MAE remains apples-to-apples with the baseline.
+    """
     device = pred.device
     target = target.to(device)
     if isinstance(laterality, str):
@@ -510,8 +529,38 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None):
         p = pred_52[mask]
         t = target_52[mask]
 
-        weights = 1.0 + WEIGHT_SCALE * (MAX_DB - t).clamp(min=0) / MAX_DB
-        huber = (F.huber_loss(p, t, reduction='none', delta=HUBER_DELTA) * weights).mean()
+        # Existing value-based (severity) weight.
+        value_w = 1.0 + WEIGHT_SCALE * (MAX_DB - t).clamp(min=0) / MAX_DB
+        # Deep-floor boost (goal-1 rescue) — additive extra weight on the deepest
+        # GT points, layered onto the severity weight. deep_cfg=None (baseline)
+        # leaves value_w untouched.
+        if deep_cfg is not None and deep_cfg.get('floor_boost', 0.0) > 0:
+            floor_db = deep_cfg['floor_db']
+            value_w = value_w + deep_cfg['floor_boost'] * \
+                      (floor_db - t).clamp(min=0) / floor_db
+        # New spatial (Garway–Heath) weight, layered in behind the flag.
+        if sector_weights is not None:
+            eye = 'OD' if lat.startswith('OD') else 'OS'
+            sector_w = sector_weights[eye].to(device)[mask]   # query-order → masked subset
+            if sector_combine == 'sector_only':
+                weights = sector_w
+            elif sector_combine == 'value_only':
+                weights = value_w
+            else:  # 'both'
+                weights = value_w * sector_w
+        else:
+            weights = value_w
+        # Per-point Huber, with an asymmetric penalty on OVER-predicting deep
+        # points (pred>gt AND gt<floor) — directly counters the positive bias /
+        # scotoma-depth underestimation seen in the first GH run.
+        huber_pp = F.huber_loss(p, t, reduction='none', delta=HUBER_DELTA)
+        if deep_cfg is not None and deep_cfg.get('overpred_penalty', 0.0) > 0:
+            over_deep = (p > t) & (t < deep_cfg['floor_db'])
+            huber_pp = huber_pp * torch.where(
+                over_deep,
+                torch.full_like(p, 1.0 + deep_cfg['overpred_penalty']),
+                torch.ones_like(p))
+        huber = (huber_pp * weights).mean()
         mae   = (p - t).abs().mean()
 
         total_huber += huber * mask.sum().item()
@@ -634,7 +683,43 @@ def compute_per_eye_metrics(pred, target, laterality):
     return float(np.mean(eye_corrs))
 
 
-def evaluate(model, loader):
+def _flat_severity_stats(pred, target, laterality):
+    """Flat (masked) bias + deep-region MAEs for live training diagnostics.
+
+    Returns {'bias','rmse','floor_mae','floor_n','deep_mae','deep_n'} where
+    floor = GT 0-10 dB (the goal-1 metric) and deep = GT < 16 dB."""
+    if isinstance(laterality, str):
+        laterality = [laterality]
+    if pred.dim() == 1:
+        pred = pred.unsqueeze(0)
+    if target.dim() == 1:
+        target = target.unsqueeze(0)
+    P, T = [], []
+    for i in range(min(len(laterality), pred.shape[0], target.shape[0])):
+        lat = laterality[i] if i < len(laterality) else laterality[0]
+        valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
+        t52 = target[min(i, target.shape[0]-1)][valid_idx]
+        p52 = pred[min(i, pred.shape[0]-1)]
+        m = t52 < MASKED_VALUE_THRESHOLD
+        if m.sum() > 0:
+            P.extend(p52[m].tolist())
+            T.extend(t52[m].tolist())
+    if len(P) == 0:
+        return {}
+    P = np.array(P); T = np.array(T); err = P - T; ae = np.abs(err)
+
+    def band(lo, hi):
+        m = (T >= lo) & (T < hi)
+        return (float(ae[m].mean()) if m.any() else float('nan')), int(m.sum())
+
+    floor_mae, floor_n = band(0, 10)
+    deep_mae,  deep_n  = band(0, 16)
+    return {'bias': float(err.mean()), 'rmse': float(np.sqrt((err ** 2).mean())),
+            'floor_mae': floor_mae, 'floor_n': floor_n,
+            'deep_mae': deep_mae,  'deep_n': deep_n}
+
+
+def evaluate(model, loader, detailed=False):
     model.eval()
     total_mae = n_valid = 0
     all_preds, all_targets, all_lats = [], [], []
@@ -650,20 +735,103 @@ def evaluate(model, loader):
             all_targets.append(hvf.unsqueeze(0) if hvf.dim() == 1 else hvf)
             all_lats.append(lat)
     if n_valid == 0:
-        return float('inf'), 0.0, 0.0, 0.0, 0.0
+        return (float('inf'), 0.0, 0.0, 0.0, 0.0, {}) if detailed \
+            else (float('inf'), 0.0, 0.0, 0.0, 0.0)
     stacked_preds   = torch.cat(all_preds, dim=0)
     stacked_targets = torch.cat(all_targets, dim=0)
     corr = pearson_correlation(stacked_preds, stacked_targets, all_lats)
     r2, slope = compute_r2_slope(stacked_preds, stacked_targets, all_lats)
     per_eye_corr = compute_per_eye_metrics(stacked_preds, stacked_targets, all_lats)
-    return total_mae / n_valid, corr, r2, slope, per_eye_corr
+    mae = total_mae / n_valid
+    if not detailed:
+        return mae, corr, r2, slope, per_eye_corr
+    extra = _flat_severity_stats(stacked_preds, stacked_targets, all_lats)
+    return mae, corr, r2, slope, per_eye_corr, extra
+
+
+def diagnose_training(history):
+    """Inspect the validation trajectory and decide whether to auto-stop with a
+    plain-English reason. Pure function of the recorded history dict (lists keyed
+    by 'val_mae','val_slope','val_bias','val_floor').
+
+    Returns (should_stop: bool, reason: str|None, warnings: list[str]).
+    Warnings are printed live every check; a reason means STOP now."""
+    warns = []
+    mae   = history['val_mae']
+    slope = history['val_slope']
+    bias  = history['val_bias']
+    floor = history['val_floor']
+    cur_mae, cur_slope, cur_bias = mae[-1], slope[-1], bias[-1]
+
+    # Hard stop 1 — numerical blow-up.
+    if not all(np.isfinite([cur_mae, cur_slope, cur_bias])):
+        return True, ("NUMERICAL INSTABILITY — a validation metric went "
+                      "non-finite (NaN/Inf). Usually exploding gradients or too "
+                      "high an LR. Lower the LR or inspect the inputs."), warns
+
+    # Hard stop 2 — sustained divergence (val MAE climbing well off its best).
+    if len(mae) >= 4:
+        best = min(mae[:-1])
+        if mae[-1] > mae[-2] > mae[-3] and cur_mae > best + 1.0:
+            return True, (f"VAL MAE DIVERGING — rose 3 checks straight to "
+                          f"{cur_mae:.2f} dB, >1 dB above the best ({best:.2f}). "
+                          f"The model is unlearning/overfitting; the best "
+                          f"checkpoint is already saved."), warns
+
+    # Hard stop 3 — slope collapse (predictions flattening to a constant mean).
+    if len(slope) >= 3 and all(s < 0.08 for s in slope[-3:]):
+        return True, (f"SLOPE COLLAPSE — val slope stuck <0.08 for 3 checks "
+                      f"(now {cur_slope:.3f}); predictions are regressing to a "
+                      f"constant. Ease regularization (dropout/weight-decay) or "
+                      f"the variance penalty."), warns
+
+    # Soft warnings (printed live; do NOT stop).
+    if cur_slope < 0.20:
+        warns.append(f"slope low ({cur_slope:.3f}) — watch for regression-to-mean")
+    if np.isfinite(cur_bias) and abs(cur_bias) > 2.0:
+        if cur_bias > 0:
+            warns.append(f"large +bias ({cur_bias:+.2f} dB) — scotoma depth is "
+                         f"being UNDER-estimated; raise --overpred-penalty")
+        else:
+            warns.append(f"large -bias ({cur_bias:+.2f} dB) — depth is being "
+                         f"OVER-estimated; lower --overpred-penalty/--floor-boost")
+    if len(floor) >= 3 and floor[-1] > floor[-2] > floor[-3]:
+        warns.append(f"deep-floor (0-10 dB) MAE rising ({floor[-1]:.2f}) — the "
+                     f"goal-1 metric is regressing; consider raising "
+                     f"--floor-boost / --overpred-penalty")
+    return False, None, warns
 
 
 # ============== Training ==============
-def train():
+def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
+          out_best=BEST_SAVE, out_inference=INFERENCE_SAVE, deep_cfg=None):
     print("=" * 60)
     print("Training v10.2 — Per-point attention + heavy regularization")
     print("=" * 60)
+
+    # ── Garway–Heath sector weighting (opt-in) ─────────────────
+    # weighting='baseline'      → original behavior (value-based weight only).
+    # weighting='garway_heath'  → add the spatial sector weight + deep-floor
+    #                             shaping (deep_cfg) in compute_loss.
+    sector_weights = None
+    if weighting == 'garway_heath':
+        from garway_heath_weighting import (sector_weight_tensors,
+                                            save_resolved_config, RESULTS_DIR,
+                                            deep_loss_config)
+        sector_weights = sector_weight_tensors(device=DEVICE, normalize=True)
+        if deep_cfg is None:
+            deep_cfg = deep_loss_config()
+        os.makedirs(RESULTS_DIR, exist_ok=True)
+        save_resolved_config(extra={'combine': sector_combine, 'epochs': epochs,
+                                    'deep_loss': deep_cfg})
+        print(f"✓ Garway–Heath weighting ON  (combine={sector_combine})")
+        print(f"  Deep-floor rescue: floor_db={deep_cfg['floor_db']:.1f} dB | "
+              f"floor_boost={deep_cfg['floor_boost']:.2f} | "
+              f"overpred_penalty={deep_cfg['overpred_penalty']:.2f}")
+        print(f"  Resolved config + checkpoints → {RESULTS_DIR}")
+    else:
+        deep_cfg = None
+        print("✓ Weighting: baseline (value-based only)")
 
     print(f"\nv10.1 showed: train MAE=3.57 (works!), val MAE=4.02 (overfits)")
     print(f"Same architecture, more regularization to close the gap")
@@ -711,7 +879,7 @@ def train():
     ])
 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=EPOCHS, eta_min=1e-6
+        optimizer, T_max=epochs, eta_min=1e-6
     )
 
     best_mae    = float('inf')
@@ -720,9 +888,15 @@ def train():
     best_score  = float('inf')
     patience    = 0
 
-    for epoch in range(1, EPOCHS + 1):
+    # Live diagnostics / self-stopping state.
+    history    = {'epoch': [], 'val_mae': [], 'val_slope': [],
+                  'val_bias': [], 'val_floor': []}
+    best_extra = None
+    stop_diag  = None
+
+    for epoch in range(1, epochs + 1):
         model.train()
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
 
         for imgs, hvf, lat in pbar:
             imgs = imgs.to(DEVICE)
@@ -731,7 +905,10 @@ def train():
             # Get stored attention weights for entropy regularization
             attn_w = model._last_attn_weights if hasattr(model, '_last_attn_weights') else None
             
-            loss, mae, nv = compute_loss(pred, hvf, lat, epoch=epoch, attn_weights=attn_w)
+            loss, mae, nv = compute_loss(pred, hvf, lat, epoch=epoch, attn_weights=attn_w,
+                                         sector_weights=sector_weights,
+                                         sector_combine=sector_combine,
+                                         deep_cfg=deep_cfg)
 
             if nv > 0:
                 optimizer.zero_grad()
@@ -751,7 +928,8 @@ def train():
 
         # ── Validate ───────────────────────────────────────────
         if epoch % VAL_EVERY == 0 or epoch <= 3:
-            val_mae, val_corr, val_r2, val_slope, val_eye_corr = evaluate(model, val_loader)
+            val_mae, val_corr, val_r2, val_slope, val_eye_corr, val_extra = \
+                evaluate(model, val_loader, detailed=True)
 
             train_eval = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, val_transform,
                                            mode='val', use_tta=False)
@@ -760,13 +938,32 @@ def train():
             train_mae, train_corr, train_r2, train_slope, train_eye_corr = evaluate(model, train_eval_loader)
             gap = train_mae - val_mae
 
+            val_bias  = val_extra.get('bias', float('nan'))
+            val_floor = val_extra.get('floor_mae', float('nan'))
+            val_deep  = val_extra.get('deep_mae', float('nan'))
+            val_fn    = val_extra.get('floor_n', 0)
+
+            # Record trajectory for live diagnostics / self-stopping.
+            history['epoch'].append(epoch)
+            history['val_mae'].append(val_mae)
+            history['val_slope'].append(val_slope)
+            history['val_bias'].append(val_bias)
+            history['val_floor'].append(val_floor)
+
             print(f"\n[Epoch {epoch}]")
             print(f"  Train: MAE={train_mae:.2f} | Corr={train_corr:.3f} | Slope={train_slope:.3f} | EyeCorr={train_eye_corr:.3f}")
             print(f"  Val:   MAE={val_mae:.2f} | Corr={val_corr:.3f} | Slope={val_slope:.3f} | EyeCorr={val_eye_corr:.3f}")
+            print(f"  Severe watch:  bias={val_bias:+.2f} dB | floor(0-10)={val_floor:.2f} (n={val_fn}) | "
+                  f"deep(<16)={val_deep:.2f}   [targets: bias→0, floor↓, deep↓]")
             print(f"  Gap: {gap:+.2f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
 
             if gap < -0.4:
                 print(f"  ⚠️  Gap < -0.4 — possible overfitting")
+
+            # Live diagnosis — warns each check; can auto-stop with a reason.
+            should_stop, stop_reason, warns = diagnose_training(history)
+            for w in warns:
+                print(f"  ⚠️  {w}")
 
             slope_penalty = max(0, 0.3 - val_slope) * 2.0
             composite = val_mae + slope_penalty
@@ -781,21 +978,36 @@ def train():
                     best_score = composite
                 best_corr  = max(best_corr, val_corr)
                 best_slope = max(best_slope, val_slope)
+                best_extra = {'epoch': epoch, 'mae': val_mae, 'slope': val_slope,
+                              'bias': val_bias, 'floor_mae': val_floor,
+                              'deep_mae': val_deep}
 
                 torch.save({'model': model.state_dict(), 'mae': val_mae,
                             'corr': val_corr, 'r2': val_r2, 'slope': val_slope,
-                            'eye_corr': val_eye_corr, 'epoch': epoch}, BEST_SAVE)
+                            'eye_corr': val_eye_corr, 'epoch': epoch}, out_best)
                 torch.save({'model_state_dict': model.state_dict(),
                             'encoder_checkpoint': CHECKPOINT_PATH,
-                            'val_mae': val_mae, 'val_corr': val_corr}, INFERENCE_SAVE)
+                            'val_mae': val_mae, 'val_corr': val_corr}, out_inference)
                 print(f"  ✓ Saved! ({', '.join(save_reason)})")
                 print(f"    MAE={val_mae:.2f} | Slope={val_slope:.3f} | EyeCorr={val_eye_corr:.3f} | Score={composite:.2f}")
                 patience = 0
             else:
                 patience += VAL_EVERY
-                if patience >= PATIENCE:
-                    print(f"\nEarly stopping at epoch {epoch}")
-                    break
+
+            # ── Self-stopping: diagnostic trip OR plateau patience ──
+            if should_stop:
+                print(f"\n{'='*60}")
+                print(f"⛔ AUTO-STOP at epoch {epoch}")
+                print(f"   {stop_reason}")
+                print(f"{'='*60}")
+                stop_diag = stop_reason
+                break
+            if patience >= PATIENCE:
+                print(f"\nEarly stopping at epoch {epoch} "
+                      f"(no val improvement for {patience} epochs — plateau).")
+                stop_diag = (f"Plateau — no validation improvement for {patience} "
+                             f"epochs (normal convergence stop).")
+                break
 
     # ── Summary ────────────────────────────────────────────────
     print(f"\n{'='*60}")
@@ -813,9 +1025,86 @@ def train():
         print(f"  ✓ Sub-4! Gap to baseline: {best_mae - 3.74:+.2f} dB")
     else:
         print(f"  Gap to baseline: {best_mae - 3.74:+.2f} dB")
-    print(f"  Model saved to: {INFERENCE_SAVE}")
+    print(f"  Model saved to: {out_inference}")
+    print("=" * 60)
+
+    # ── Diagnosis / goal check (explains how the run went) ─────
+    print(f"\n{'='*60}")
+    print("DIAGNOSIS — what happened this run")
+    print(f"{'='*60}")
+    if stop_diag:
+        print(f"  Stop reason: {stop_diag}")
+    else:
+        print(f"  Stop reason: reached the epoch budget ({epochs}) without a "
+              f"diagnostic trip.")
+    if history['val_mae']:
+        def _arrow(a, b, lower_better=True):
+            if not (np.isfinite(a) and np.isfinite(b)):
+                return "?"
+            better = (b < a) if lower_better else (b > a)
+            return "✓ improved" if better else "✗ worse/flat"
+        print(f"  Val MAE:    {history['val_mae'][0]:.2f} → best {best_mae:.2f} dB  "
+              f"({_arrow(history['val_mae'][0], best_mae)})")
+        print(f"  Val slope:  {history['val_slope'][0]:.3f} → {history['val_slope'][-1]:.3f}  "
+              f"(target ↑; {_arrow(history['val_slope'][0], history['val_slope'][-1], lower_better=False)})")
+        print(f"  Val bias:   {history['val_bias'][0]:+.2f} → {history['val_bias'][-1]:+.2f} dB  "
+              f"(target → 0)")
+        print(f"  Floor 0-10: {history['val_floor'][0]:.2f} → {history['val_floor'][-1]:.2f} dB  "
+              f"(GOAL-1 metric, target ↓; {_arrow(history['val_floor'][0], history['val_floor'][-1])})")
+    if best_extra:
+        print(f"\n  Best checkpoint (epoch {best_extra['epoch']}): "
+              f"MAE={best_extra['mae']:.2f} | slope={best_extra['slope']:.3f} | "
+              f"bias={best_extra['bias']:+.2f} | floor(0-10)={best_extra['floor_mae']:.2f} | "
+              f"deep(<16)={best_extra['deep_mae']:.2f}")
+        b = best_extra['bias']
+        if np.isfinite(b) and b > 1.0:
+            print("  ▸ Bias still positive → scotomata still under-deepened. "
+                  "Re-run with a higher --overpred-penalty (e.g. 0.9) or --floor-boost (e.g. 3.0).")
+        elif np.isfinite(b) and b < -1.0:
+            print("  ▸ Bias negative → over-deepening. Lower --overpred-penalty / --floor-boost.")
+        else:
+            print("  ▸ Bias near 0 → scotoma-depth calibration looks healthy.")
+    print(f"  Next: evaluate vs baseline with "
+          f"`python decoder/garway_heath_weighting.py --evaluate`")
     print("=" * 60)
 
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser(description="Train v10.2 PerPointVFModel (GRAPE)")
+    parser.add_argument('--weighting', choices=['baseline', 'garway_heath'],
+                        default='baseline',
+                        help="'baseline' = original value-based weight only (default); "
+                             "'garway_heath' = add the opt-in spatial sector weight.")
+    parser.add_argument('--sector-combine', choices=['both', 'sector_only', 'value_only'],
+                        default='both',
+                        help="How the sector weight combines with the existing "
+                             "value-based weight (only used with --weighting garway_heath).")
+    parser.add_argument('--epochs', type=int, default=EPOCHS,
+                        help="Override number of epochs (e.g. small value for a smoke test).")
+    parser.add_argument('--floor-boost', type=float, default=None,
+                        help="GH only: extra additive loss weight on the deepest GT "
+                             "points (<floor-db). 0 disables. Default from garway_heath_weighting.")
+    parser.add_argument('--overpred-penalty', type=float, default=None,
+                        help="GH only: extra Huber multiplier when OVER-predicting a "
+                             "deep point (counters +bias). 0 disables. Default from module.")
+    parser.add_argument('--floor-db', type=float, default=None,
+                        help="GH only: GT threshold (dB) defining the 'deep floor' for "
+                             "the boost/penalty. Default from module.")
+    args = parser.parse_args()
+
+    deep_cfg = None
+    if args.weighting == 'garway_heath':
+        # Save GH checkpoints alongside results, leaving the baseline ones intact.
+        from garway_heath_weighting import RESULTS_DIR, GH_MODEL, deep_loss_config
+        os.makedirs(RESULTS_DIR, exist_ok=True)
+        out_best      = os.path.join(RESULTS_DIR, "best_model_gh.pth")
+        out_inference = GH_MODEL
+        deep_cfg = deep_loss_config(floor_db=args.floor_db,
+                                    floor_boost=args.floor_boost,
+                                    overpred_penalty=args.overpred_penalty)
+    else:
+        out_best, out_inference = BEST_SAVE, INFERENCE_SAVE
+
+    train(weighting=args.weighting, sector_combine=args.sector_combine,
+          epochs=args.epochs, out_best=out_best, out_inference=out_inference,
+          deep_cfg=deep_cfg)
