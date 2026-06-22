@@ -149,8 +149,8 @@ SECTOR_WEIGHTS = {
 # Set FLOOR_BOOST=0 and OVERPRED_PENALTY=0 (or pass --floor-boost 0 etc.) to
 # recover the pure sector-weighted run from before.
 FLOOR_DB         = 12.0
-FLOOR_BOOST      = 2.0
-OVERPRED_PENALTY = 0.6
+FLOOR_BOOST      = 0.5
+OVERPRED_PENALTY = 0.15
 
 
 def deep_loss_config(floor_db=None, floor_boost=None, overpred_penalty=None):

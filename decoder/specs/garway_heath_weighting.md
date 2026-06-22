@@ -80,6 +80,52 @@ These two are the same root problem on the value axis, and they motivate the
 **deep-floor loss shaping** (§4.1) and the **per-sector re-tune** (§4): bump the
 laggard Superior-arcuate hardest, and add a value-axis rescue for deep points.
 
+### 1.2 Run 2 — Failure analysis and corrected design
+
+The second GH training run was launched with `--floor-boost 2.0 --overpred-penalty 0.6` to
+address run-1's positive bias (+0.73 dB). It auto-stopped at epoch 3 with a
+"SLOPE COLLAPSE" diagnostic after approximately 45 gradient steps. Post-mortem
+identified **three bugs** in the diagnostic / hyperparameter design — not a real
+slope collapse.
+
+**Bug 1 — Slope collapse check had no minimum-epoch guard.**
+`diagnose_training()` checked `len(slope) >= 3 and all(s < 0.08 for s in slope[-3:])`. With
+`epoch <= 3` forcing validation at epochs 1, 2, 3, the val slope is naturally
+0.001–0.013 for an uninitialized model. The check tripped after exactly 3
+epochs of data. This is initialization, not collapse.
+
+**Bug 2 — All diagnostic warnings had no minimum-check guard.**
+The bias soft-warning fired at epoch 1 with bias = −3.92 dB and attributed it
+to `--overpred-penalty`/`--floor-boost`. But at epoch 1 the model predicts
+approximately `PROJ_INIT_BIAS ≈ 18 dB` for all points while mean true
+sensitivity is approximately 22 dB, giving a natural initialization bias of
+approximately −4 dB. The floor_boost had had no time to cause anything.
+
+**Bug 3 — floor_boost=2.0 and overpred_penalty=0.6 are too aggressive for their intent.**
+Run-1 GH had +0.73 dB bias at convergence — a real but modest over-prediction.
+Values of 2.0 and 0.6 were chosen to push hard in the other direction, but they
+are large enough to reverse the direction entirely once the model warms up.
+
+**Corrected design values** (updated in §4.1 and in `garway_heath_weighting.py`
+module defaults):
+
+| constant | run-2 (failed) | corrected |
+|---|---:|---:|
+| FLOOR_BOOST | 2.0 | **0.5** |
+| OVERPRED_PENALTY | 0.6 | **0.15** |
+
+Conservative enough to nudge the positive bias without overcorrecting.
+
+**Corrected diagnostic guard thresholds** (updated in §8 and in
+`training.py diagnose_training()`):
+
+| guard | before | after | rationale |
+|---|---|---|---|
+| Slope collapse minimum | `len(slope) >= 3` | `len(slope) >= 8` | ≥16 epochs after the val gate opens; model has time to actually learn |
+| Bias warning minimum | none | `len(bias) >= 5` | skip initialization transients |
+| Slope warning minimum | none | `len(slope) >= 5` | skip initialization transients |
+| Rising-floor warning minimum | `len(floor) >= 3` | `len(floor) >= 5` | reduce false positives early in training |
+
 ---
 
 ## 2. The 52-point → sector mapping
@@ -209,8 +255,8 @@ the dB scale — see below.)
 Sector weights are *spatial* and cannot target a value band, so they can't fix
 the run-1 deep-point regression or the positive bias (§1.1). This adds a
 **value-axis** rescue, defined as editable constants in
-`garway_heath_weighting.py` (`FLOOR_DB=12.0`, `FLOOR_BOOST=2.0`,
-`OVERPRED_PENALTY=0.6`) and surfaced via `deep_loss_config(floor_db=None,
+`garway_heath_weighting.py` (`FLOOR_DB=12.0`, `FLOOR_BOOST=0.5`,
+`OVERPRED_PENALTY=0.15`) and surfaced via `deep_loss_config(floor_db=None,
 floor_boost=None, overpred_penalty=None)`, which returns a plain dict (no
 `import training` — preserves the no-circular-import design; `None` args fall back
 to the module defaults so CLI flags can override individual fields).
@@ -335,9 +381,13 @@ modes (positive bias, deep-point regression, slope collapse):
   `(should_stop, reason, warnings)`. Hard auto-stops, each with a plain-English
   reason, on: (1) a **non-finite metric** (numerical instability); (2) **val MAE
   diverging** (rose 3 checks straight *and* > 1 dB above best); (3) **slope
-  collapse** (val slope < 0.08 for 3 checks straight = regression-to-mean). Soft
-  live **warnings** (no stop) on: low slope (< 0.20), large |bias| (> 2 dB), and
-  a rising deep-floor MAE. The existing plateau-patience stop now also records a
+  collapse** (val slope < 0.08 for **8 checks** straight — requires `len(slope) >= 8`
+  before the check can fire, giving the model at minimum ~16 epochs after the val
+  gate first opens to actually learn; see §1.2 for why the former threshold of 3
+  caused a false stop in run 2). Soft live **warnings** (no stop), each with a
+  **minimum-check guard** to skip initialization transients: low slope (< 0.20,
+  requires `len(slope) >= 5`), large |bias| (> 2 dB, requires `len(bias) >= 5`),
+  and a rising deep-floor MAE (requires `len(floor) >= 5`; formerly 3). The existing plateau-patience stop now also records a
   reason.
 - **End-of-run "DIAGNOSIS" block.** Prints the stop reason and the
   start→best/last trajectory of Val MAE, slope, bias, and Floor 0–10 (the goal-1

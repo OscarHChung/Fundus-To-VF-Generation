@@ -854,23 +854,26 @@ def diagnose_training(history):
                           f"checkpoint is already saved."), warns
 
     # Hard stop 3 — slope collapse (predictions flattening to a constant mean).
-    if len(slope) >= 3 and all(s < 0.08 for s in slope[-3:]):
-        return True, (f"SLOPE COLLAPSE — val slope stuck <0.08 for 3 checks "
-                      f"(now {cur_slope:.3f}); predictions are regressing to a "
-                      f"constant. Ease regularization (dropout/weight-decay) or "
-                      f"the variance penalty."), warns
+    # Guard: require ≥8 val evaluations so initialization-phase low slope
+    # (naturally near 0 in the first ~20 epochs) cannot trigger this.
+    if len(slope) >= 8 and all(s < 0.08 for s in slope[-8:]):
+        return True, (f"SLOPE COLLAPSE — val slope stuck <0.08 for 8 consecutive "
+                      f"checks (now {cur_slope:.3f}); predictions are regressing "
+                      f"to a constant. Ease regularization (dropout/weight-decay) "
+                      f"or the variance penalty."), warns
 
     # Soft warnings (printed live; do NOT stop).
-    if cur_slope < 0.20:
+    # Guard: require ≥5 checks so uninitialized-model noise doesn't fire these.
+    if len(slope) >= 5 and cur_slope < 0.20:
         warns.append(f"slope low ({cur_slope:.3f}) — watch for regression-to-mean")
-    if np.isfinite(cur_bias) and abs(cur_bias) > 2.0:
+    if len(bias) >= 5 and np.isfinite(cur_bias) and abs(cur_bias) > 2.0:
         if cur_bias > 0:
             warns.append(f"large +bias ({cur_bias:+.2f} dB) — scotoma depth is "
                          f"being UNDER-estimated; raise --overpred-penalty")
         else:
             warns.append(f"large -bias ({cur_bias:+.2f} dB) — depth is being "
                          f"OVER-estimated; lower --overpred-penalty/--floor-boost")
-    if len(floor) >= 3 and floor[-1] > floor[-2] > floor[-3]:
+    if len(floor) >= 5 and floor[-1] > floor[-2] > floor[-3]:
         warns.append(f"deep-floor (0-10 dB) MAE rising ({floor[-1]:.2f}) — the "
                      f"goal-1 metric is regressing; consider raising "
                      f"--floor-boost / --overpred-penalty")
