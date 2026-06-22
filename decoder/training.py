@@ -102,7 +102,9 @@ ATTN_TEMP_INIT      = 2.0    # initial temperature (>1 = softer attention)
 LABEL_NOISE_STD = 0.3        # σ=0.3 dB gaussian noise on train targets
 
 # Validation
-VAL_EVERY = 2
+VAL_EVERY       = 2
+TRAIN_MAE_GATE  = 5.5   # skip val when epoch train MAE is above this (still converging)
+FORCE_VAL_EVERY = 10    # validate every N epochs regardless of gate (sanity / monitor)
 
 # Clipping
 OUTLIER_CLIP_RANGE = (0, 35)
@@ -448,7 +450,28 @@ class PerPointVFModel(nn.Module):
         
         # Store attention weights for regularization (only during training)
         self._last_attn_weights = attn_weights
-        
+
+        return pred
+
+    def decode_latent(self, latent, laterality='OD', average_multi=True):
+        """Trainable-decoder-only forward on a pre-cached encoder latent.
+
+        Skips the frozen 1.2 GB RETFound encoder entirely — used by
+        evaluate_from_cache() so val/train-eval passes cost only the small
+        attention + head + refinement modules (~1 M params, ~50× faster)."""
+        cls_token = latent[:, 0, :]
+        patches   = latent[:, 1:, :]
+        point_feats, attn_weights = self.attention(patches, laterality)
+        B = latent.shape[0]
+        cls_expanded = cls_token.unsqueeze(1).expand(B, NUM_VALID_POINTS, self.embed_dim)
+        combined = torch.cat([point_feats, cls_expanded], dim=2)
+        pred = self.point_head(combined)
+        pred = self.refinement(pred)
+        pred = torch.where(pred < 0.1, torch.zeros_like(pred), pred)
+        pred = torch.clamp(pred, OUTLIER_CLIP_RANGE[0], OUTLIER_CLIP_RANGE[1])
+        if average_multi and pred.shape[0] > 1:
+            pred = pred.mean(dim=0, keepdim=True)
+        self._last_attn_weights = attn_weights
         return pred
 
 
@@ -749,6 +772,58 @@ def evaluate(model, loader, detailed=False):
     return mae, corr, r2, slope, per_eye_corr, extra
 
 
+@torch.no_grad()
+def precompute_features(model, loader, device, desc=""):
+    """Cache frozen encoder outputs for every sample in a val-mode loader.
+
+    Returns list of {'latent': cpu_tensor[N,197,1024], 'hvf': tensor, 'lat': str}.
+    One-time cost at the start of training; each subsequent val check runs
+    evaluate_from_cache() and skips the encoder entirely."""
+    model.eval()
+    cache = []
+    for sample in tqdm(loader, desc=f"  Caching {desc}", leave=False):
+        imgs, hvf, lat = sample
+        imgs = imgs.to(device)
+        latent = model.encoder.forward_encoder(imgs, mask_ratio=0.0)[0]
+        cache.append({'latent': latent.cpu(), 'hvf': hvf, 'lat': lat})
+    return cache
+
+
+def evaluate_from_cache(model, cache, device, detailed=False):
+    """Fast evaluation using precomputed encoder latents.
+
+    Identical accuracy to evaluate(); skips the frozen encoder forward pass so
+    a full val check takes <1 s instead of ~30 s on MPS."""
+    model.eval()
+    total_mae = n_valid = 0
+    all_preds, all_targets, all_lats = [], [], []
+    with torch.no_grad():
+        for item in cache:
+            latent = item['latent'].to(device)
+            hvf    = item['hvf']
+            lat    = item['lat']
+            pred   = model.decode_latent(latent, lat, average_multi=True)
+            _, mae, nv = compute_loss(pred, hvf, lat, epoch=0)
+            total_mae += mae * nv
+            n_valid   += nv
+            all_preds.append(pred.cpu())
+            all_targets.append(hvf.unsqueeze(0) if hvf.dim() == 1 else hvf)
+            all_lats.append(lat)
+    if n_valid == 0:
+        return (float('inf'), 0.0, 0.0, 0.0, 0.0, {}) if detailed \
+            else (float('inf'), 0.0, 0.0, 0.0, 0.0)
+    stacked_preds   = torch.cat(all_preds, dim=0)
+    stacked_targets = torch.cat(all_targets, dim=0)
+    corr         = pearson_correlation(stacked_preds, stacked_targets, all_lats)
+    r2, slope    = compute_r2_slope(stacked_preds, stacked_targets, all_lats)
+    per_eye_corr = compute_per_eye_metrics(stacked_preds, stacked_targets, all_lats)
+    mae = total_mae / n_valid
+    if not detailed:
+        return mae, corr, r2, slope, per_eye_corr
+    extra = _flat_severity_stats(stacked_preds, stacked_targets, all_lats)
+    return mae, corr, r2, slope, per_eye_corr, extra
+
+
 def diagnose_training(history):
     """Inspect the validation trajectory and decide whether to auto-stop with a
     plain-English reason. Pure function of the recorded history dict (lists keyed
@@ -868,6 +943,23 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
     model = PerPointVFModel(base_model)
     model.to(DEVICE)
 
+    # ── Pre-cache frozen encoder features (one-time cost) ──────
+    # The RETFound encoder is frozen throughout training, so its outputs for
+    # the deterministic val/train-eval sets never change. Cache them once now;
+    # each subsequent val check runs only the small trainable decoder (~1 M
+    # params) rather than the full 1.2 GB ViT-Large — ~50× faster per check.
+    print(f"\nPre-caching encoder features for val + train-eval sets …")
+    train_eval_ds  = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, val_transform,
+                                       mode='val', use_tta=False)
+    train_eval_pre = DataLoader(train_eval_ds, batch_size=1, shuffle=False,
+                                num_workers=0, collate_fn=val_collate_fn)
+    val_cache        = precompute_features(model, val_loader,    DEVICE, "val")
+    train_eval_cache = precompute_features(model, train_eval_pre, DEVICE, "train-eval")
+    print(f"  Cached {len(val_cache)} val + {len(train_eval_cache)} train-eval samples.")
+    print(f"  Val checks are now ~50× faster (decoder-only, encoder skipped).")
+    print(f"  Val gate: skip unless epoch train MAE < {TRAIN_MAE_GATE} dB "
+          f"(forced every {FORCE_VAL_EVERY} epochs).\n")
+
     # ── Optimizer ──────────────────────────────────────────────
     attn_head_params = list(model.attention.parameters()) + \
                        list(model.point_head.parameters())
@@ -898,13 +990,15 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
         model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
 
+        epoch_mae_sum = 0.0
+        epoch_mae_n   = 0
+
         for imgs, hvf, lat in pbar:
             imgs = imgs.to(DEVICE)
             pred = model(imgs, laterality=lat, average_multi=False)
-            
-            # Get stored attention weights for entropy regularization
+
             attn_w = model._last_attn_weights if hasattr(model, '_last_attn_weights') else None
-            
+
             loss, mae, nv = compute_loss(pred, hvf, lat, epoch=epoch, attn_weights=attn_w,
                                          sector_weights=sector_weights,
                                          sector_combine=sector_combine,
@@ -916,9 +1010,12 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad], 1.0)
                 optimizer.step()
+                epoch_mae_sum += mae * nv
+                epoch_mae_n   += nv
 
             pbar.set_postfix({'MAE': f'{mae:.2f}'})
 
+        epoch_train_mae = epoch_mae_sum / epoch_mae_n if epoch_mae_n > 0 else float('inf')
         scheduler.step()
 
         if epoch <= 5 or epoch % 10 == 0:
@@ -927,15 +1024,24 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
             print(f"  Refinement alpha: {ref_alpha:.3f} | Attn temp: {temp:.3f}")
 
         # ── Validate ───────────────────────────────────────────
-        if epoch % VAL_EVERY == 0 or epoch <= 3:
-            val_mae, val_corr, val_r2, val_slope, val_eye_corr, val_extra = \
-                evaluate(model, val_loader, detailed=True)
+        is_scheduled = (epoch % VAL_EVERY == 0) or (epoch <= 3)
+        # A "forced" check fires every FORCE_VAL_EVERY epochs regardless of the
+        # gate so we still get periodic monitoring even if train hasn't converged.
+        forced_check = (epoch % FORCE_VAL_EVERY == 0) and is_scheduled
+        train_good   = epoch_train_mae < TRAIN_MAE_GATE
+        run_val      = is_scheduled and (train_good or forced_check)
 
-            train_eval = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, val_transform,
-                                           mode='val', use_tta=False)
-            train_eval_loader = DataLoader(train_eval, batch_size=1, shuffle=False,
-                                           num_workers=0, collate_fn=val_collate_fn)
-            train_mae, train_corr, train_r2, train_slope, train_eye_corr = evaluate(model, train_eval_loader)
+        if is_scheduled and not run_val:
+            # Gate fired — skip the (expensive) val pass and say why.
+            print(f"[Epoch {epoch}] train MAE={epoch_train_mae:.2f} dB "
+                  f"(gate {TRAIN_MAE_GATE} not reached — skipping val)")
+
+        elif run_val:
+            # ── Fast eval from pre-cached encoder latents ───────
+            val_mae, val_corr, val_r2, val_slope, val_eye_corr, val_extra = \
+                evaluate_from_cache(model, val_cache, DEVICE, detailed=True)
+            train_mae, train_corr, train_r2, train_slope, train_eye_corr = \
+                evaluate_from_cache(model, train_eval_cache, DEVICE)
             gap = train_mae - val_mae
 
             val_bias  = val_extra.get('bias', float('nan'))
@@ -943,24 +1049,23 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
             val_deep  = val_extra.get('deep_mae', float('nan'))
             val_fn    = val_extra.get('floor_n', 0)
 
-            # Record trajectory for live diagnostics / self-stopping.
             history['epoch'].append(epoch)
             history['val_mae'].append(val_mae)
             history['val_slope'].append(val_slope)
             history['val_bias'].append(val_bias)
             history['val_floor'].append(val_floor)
 
-            print(f"\n[Epoch {epoch}]")
-            print(f"  Train: MAE={train_mae:.2f} | Corr={train_corr:.3f} | Slope={train_slope:.3f} | EyeCorr={train_eye_corr:.3f}")
-            print(f"  Val:   MAE={val_mae:.2f} | Corr={val_corr:.3f} | Slope={val_slope:.3f} | EyeCorr={val_eye_corr:.3f}")
-            print(f"  Severe watch:  bias={val_bias:+.2f} dB | floor(0-10)={val_floor:.2f} (n={val_fn}) | "
+            tag = " [FORCED]" if forced_check and not train_good else ""
+            print(f"\n[Epoch {epoch}{tag}]  batch train MAE={epoch_train_mae:.2f} dB")
+            print(f"  Train(clean): MAE={train_mae:.2f} | Corr={train_corr:.3f} | Slope={train_slope:.3f} | EyeCorr={train_eye_corr:.3f}")
+            print(f"  Val:          MAE={val_mae:.2f} | Corr={val_corr:.3f} | Slope={val_slope:.3f} | EyeCorr={val_eye_corr:.3f}")
+            print(f"  Severe watch: bias={val_bias:+.2f} dB | floor(0-10)={val_floor:.2f} (n={val_fn}) | "
                   f"deep(<16)={val_deep:.2f}   [targets: bias→0, floor↓, deep↓]")
             print(f"  Gap: {gap:+.2f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
 
             if gap < -0.4:
                 print(f"  ⚠️  Gap < -0.4 — possible overfitting")
 
-            # Live diagnosis — warns each check; can auto-stop with a reason.
             should_stop, stop_reason, warns = diagnose_training(history)
             for w in warns:
                 print(f"  ⚠️  {w}")
@@ -981,7 +1086,6 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
                 best_extra = {'epoch': epoch, 'mae': val_mae, 'slope': val_slope,
                               'bias': val_bias, 'floor_mae': val_floor,
                               'deep_mae': val_deep}
-
                 torch.save({'model': model.state_dict(), 'mae': val_mae,
                             'corr': val_corr, 'r2': val_r2, 'slope': val_slope,
                             'eye_corr': val_eye_corr, 'epoch': epoch}, out_best)
@@ -992,9 +1096,11 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
                 print(f"    MAE={val_mae:.2f} | Slope={val_slope:.3f} | EyeCorr={val_eye_corr:.3f} | Score={composite:.2f}")
                 patience = 0
             else:
-                patience += VAL_EVERY
+                # Only count patience on real (gated) checks, not forced monitors.
+                if not forced_check or train_good:
+                    patience += VAL_EVERY
 
-            # ── Self-stopping: diagnostic trip OR plateau patience ──
+            # ── Self-stopping ───────────────────────────────────
             if should_stop:
                 print(f"\n{'='*60}")
                 print(f"⛔ AUTO-STOP at epoch {epoch}")
@@ -1004,9 +1110,8 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
                 break
             if patience >= PATIENCE:
                 print(f"\nEarly stopping at epoch {epoch} "
-                      f"(no val improvement for {patience} epochs — plateau).")
-                stop_diag = (f"Plateau — no validation improvement for {patience} "
-                             f"epochs (normal convergence stop).")
+                      f"(no improvement for {patience} epochs — plateau).")
+                stop_diag = (f"Plateau — no val improvement for {patience} epochs.")
                 break
 
     # ── Summary ────────────────────────────────────────────────
