@@ -90,7 +90,7 @@ MAX_DB         = 35.0
 PER_EYE_CCC_WEIGHT = 0.15
 PER_EYE_CCC_START  = 5
 
-# Variance penalty
+# Variance penalty (iter-5 showed removing it overfits → restored)
 VARIANCE_WEIGHT = 0.05
 VARIANCE_START  = 8
 
@@ -99,7 +99,7 @@ ATTN_ENTROPY_WEIGHT = 0.01   # small bonus for spread-out attention
 ATTN_TEMP_INIT      = 2.0    # initial temperature (>1 = softer attention)
 
 # ── NEW: Label noise ──────────────────────────────────────────
-LABEL_NOISE_STD = 0.3        # σ=0.3 dB gaussian noise on train targets
+LABEL_NOISE_STD = 0.3        # iter-5 showed removing it overfits → restored
 
 # Validation
 VAL_EVERY       = 2
@@ -129,6 +129,11 @@ DIST_LOSS_WEIGHT = 0.5     # default λ on the soft-CE term in compute_loss
 #   inverse-(smoothed)-density weight derived from the train label distribution.
 LDS_SIGMA_DB = 2.0         # dB; Gaussian kernel σ for smoothing the label density
 LDS_MAX_WEIGHT = 4.0       # cap on any single bin's weight (run-4: 6 over-deepened)
+
+# Weight EMA — exponential moving average of decoder weights, evaluated/saved
+# instead of the raw weights. Low-risk variance reduction on the plateau (the
+# 211-eye generalization ceiling). 0 disables.
+EMA_DECAY = 0.998
 
 # Bias control — per-eye mean-error penalty. Decouples "deep points should be
 # deep" (goal 1) from "the whole field is shifted down" (the −4 dB bias runaway
@@ -199,6 +204,11 @@ print("✓ Loaded RETFound")
 train_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.RandomRotation(ROTATION_DEG),
+    # Photometric jitter (iter-7): fundus illumination/contrast varies a lot
+    # across cameras/patients; this regularizes the frozen-encoder→decoder probe
+    # without touching geometry (the banned affine would disturb the anatomical
+    # prior; ColorJitter does not). Targets the 211-eye generalization ceiling.
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
@@ -1109,6 +1119,43 @@ def diagnose_training(history, target_mae=SUBGOAL_TARGET_MAE):
     return False, None, warns
 
 
+# ============== Weight EMA ==============
+class WeightEMA:
+    """Exponential moving average of the trainable decoder params. Evaluated and
+    saved instead of the raw weights to cut val variance on the plateau."""
+    def __init__(self, modules, decay=EMA_DECAY):
+        self.decay = decay
+        self.step = 0
+        self.params = [p for m in modules for p in m.parameters() if p.requires_grad]
+        self.shadow = [p.detach().clone() for p in self.params]
+        self._backup = None
+
+    @torch.no_grad()
+    def update(self):
+        # Warmup: low effective decay early so the average tracks the model from
+        # the start instead of anchoring to the (near-constant) init weights —
+        # the iter-6 slope-collapse bug on short runs.
+        self.step += 1
+        d = min(self.decay, (1.0 + self.step) / (10.0 + self.step))
+        for s, p in zip(self.shadow, self.params):
+            s.mul_(d).add_(p.detach(), alpha=1.0 - d)
+
+    @torch.no_grad()
+    def apply_to(self):
+        """Swap EMA weights into the live model (keeps a backup to restore)."""
+        self._backup = [p.detach().clone() for p in self.params]
+        for p, s in zip(self.params, self.shadow):
+            p.copy_(s)
+
+    @torch.no_grad()
+    def restore(self):
+        if self._backup is None:
+            return
+        for p, b in zip(self.params, self._backup):
+            p.copy_(b)
+        self._backup = None
+
+
 # ============== Champion tracking (best-ever model + methods) ==============
 CHAMPION_DIR = os.path.join(CURRENT_DIR, "results", "champion")
 
@@ -1156,12 +1203,14 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
           use_dist=False, dist_blend=DIST_BLEND, dist_loss_weight=DIST_LOSS_WEIGHT,
           reweight='value', lds_sigma=LDS_SIGMA_DB, target_mae=SUBGOAL_TARGET_MAE,
           bias_penalty=BIAS_PENALTY_WEIGHT,
-          attn_dropout=None, head_dropout=None, weight_decay=None):
-    # Regularization overrides (for fast autonomous sweeps without code edits).
-    global ATTN_DROPOUT, HEAD_DROPOUT, ATTN_WD
+          attn_dropout=None, head_dropout=None, weight_decay=None, lr=None,
+          ema_decay=EMA_DECAY):
+    # Regularization / LR overrides (for fast autonomous sweeps without edits).
+    global ATTN_DROPOUT, HEAD_DROPOUT, ATTN_WD, ATTN_LR
     if attn_dropout is not None: ATTN_DROPOUT = attn_dropout
     if head_dropout is not None: HEAD_DROPOUT = head_dropout
     if weight_decay is not None: ATTN_WD = weight_decay
+    if lr is not None: ATTN_LR = lr
 
     print("=" * 60)
     print("Training v10.2 — Per-point attention + Garway–Heath")
@@ -1291,6 +1340,15 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
         optimizer, T_max=epochs, eta_min=1e-6
     )
 
+    # Weight EMA over the trainable decoder modules (eval/save the EMA weights).
+    ema = None
+    if ema_decay and ema_decay > 0:
+        ema_mods = [model.attention, model.point_head, model.refinement]
+        if use_dist:
+            ema_mods.append(model.dist_head)
+        ema = WeightEMA(ema_mods, decay=ema_decay)
+        print(f"✓ Weight EMA ON (decay={ema_decay})")
+
     best_mae    = float('inf')
     best_corr   = 0.0
     best_slope  = 0.0
@@ -1331,6 +1389,8 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad], 1.0)
                 optimizer.step()
+                if ema is not None:
+                    ema.update()
                 epoch_mae_sum += mae * nv
                 epoch_mae_n   += nv
 
@@ -1358,6 +1418,9 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
                   f"(gate {TRAIN_MAE_GATE} not reached — skipping val)")
 
         elif run_val:
+            # Evaluate (and save) the EMA weights, not the raw ones.
+            if ema is not None:
+                ema.apply_to()
             # ── Fast eval from pre-cached encoder latents ───────
             val_mae, val_corr, val_r2, val_slope, val_eye_corr, val_extra = \
                 evaluate_from_cache(model, val_cache, DEVICE, detailed=True)
@@ -1422,6 +1485,10 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
                 # Only count patience on real (gated) checks, not forced monitors.
                 if not forced_check or train_good:
                     patience += VAL_EVERY
+
+            # Restore raw weights so training continues from them.
+            if ema is not None:
+                ema.restore()
 
             # ── Self-stopping ───────────────────────────────────
             if should_stop:
@@ -1505,7 +1572,9 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
         'reweight': reweight, 'lds_sigma': (lds_sigma if reweight == 'lds' else None),
         'bias_penalty': bias_penalty, 'deep_cfg': deep_cfg,
         'attn_dropout': ATTN_DROPOUT, 'head_dropout': HEAD_DROPOUT,
-        'attn_weight_decay': ATTN_WD, 'epochs': epochs,
+        'attn_weight_decay': ATTN_WD, 'attn_lr': ATTN_LR,
+        'ema_decay': ema_decay, 'label_noise': LABEL_NOISE_STD,
+        'variance_weight': VARIANCE_WEIGHT, 'epochs': epochs,
     }
     _update_champion(best_mae, best_extra, run_config, out_inference)
     return best_mae, best_extra
@@ -1558,6 +1627,11 @@ if __name__ == "__main__":
                              "Default keeps the module constants (0.4).")
     parser.add_argument('--weight-decay', type=float, default=None,
                         help="Override attention/head weight decay. Default keeps 0.015.")
+    parser.add_argument('--lr', type=float, default=None,
+                        help="Override attention/head LR. Default keeps 5e-4 (v10.1 used 8e-4).")
+    parser.add_argument('--ema-decay', type=float, default=EMA_DECAY,
+                        help="Weight-EMA decay (eval/save the EMA weights). 0 disables. "
+                             "Default %(default)s.")
     args = parser.parse_args()
 
     deep_cfg = None
@@ -1581,4 +1655,4 @@ if __name__ == "__main__":
           reweight=args.reweight, lds_sigma=args.lds_sigma, target_mae=args.target_mae,
           bias_penalty=args.bias_penalty,
           attn_dropout=args.dropout, head_dropout=args.dropout,
-          weight_decay=args.weight_decay)
+          weight_decay=args.weight_decay, lr=args.lr, ema_decay=args.ema_decay)

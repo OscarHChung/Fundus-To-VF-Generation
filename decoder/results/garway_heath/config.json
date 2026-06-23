@@ -280,6 +280,6 @@
   "os_convention": "fliplr(mask_OD)  (matches training.py)",
   "target": "raw threshold sensitivity (dB), clamped 0-35",
   "masked_value_threshold": 99.0,
-  "combine": "both",
+  "combine": "sector_only",
   "epochs": 100
 }

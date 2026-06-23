@@ -1,0 +1,32 @@
+{
+  "val_mae": 4.145488903877583,
+  "severe": {
+    "epoch": 42,
+    "mae": 4.145488903877583,
+    "slope": 0.3665252051002129,
+    "bias": 0.11186831743256745,
+    "floor_mae": 11.964753929525614,
+    "deep_mae": 9.22344300809082
+  },
+  "methods": {
+    "weighting": "garway_heath",
+    "sector_combine": "sector_only",
+    "head": "scalar",
+    "dist_blend": null,
+    "dist_loss_weight": null,
+    "reweight": "value",
+    "lds_sigma": null,
+    "bias_penalty": 0.1,
+    "deep_cfg": {
+      "floor_db": 12.0,
+      "floor_boost": 0.5,
+      "overpred_penalty": 0.15
+    },
+    "attn_dropout": 0.2,
+    "head_dropout": 0.2,
+    "attn_weight_decay": 0.005,
+    "epochs": 100
+  },
+  "previous_best": 4.249445463748688,
+  "timestamp": "2026-06-22T04:17:32"
+}
