@@ -1,14 +1,7 @@
-import pandas as pd
 import numpy as np
 from scipy.spatial import cKDTree
-import json
 from scipy.interpolate import griddata
-
-grape = pd.read_excel("data/vf_tests/grape_data.xlsx", sheet_name="Baseline")
-grape_vf = grape.iloc[:, -61:].values
-patient_ids = grape.iloc[:, 0].values
-laterality = grape.iloc[:, 1].values
-fundus_files = grape.iloc[:, 16].values
+import json
 
 # Degree locations of G1 vf tests (59 not including blind spots)
 G1_LOCATIONS_RIGHT = np.array([
@@ -100,34 +93,8 @@ def spiral_order(eye):
                 33, 34, 35, 36, 37, 38,
                 52, 53] # left eye
 
-# Mask 22nd and 33rd columns (blind spots)
-mask = np.ones(grape_vf.shape[1], dtype=bool)
-mask[21] = False
-mask[32] = False
-vf_removed = grape_vf[:, mask]
 
-# Reorder each row based on laterality (59 columns instead of 61)
-reordered_vf = np.zeros_like(vf_removed)
-
-for i, (vf_row, lat) in enumerate(zip(vf_removed, laterality)):
-    order = spiral_order(lat)
-    reordered_vf[i] = vf_row[order]
-
-reordered_df = pd.DataFrame(
-    reordered_vf,
-    index=patient_ids,
-    columns=[f"VF_{i}" for i in range(reordered_vf.shape[1])]
-)
-reordered_df.insert(0, "PatientID", patient_ids)
-reordered_df.insert(1, "Laterality", laterality)
-reordered_df.insert(2, "FundusFile", fundus_files)
-
-reordered_df = reordered_df.iloc[1:]
-
-# Mapping from G1 to 24-2
-kd_right = cKDTree(VF24_2_RIGHT)
-kd_left = cKDTree(VF24_2_LEFT)
-
+# 24-2 valid-point mask for the right eye (8x9 grid; 52 valid of 72 cells)
 mask_OD = np.array([
     [False, False, False,  True,  True,  True,  True, False, False],
     [False, False,  True,  True,  True,  True,  True,  True, False],
@@ -138,63 +105,73 @@ mask_OD = np.array([
     [False, False, True,  True,  True,  True, True, True, False],
     [False, False, False, True,  True,  True, True, False, False]
 ], dtype=bool)
-mask_OS = reversed_rows_arr = mask_OD[:, ::-1]
-output = []
+mask_OS = mask_OD[:, ::-1]
 
-for i, pid in enumerate(patient_ids):
-    if pd.isna(pid):
-        continue
+# Module-level KD-trees over the 24-2 locations (reused by g1_to_hvf)
+_KD_RIGHT = cKDTree(VF24_2_RIGHT)
+_KD_LEFT = cKDTree(VF24_2_LEFT)
 
-    eye = str(laterality[i]).upper()
-    if eye not in ["OD", "OS"]:
-        print(f"Unknown laterality {eye} for patient {pid}, skipping")
-        continue
 
-    # KD-Tree selection
+def g1_to_hvf(g1_61, laterality):
+    """Map 61 raw G1 sensitivity values (GRAPE column order, including the two blind-spot
+    columns at indices 21 and 32) to an 8x9 HVF 24-2 grid (Python lists), 100.0 at masked
+    cells. This is the exact mapping the Baseline pipeline uses, factored out for reuse."""
+    eye = str(laterality).strip().upper()
+    eye = "OD" if eye.startswith("OD") else "OS"
+    vf = np.asarray(g1_61, dtype=float)
+    keep = np.ones(vf.shape[0], dtype=bool)
+    keep[21] = False
+    keep[32] = False
+    vf = vf[keep]                       # 61 -> 59 (drop blind spots)
+    vf = vf[spiral_order(eye)]          # reorder into G1_LOCATIONS order
     if eye == "OD":
-        g1_points = G1_LOCATIONS_RIGHT
-        kd_tree = kd_right
-        mask = mask_OD
+        g1_pts, kd, mask = G1_LOCATIONS_RIGHT, _KD_RIGHT, mask_OD
     else:
-        g1_points = G1_LOCATIONS_LEFT
-        kd_tree = kd_left
-        mask = mask_OS
-
-    # KD-Tree mapping
-    vf_row = reordered_vf[i]
-    distances, indices = kd_tree.query(g1_points)
-    temp = [[] for _ in range(len(kd_tree.data))]
-    for g1_val, idx in zip(vf_row, indices):
-        temp[idx].append(g1_val)
-    mapped_values = [np.mean(vals) if vals else np.nan for vals in temp]
-
-    # Fill NaNs with nearest neighbor
-    mapped_values = np.array(mapped_values)
-    nan_mask = np.isnan(mapped_values)
+        g1_pts, kd, mask = G1_LOCATIONS_LEFT, _KD_LEFT, mask_OS
+    _, indices = kd.query(g1_pts)
+    buckets = [[] for _ in range(len(kd.data))]
+    for g1_val, idx in zip(vf, indices):
+        buckets[idx].append(g1_val)
+    mapped = np.array([np.mean(b) if b else np.nan for b in buckets])
+    nan_mask = np.isnan(mapped)
     if nan_mask.any():
-        from scipy.interpolate import griddata
-        mapped_values[nan_mask] = griddata(
-            points=kd_tree.data[~nan_mask],
-            values=mapped_values[~nan_mask],
-            xi=kd_tree.data[nan_mask],
-            method='nearest'
-        )
+        mapped[nan_mask] = griddata(kd.data[~nan_mask], mapped[~nan_mask],
+                                    kd.data[nan_mask], method="nearest")
+    grid = np.full(mask.shape, 100.0)
+    grid[mask] = mapped
+    return grid.tolist()
 
-    # Insert values into 2D HVF matrix with padding = 100
-    hvf_matrix = np.full(mask.shape, 100.0)
-    hvf_matrix[mask] = mapped_values
 
-    # Add to JSON
-    entry = {
-        "PatientID": int(pid),
-        "FundusImage": fundus_files[i],
-        "Laterality": eye,
-        "hvf": hvf_matrix.tolist()
-    }
-    output.append(entry)
+def _convert_baseline():
+    """Original behavior: convert the Baseline sheet's G1 fields to 8x9 HVF JSON.
+    Requires pandas + openpyxl (only needed when run as a script)."""
+    import pandas as pd
+    grape = pd.read_excel("data/vf_tests/grape_data.xlsx", sheet_name="Baseline")
+    grape_vf = grape.iloc[:, -61:].values
+    patient_ids = grape.iloc[:, 0].values
+    laterality = grape.iloc[:, 1].values
+    fundus_files = grape.iloc[:, 16].values
 
-# Save JSON
-with open("data/vf_tests/grape_new_vf_tests.json", "w") as f:
-    json.dump(output, f, indent=2)
+    output = []
+    for i, pid in enumerate(patient_ids):
+        if pd.isna(pid):
+            continue
+        eye = str(laterality[i]).upper()
+        if eye not in ["OD", "OS"]:
+            print(f"Unknown laterality {eye} for patient {pid}, skipping")
+            continue
+        hvf_matrix = g1_to_hvf(grape_vf[i], eye)
+        output.append({
+            "PatientID": int(pid),
+            "FundusImage": fundus_files[i],
+            "Laterality": eye,
+            "hvf": hvf_matrix,
+        })
 
-print("Saved 24-2 HVFs as 8x9 matrices with padding around eye in JSON")
+    with open("data/vf_tests/grape_new_vf_tests.json", "w") as f:
+        json.dump(output, f, indent=2)
+    print("Saved 24-2 HVFs as 8x9 matrices with padding around eye in JSON")
+
+
+if __name__ == "__main__":
+    _convert_baseline()
