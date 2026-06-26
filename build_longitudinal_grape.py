@@ -80,14 +80,30 @@ def read_followup(xlsx_path):
 
 
 def build(xlsx_path, fundus_dir, out_path):
-    """Write per-visit records for every visit whose fundus photo exists on disk."""
+    """Write per-visit records for every visit whose fundus photo exists on disk.
+
+    Each record also carries `interval_years` (cumulative years from baseline) and its
+    most-recent CAUSAL prior VF (`prior_hvf`, from ANY earlier follow-up visit of the same
+    eye — photo-bearing or not, since interim visits are temporally closer), with the
+    visit-to-visit gap `delta_t`. Visit-1 records have prior_hvf=None / has_prior=False.
+    """
+    from collections import defaultdict
     have = set(os.listdir(fundus_dir))
     rows = read_followup(xlsx_path)
+    # full per-eye VF timeline (ALL visits, photo or not), sorted by visit
+    timeline = defaultdict(list)
+    for r in rows:
+        timeline[(r["subject"], r["laterality"])].append(r)
+    for k in timeline:
+        timeline[k].sort(key=lambda x: x["visit"])
     recs = []
     for r in rows:
         if r["cfp"] not in have:          # "/" or a photo we don't have
             continue
         flat = [v for row in r["hvf"] for v in row if v < 99.0]
+        # most-recent strictly-earlier visit of the same eye (any-VF prior)
+        hist = [p for p in timeline[(r["subject"], r["laterality"])] if p["visit"] < r["visit"]]
+        prior = hist[-1] if hist else None
         recs.append({
             "PatientID": int(r["subject"]),
             "Laterality": r["laterality"],
@@ -95,8 +111,15 @@ def build(xlsx_path, fundus_dir, out_path):
             "FundusImage": [r["cfp"]],
             "hvf": r["hvf"],
             "mean_db": float(np.mean(flat)),
+            "interval_years": float(r["interval"]),
+            "has_prior": prior is not None,
+            "prior_hvf": prior["hvf"] if prior else None,
+            "prior_visit": prior["visit"] if prior else None,
+            "delta_t": float(r["interval"] - prior["interval"]) if prior else 0.0,
         })
     json.dump(recs, open(out_path, "w"), indent=2)
+    n_prior = sum(x["has_prior"] for x in recs)
+    print(f"records with a causal prior VF: {n_prior}/{len(recs)}")
     sev = sum(x["mean_db"] < 15 for x in recs)
     mod = sum(15 <= x["mean_db"] < 22 for x in recs)
     n_pat = len(set(x["PatientID"] for x in recs))
