@@ -58,7 +58,13 @@ def train_fold(fold, epochs, lr, aux_w, warm):
         missing, unexpected = model.load_state_dict(sd, strict=False)
         print(f"  warm-start fundus from {os.path.basename(warm.format(fold))} "
               f"(loaded {len(sd) - len(unexpected)} tensors)")
-    params = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith("ae.")]
+    # FREEZE the warm-started fundus branch (visit-1 stays at its long_global value, no degradation);
+    # train ONLY the longitudinal params (delta denoiser + interval + gate).
+    LONG = ("delta_head", "interval", "alpha", "no_prior_token")
+    for n, p in model.named_parameters():
+        p.requires_grad = n.startswith(LONG)
+    params = [p for n, p in model.named_parameters() if p.requires_grad]
+    print(f"  trainable (longitudinal only): {sum(p.numel() for p in params):,} params")
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.005)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr * 0.05)
     val_json = os.path.join(CV, f"fold{fold}_val.json")
@@ -71,9 +77,7 @@ def train_fold(fold, epochs, lr, aux_w, warm):
             loss, _, _ = T.compute_loss(pred, hvf, lats, epoch=ep,
                                         attn_weights=model._last_attn_weights,
                                         sector_weights=SECTORS, sector_combine="sector_only")
-            lf, _, _ = T.compute_loss(model._last_pred_fundus, hvf, lats, epoch=ep,
-                                      sector_weights=SECTORS, sector_combine="sector_only")
-            loss = loss + aux_w * lf + 0.01 * (model._last_delta ** 2).mean()
+            loss = loss + 0.01 * (model._last_delta ** 2).mean()   # mild delta regularizer
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0); opt.step()
         sched.step()

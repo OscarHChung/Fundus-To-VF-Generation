@@ -1,0 +1,21 @@
+{
+  "headline_mae": 3.751,
+  "eval": "per-patient 5-fold CV over 631 longitudinal records (leak-free: eye-disjoint folds + causal past->future ordering)",
+  "method": "LongitudinalVFModel = persistence on follow-up visits (prior VF) + fundus long_global on first visits; encoder-decoder + Garway-Heath intact. Equivalent deterministic blend = 3.752.",
+  "raw": {"mae": 3.751, "slope": 0.655, "corr": 0.741, "eyecorr": 0.539, "floor": 7.93},
+  "calibrated": {"mae": 3.888, "slope": 0.709, "floor": 7.63},
+  "strata": {
+    "follow_up_n368_with_prior_VF": 3.185,
+    "first_visit_n263_fundus_only": 4.545
+  },
+  "severe_n101": {"mae": 6.06, "floor": 6.31, "slope": 0.482},
+  "baselines": {"fundus_only_honest": 4.29, "persistence_baseline": 3.71, "test_retest_noise_floor": 2.76},
+  "honest_notes": [
+    "Beats fundus-only (4.29) and meets the firm <=3.9 target; sits at the sub-3.74 boundary.",
+    "Follow-up stratum is noise-floor-bounded (2.76) -> persistence is unbeatable there; the learned delta adds ~nothing.",
+    "First-visit stratum (4.55) is the bottleneck; the disc structure-function lever is the remaining (marginal) way to push clearly sub-3.74.",
+    "ARVO framing must lead with the persistence baseline (3.71) and disclose 42% of records are first-visit/fundus-only."
+  ],
+  "checkpoints": "decoder/results/auto/long_prior_f{0..4}_best.pth",
+  "timestamp": "2026-06-26"
+}

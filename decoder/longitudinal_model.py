@@ -46,9 +46,11 @@ class LongitudinalVFModel(T.PerPointVFModel):
         self.d_latent = ae.d
         self.interval = IntervalEmbed(d_int)
         self.alpha = nn.Linear(d_int, 1)            # scalar delta gate
-        nn.init.zeros_(self.alpha.weight); nn.init.constant_(self.alpha.bias, -2.0)  # start small
+        nn.init.zeros_(self.alpha.weight); nn.init.constant_(self.alpha.bias, 1.0)  # gate ~0.73 open
         self.no_prior_token = nn.Parameter(torch.zeros(self.d_latent))
-        in_dim = self.embed_dim * 2 + self.d_latent + d_int        # attended ‖ cls ‖ z_prior ‖ ie
+        # attended ‖ cls ‖ z_prior ‖ ie ‖ prior-per-point ‖ prior-eye-mean  (last two let the head
+        # learn the shrink-toward-mean denoiser Agent-C measured — it MUST see the prior value)
+        in_dim = self.embed_dim * 2 + self.d_latent + d_int + 2
         self.delta_head = nn.Sequential(
             nn.Linear(in_dim, 256), nn.LayerNorm(256), nn.GELU(), nn.Dropout(T.HEAD_DROPOUT),
             nn.Linear(256, 1))
@@ -80,10 +82,13 @@ class LongitudinalVFModel(T.PerPointVFModel):
             pred_fundus = pred_fundus + self._global_residual(cls, patches)
         self._last_pred_fundus = pred_fundus
         z_prior, ie, prior_field = self._prior_pieces(prior_vec, prior_mask, dt, has_prior)
+        pf = (prior_field / 35.0).unsqueeze(-1)                                # (B,52,1) per-point prior
+        pf_mean = (prior_field.mean(1, keepdim=True) / 35.0)[:, None, :].expand(B, NUM, 1)
         h = torch.cat([attended,
                        cls[:, None, :].expand(B, NUM, -1),
                        z_prior[:, None, :].expand(B, NUM, -1),
-                       ie[:, None, :].expand(B, NUM, -1)], dim=-1)             # (B,52,in_dim)
+                       ie[:, None, :].expand(B, NUM, -1),
+                       pf, pf_mean], dim=-1)                                   # (B,52,in_dim)
         delta = torch.sigmoid(self.alpha(ie)) * self.delta_head(h).squeeze(-1)  # (B,52)
         self._last_delta = delta * has_prior[:, None]
         pred_long = prior_field + delta
