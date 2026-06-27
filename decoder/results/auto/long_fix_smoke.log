@@ -1,0 +1,43 @@
+✓ Using MPS (Apple Silicon GPU)
+✓ Loaded RETFound
+
+=== FOLD 0 ===
+  Longitudinal train: 522 records (313 with prior, 209 visit-1)
+✓ Encoder: FROZEN
+✓ Per-point attention (dropout=0.4, temp_init=2.0)
+✓ Shared point head (dropout=0.4)
+✓ Joint global-spatial head ON (ADDITIVE: per-point pred + zero-mean global pattern from mean-pool patches‖CLS; zero-init=no-op start) — targets eyeCorr 0.51
+✓ Cross-point refinement
+  Trainable: attention=425,985 + head=558,337 + refinement=11,181 = 995,503
+✓ Longitudinal head ON (prior-VF residual on persistence; zero-init delta; interval-gated). AE latent d=64, frozen.
+  warm-start fundus from long_global_f0_best.pth (loaded 446 tensors)
+  trainable (longitudinal only): 564,162 params
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep 4 val MAE 3.682 (best 3.682)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep 6 val MAE 3.688 (best 3.682)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep 8 val MAE 3.694 (best 3.682)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep10 val MAE 3.680 (best 3.680)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep12 val MAE 3.702 (best 3.680)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep13 val MAE 3.699 (best 3.680)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  Longitudinal val: 522 records (313 with prior, 209 visit-1)
+  fold 0: MAE 3.680 | floor 7.53(n552) | deep 6.89 | slope 0.663 | corr 0.795 | eyeCorr 0.543 | bias +0.40 | σp/σt 0.83
+
+==========================================================================================
+LONGITUDINAL 5-FOLD OOF (109 recs)  RAW   MAE 3.680 | floor 7.53(n552) | deep 6.89 | slope 0.663 | corr 0.795 | eyeCorr 0.543 | bias +0.40 | σp/σt 0.83
+  severity-stratified (per-eye true mean dB):
+    severe   n= 24 | MAE 5.687 | floor 6.43 | slope 0.551
+    moderate n= 24 | MAE 4.417 | floor 10.75 | slope 0.393
+    mild     n= 61 | MAE 2.600 | floor 13.24 | slope 0.488
+LONGITUDINAL 5-FOLD OOF (109 recs)  CALIB MAE 3.723 | floor 7.29(n552) | deep 6.86 | slope 0.714 | corr 0.794 | eyeCorr 0.542 | bias +0.51 | σp/σt 0.90
+  severity-stratified (per-eye true mean dB):
+    severe   n= 24 | MAE 5.583 | floor 6.13 | slope 0.575
+    moderate n= 24 | MAE 4.599 | floor 10.70 | slope 0.428
+    mild     n= 61 | MAE 2.647 | floor 13.51 | slope 0.540
+==========================================================================================
+refs: fundus-only 4.29 ; persistence 3.71 ; target sub-3.74.

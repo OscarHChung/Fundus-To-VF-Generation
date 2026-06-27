@@ -71,6 +71,11 @@ ATTN_WD = 1.5e-2           # was 5e-3 — 3x stronger
 REFINE_LR = 3e-4           # was 5e-4
 REFINE_WD = 1e-2            # was 5e-3
 
+# Encoder partial fine-tune (opt-in via --unfreeze-blocks). TINY LR so the
+# pretrained RETFound features adapt to VF without catastrophic drift on 211 eyes.
+ENC_LR = 1e-5
+ENC_WD = 1e-4
+
 # Projection warm start
 PROJ_INIT_BIAS = 18.0
 
@@ -93,6 +98,16 @@ PER_EYE_CCC_START  = 5
 # Variance penalty (iter-5 showed removing it overfits → restored)
 VARIANCE_WEIGHT = 0.05
 VARIANCE_START  = 8
+
+# ── Session-3: within-eye dispersion match (anti-shrinkage) ──────
+# Iter-A probes proved the model is excessively shrunk: pooled σ_pred/σ_true ≈ 0.53 while
+# the SAME frozen features support ~0.82 (per-point ridge). Shrinkage flattens the scatterplot
+# (low slope) and under-deepens scotomata (high floor MAE) — the severe-point bottleneck.
+# This term matches each eye's WITHIN-field prediction spread to its target spread,
+# σ_pred(52pts) ≈ σ_true(52pts), pushing dispersion up from real per-point structure rather
+# than the global down-shift that loss-reweighting caused. 0 disables (default).
+DISPERSION_WEIGHT = 0.0
+DISPERSION_START  = 3
 
 # ── NEW: Attention regularization ─────────────────────────────
 ATTN_ENTROPY_WEIGHT = 0.01   # small bonus for spread-out attention
@@ -204,11 +219,8 @@ print("✓ Loaded RETFound")
 train_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.RandomRotation(ROTATION_DEG),
-    # Photometric jitter (iter-7): fundus illumination/contrast varies a lot
-    # across cameras/patients; this regularizes the frozen-encoder→decoder probe
-    # without touching geometry (the banned affine would disturb the anatomical
-    # prior; ColorJitter does not). Targets the 211-eye generalization ceiling.
-    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    # (iter-7 ColorJitter REVERTED: val MAE 4.36 > champion 4.15 — photometric aug
+    #  adds no VF-relevant signal. Clean champion baseline restored.)
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
@@ -230,15 +242,45 @@ def get_tta_transforms():
         for deg in TTA_ROTATIONS
     ]
 
+# ============== Disc-crop view (iter-11 signal probe) ==============
+# GRAPE fundus photos are macula-centered with the optic disc at a stereotyped,
+# laterality-mirrored location (OD ~x=0.78, OS ~x=0.22; y~0.49). A FIXED
+# laterality-aware crop zooms the optic-nerve-head / peripapillary RNFL — the
+# structural basis of glaucomatous VF loss — with NO learned detector. Added as an
+# extra per-eye view; the model's existing multi-image averaging fuses it with the
+# full image. Probes whether higher-res disc detail raises corr (the severe ceiling).
+DISC_CX_OD = 0.78
+DISC_CX_OS = 0.22
+DISC_CY    = 0.49
+DISC_HALF  = 0.27   # half box size (fraction of W/H) → ~54% crop, resized to 224
+
+def disc_crop_pil(img, laterality):
+    w, h = img.size
+    cx = DISC_CX_OD if str(laterality).startswith('OD') else DISC_CX_OS
+    left   = int(max(0, (cx - DISC_HALF) * w))
+    right  = int(min(w, (cx + DISC_HALF) * w))
+    top    = int(max(0, (DISC_CY - DISC_HALF) * h))
+    bottom = int(min(h, (DISC_CY + DISC_HALF) * h))
+    if right - left < 8 or bottom - top < 8:   # degenerate guard
+        return img
+    return img.crop((left, top, right, bottom))
+
+
 # ============== Dataset ==============
 class MultiImageDataset(Dataset):
-    def __init__(self, json_path, fundus_dir, transform, mode='train', use_tta=False):
+    def __init__(self, json_path, fundus_dir, transform, mode='train', use_tta=False,
+                 disc_crop=False):
         with open(json_path, 'r') as f:
             self.data = json.load(f)
         self.fundus_dir = fundus_dir
         self.transform  = transform
         self.mode       = mode
         self.use_tta    = use_tta
+        self.disc_crop  = disc_crop
+        # Views per image: always 'full'; + 'disc' (a laterality-aware disc zoom)
+        # when disc_crop is on. Train treats each (image,view) as its own sample;
+        # val stacks all views of an eye and averages their predictions.
+        views = ['full', 'disc'] if disc_crop else ['full']
         self.samples = []
         for item in self.data:
             images     = item['FundusImage'] if isinstance(item['FundusImage'], list) else [item['FundusImage']]
@@ -247,11 +289,14 @@ class MultiImageDataset(Dataset):
             patient_id = item.get('PatientID', 0)
             if self.mode == 'train':
                 for img_path in images:
-                    self.samples.append({'image': img_path, 'hvf': hvf,
-                                         'laterality': laterality, 'patient_id': patient_id})
+                    for v in views:
+                        self.samples.append({'image': img_path, 'view': v, 'hvf': hvf,
+                                             'laterality': laterality, 'patient_id': patient_id})
             else:
-                self.samples.append({'images': images, 'hvf': hvf,
-                                     'laterality': laterality, 'patient_id': patient_id})
+                image_views = [(p, v) for p in images for v in views]
+                self.samples.append({'images': images, 'image_views': image_views,
+                                     'hvf': hvf, 'laterality': laterality,
+                                     'patient_id': patient_id})
         if self.mode == 'train':
             print(f"  Train: {len(self.data)} eyes → {len(self.samples)} images")
         else:
@@ -282,6 +327,8 @@ class MultiImageDataset(Dataset):
         sample = self.samples[idx]
         if self.mode == 'train':
             img = Image.open(os.path.join(self.fundus_dir, sample['image'])).convert('RGB')
+            if sample.get('view') == 'disc':
+                img = disc_crop_pil(img, sample['laterality'])
             hvf = np.array(sample['hvf'], dtype=np.float32).flatten()
             hvf_tensor = torch.tensor(hvf)
             # Label noise — small gaussian perturbation on train targets
@@ -296,8 +343,11 @@ class MultiImageDataset(Dataset):
             return self.transform(img), hvf_tensor, sample['laterality']
         else:
             all_imgs = []
-            for img_path in sample['images']:
+            image_views = sample.get('image_views', [(p, 'full') for p in sample['images']])
+            for img_path, view in image_views:
                 img = Image.open(os.path.join(self.fundus_dir, img_path)).convert('RGB')
+                if view == 'disc':
+                    img = disc_crop_pil(img, sample['laterality'])
                 if self.use_tta:
                     for t in get_tta_transforms():
                         all_imgs.append(t(img))
@@ -545,14 +595,38 @@ class CrossPointRefinement(nn.Module):
 
 # ============== Full Model ==============
 class PerPointVFModel(nn.Module):
-    def __init__(self, encoder, use_dist=False, dist_blend=DIST_BLEND):
+    def __init__(self, encoder, use_dist=False, dist_blend=DIST_BLEND, unfreeze_blocks=0,
+                 mean_residual=False, global_head=False, finetune_norm=False):
         super().__init__()
         self.encoder = encoder
         self.embed_dim = 1024
+        self.unfreeze_blocks = unfreeze_blocks
+        self.finetune_norm = finetune_norm
 
         for p in self.encoder.parameters():
             p.requires_grad = False
-        print("✓ Encoder: FROZEN")
+        if finetune_norm:
+            # BitFit: tune ONLY LayerNorm scale/shift + biases throughout the encoder (~tens of k
+            # params on 24 blocks). Adapts RETFound's feature STATISTICS to the GRAPE/glaucoma domain
+            # with far less overfit risk than a full-block unfreeze (the prior session's 12.6M-param
+            # unfreeze overfit). Trainable params are spread across all blocks → no frozen prefix.
+            n_enc = 0
+            for name, p in self.encoder.named_parameters():
+                if 'norm' in name or name.endswith('.bias'):
+                    p.requires_grad = True; n_enc += p.numel()
+            print(f"✓ Encoder: BitFit (norm+bias only) UNFROZEN ({n_enc:,} params; rest frozen) "
+                  f"— regularized domain adaptation, attacks the eyeCorr≈0.51 frozen cap")
+        elif unfreeze_blocks > 0:
+            for blk in self.encoder.blocks[-unfreeze_blocks:]:
+                for p in blk.parameters():
+                    p.requires_grad = True
+            for p in self.encoder.norm.parameters():
+                p.requires_grad = True
+            n_enc = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
+            print(f"✓ Encoder: last {unfreeze_blocks} block(s) + norm UNFROZEN "
+                  f"({n_enc:,} trainable enc params; rest frozen) — attacks the corr ceiling")
+        else:
+            print("✓ Encoder: FROZEN")
 
         self.attention = PerPointAttention(
             embed_dim=self.embed_dim,
@@ -581,6 +655,35 @@ class PerPointVFModel(nn.Module):
         self.register_buffer('dist_centers',
                              torch.tensor(DIST_BIN_CENTERS, dtype=torch.float32))
         self._last_dist_logits = None
+
+        # Session-3 mean+residual decomposition (opt-in; always built so checkpoints load with
+        # strict=False either way). CLS→eye-mean (severity = the SOLVED part); point_head output
+        # is re-interpreted as a zero-mean within-eye RESIDUAL so the spatial head is no longer
+        # drowned/over-regularized by the dominant severity signal (MLP probe: frozen features
+        # support eyeCorr ~0.51 but the lumped head only reaches ~0.42).
+        self.mean_residual = mean_residual
+        self.mean_head = nn.Sequential(
+            nn.Linear(self.embed_dim, 128), nn.LayerNorm(128), nn.GELU(),
+            nn.Dropout(HEAD_DROPOUT), nn.Linear(128, 1))
+        nn.init.constant_(self.mean_head[-1].bias, PROJ_INIT_BIAS)
+        if mean_residual:
+            print("✓ Mean+residual head ON (CLS→eye-mean ; point_head→zero-mean spatial residual)")
+
+        # Session-3 JOINT global-spatial head (opt-in). Probes: the within-eye PATTERN is best
+        # predicted from GLOBAL mean-pooled patches+CLS via a joint (global→52) map (eyeCorr 0.51)
+        # — a SHARED per-point head is capped at the local-feature eyeCorr (~0.41 = champion).
+        # Pairs with the mean head: pred = mean_head(CLS) + zero-mean(global_spatial([pool‖CLS])).
+        self.use_global_head = global_head
+        self.global_spatial = nn.Sequential(
+            nn.Linear(self.embed_dim * 2, 512), nn.LayerNorm(512), nn.GELU(), nn.Dropout(HEAD_DROPOUT),
+            nn.Linear(512, 256), nn.LayerNorm(256), nn.GELU(), nn.Dropout(HEAD_DROPOUT),
+            nn.Linear(256, NUM_VALID_POINTS))
+        nn.init.normal_(self.global_spatial[-1].weight, std=0.01)
+        nn.init.zeros_(self.global_spatial[-1].bias)
+        if global_head:
+            print("✓ Joint global-spatial head ON (ADDITIVE: per-point pred + zero-mean global "
+                  "pattern from mean-pool patches‖CLS; zero-init=no-op start) — targets eyeCorr 0.51")
+
         if use_dist:
             print(f"✓ Distributional head ON (bins={len(DIST_BIN_CENTERS)}, "
                   f"blend={dist_blend})")
@@ -606,7 +709,12 @@ class PerPointVFModel(nn.Module):
         cls_expanded = cls_token.unsqueeze(1).expand(B, NUM_VALID_POINTS, self.embed_dim)
         combined = torch.cat([point_feats, cls_expanded], dim=2)
         scalar = self.point_head(combined)                          # (B,52)
-        if self.use_dist:
+        if self.mean_residual:
+            m = self.mean_head(cls_token)                           # (B,1) eye-mean (severity)
+            resid = scalar - scalar.mean(dim=1, keepdim=True)       # zero-mean spatial pattern
+            pred = m + resid
+            self._last_dist_logits = None
+        elif self.use_dist:
             logits = self.dist_head(combined)                       # (B,52,K)
             e = dist_expectation(logits, self.dist_centers)         # (B,52)
             pred = (1.0 - self.dist_blend) * scalar + self.dist_blend * e
@@ -624,35 +732,86 @@ class PerPointVFModel(nn.Module):
             pred = pred.mean(dim=0, keepdim=True)
         return pred
 
+    def _encode(self, x):
+        """Frozen RETFound encoder WITHOUT the MAE random patch shuffle.
+
+        encoder.forward_encoder(x, mask_ratio=0) routes through random_masking,
+        which — even at mask_ratio=0 — returns the 196 patch tokens in a RANDOM
+        per-call order (ids_shuffle=argsort(noise), keep all) and drops ids_restore.
+        That scrambles the spatial layout, so PerPointAttention's fixed row-major
+        patch_pos and the Garway–Heath anatomical prior point at random patches →
+        the per-point/spatial machinery is effectively dead and attention collapses
+        to order-invariant content pooling (the real cause of the severe-point /
+        slope ceiling). Reproducing the encoder forward without random_masking keeps
+        patches in proper row-major order so the prior + patch_pos are meaningful."""
+        enc = self.encoder
+        # BitFit: trainable norm/bias params are spread through ALL blocks → the whole forward
+        # must build a graph (no frozen prefix to skip). Slightly slower / more memory, but the
+        # only way gradients reach the throughout norms.
+        if getattr(self, 'finetune_norm', False):
+            h = enc.patch_embed(x)
+            h = h + enc.pos_embed[:, 1:, :]
+            cls = (enc.cls_token + enc.pos_embed[:, :1, :]).expand(h.shape[0], -1, -1)
+            h = torch.cat((cls, h), dim=1)
+            for blk in enc.blocks:
+                h = blk(h)
+            return enc.norm(h)
+        n_unf = getattr(self, 'unfreeze_blocks', 0)
+        n_frozen = len(enc.blocks) - n_unf
+        # Frozen prefix always runs under no_grad (no graph, no memory cost).
+        with torch.no_grad():
+            h = enc.patch_embed(x)
+            h = h + enc.pos_embed[:, 1:, :]
+            cls = (enc.cls_token + enc.pos_embed[:, :1, :]).expand(h.shape[0], -1, -1)
+            h = torch.cat((cls, h), dim=1)
+            for blk in enc.blocks[:n_frozen]:
+                h = blk(h)
+        # Trainable suffix (if any) runs WITH grad so backprop reaches its params.
+        if n_unf > 0:
+            for blk in enc.blocks[n_frozen:]:
+                h = blk(h)
+            h = enc.norm(h)
+        else:
+            with torch.no_grad():
+                h = enc.norm(h)
+        return h
+
+    def _global_residual(self, cls_token, patches):
+        """Zero-mean within-eye PATTERN from a JOINT global→52 map on [mean-pool patches ‖ CLS]
+        (eyeCorr 0.51 in probes — a shared per-point head is capped at ~0.41). Added on top of
+        the per-point path so it only contributes the pattern the local head misses; zero-init
+        ⇒ starts as a no-op (degrades gracefully to the proven control)."""
+        pooled = patches.mean(dim=1)                                       # (B,1024)
+        g = self.global_spatial(torch.cat([pooled, cls_token], dim=1))     # (B,52)
+        return g - g.mean(dim=1, keepdim=True)                             # zero-mean
+
     def forward(self, x, laterality='OD', average_multi=True):
         if x.dim() != 4:
             raise ValueError(f"Expected 4D input, got {x.shape}")
 
-        with torch.no_grad():
-            latent = self.encoder.forward_encoder(x, mask_ratio=0.0)[0]
+        # _encode manages no_grad internally (all-frozen → no graph; partial unfreeze
+        # → graph only through the trainable suffix blocks).
+        latent = self._encode(x)
         cls_token = latent[:, 0, :]
         patches   = latent[:, 1:, :]
 
         point_feats, attn_weights = self.attention(patches, laterality)
         pred = self._apply_heads(point_feats, cls_token, x.shape[0])
+        if self.use_global_head:
+            pred = pred + self._global_residual(cls_token, patches)
         pred = self._finish(pred, average_multi)
-
-        # Store attention weights for regularization (only during training)
-        self._last_attn_weights = attn_weights
-
+        self._last_attn_weights = attn_weights   # for entropy regularization (training)
         return pred
 
     def decode_latent(self, latent, laterality='OD', average_multi=True):
-        """Trainable-decoder-only forward on a pre-cached encoder latent.
-
-        Skips the frozen 1.2 GB RETFound encoder entirely — used by
-        evaluate_from_cache() so val/train-eval passes cost only the small
-        attention + head + refinement modules (~1 M params, ~50× faster).
-        Applies the same scalar/dist blend as forward()."""
+        """Trainable-decoder-only forward on a pre-cached encoder latent (skips the frozen
+        encoder; ~50× faster val). Mirrors forward()'s head routing."""
         cls_token = latent[:, 0, :]
         patches   = latent[:, 1:, :]
         point_feats, attn_weights = self.attention(patches, laterality)
         pred = self._apply_heads(point_feats, cls_token, latent.shape[0])
+        if self.use_global_head:
+            pred = pred + self._global_residual(cls_token, patches)
         pred = self._finish(pred, average_multi)
         self._last_attn_weights = attn_weights
         return pred
@@ -696,7 +855,7 @@ def attention_entropy_loss(attn_weights):
 def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
                  sector_weights=None, sector_combine='both', deep_cfg=None,
                  dist_logits=None, dist_cfg=None, lds_weights=None,
-                 bias_penalty=BIAS_PENALTY_WEIGHT):
+                 bias_penalty=BIAS_PENALTY_WEIGHT, dispersion_weight=DISPERSION_WEIGHT):
     """Weighted Huber loss (+ CCC / variance / attention-entropy terms).
 
     Garway–Heath sector weighting is opt-in and fully backward-compatible:
@@ -728,6 +887,7 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
     total_dist_ce = 0.0
     eye_ccc_losses = []
     bias_sq_terms  = []
+    disp_terms     = []
 
     for i, lat in enumerate(laterality):
         valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
@@ -797,6 +957,10 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
         if bias_penalty > 0:
             bias_sq_terms.append((p - t).mean() ** 2)
 
+        # Within-eye dispersion match (anti-shrinkage) — pull σ_pred(field) up to σ_true(field).
+        if dispersion_weight > 0 and epoch >= DISPERSION_START and mask.sum() >= 5:
+            disp_terms.append((p.std(unbiased=False) - t.std(unbiased=False)) ** 2)
+
         if epoch >= PER_EYE_CCC_START and mask.sum() >= 5:
             eye_ccc = per_eye_ccc(pred_52, target_52, mask)
             eye_ccc_losses.append(eye_ccc)
@@ -815,6 +979,10 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
     # global level from the deep-point emphasis; the run-4 negative-bias fix).
     if bias_penalty > 0 and len(bias_sq_terms) > 0:
         loss = loss + bias_penalty * torch.stack(bias_sq_terms).mean()
+
+    # Within-eye dispersion-match term (anti-shrinkage; targets slope/floor, the severe goal).
+    if dispersion_weight > 0 and len(disp_terms) > 0:
+        loss = loss + dispersion_weight * torch.stack(disp_terms).mean()
 
     # Per-eye CCC
     if len(eye_ccc_losses) > 0:
@@ -1001,7 +1169,7 @@ def precompute_features(model, loader, device, desc=""):
     for sample in tqdm(loader, desc=f"  Caching {desc}", leave=False):
         imgs, hvf, lat = sample
         imgs = imgs.to(device)
-        latent = model.encoder.forward_encoder(imgs, mask_ratio=0.0)[0]
+        latent = model._encode(imgs)   # unshuffled (see PerPointVFModel._encode)
         cache.append({'latent': latent.cpu(), 'hvf': hvf, 'lat': lat})
     return cache
 
@@ -1204,13 +1372,22 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
           reweight='value', lds_sigma=LDS_SIGMA_DB, target_mae=SUBGOAL_TARGET_MAE,
           bias_penalty=BIAS_PENALTY_WEIGHT,
           attn_dropout=None, head_dropout=None, weight_decay=None, lr=None,
-          ema_decay=EMA_DECAY):
+          ema_decay=EMA_DECAY, disc_crop=False, unfreeze_blocks=0,
+          update_champion=True, dispersion_weight=DISPERSION_WEIGHT,
+          label_noise=None, entropy_weight=None, mean_residual=False, global_head=False,
+          finetune_norm=False, enc_lr=None, heavy_aug=False, batch_size=None):
     # Regularization / LR overrides (for fast autonomous sweeps without edits).
-    global ATTN_DROPOUT, HEAD_DROPOUT, ATTN_WD, ATTN_LR
+    global ATTN_DROPOUT, HEAD_DROPOUT, ATTN_WD, ATTN_LR, LABEL_NOISE_STD, ATTN_ENTROPY_WEIGHT, ENC_LR
     if attn_dropout is not None: ATTN_DROPOUT = attn_dropout
     if head_dropout is not None: HEAD_DROPOUT = head_dropout
     if weight_decay is not None: ATTN_WD = weight_decay
     if lr is not None: ATTN_LR = lr
+    if enc_lr is not None: ENC_LR = enc_lr
+    # Session-3: knobs to UN-wash the within-eye spatial signal (MLP probe showed the
+    # frozen features support eyeCorr ~0.51 but the champion only reaches 0.41 — the entropy
+    # bonus + label noise over-smooth/shrink the per-point predictions).
+    if label_noise is not None:    LABEL_NOISE_STD = label_noise
+    if entropy_weight is not None: ATTN_ENTROPY_WEIGHT = entropy_weight
 
     print("=" * 60)
     print("Training v10.2 — Per-point attention + Garway–Heath")
@@ -1262,6 +1439,9 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
     if bias_penalty > 0:
         print(f"✓ Bias-control penalty ON (weight={bias_penalty}) — pins per-eye "
               f"mean so deep emphasis can't shift the global level")
+    if dispersion_weight > 0:
+        print(f"✓ Dispersion-match ON (weight={dispersion_weight}, start ep {DISPERSION_START}) "
+              f"— anti-shrinkage: σ_pred(field)→σ_true(field); targets slope/floor (severe goal)")
     print(f"✓ Goal self-stop: give up if no >{GOAL_PLATEAU_MIN_DELTA} dB val gain "
           f"for {GOAL_PLATEAU_CHECKS} checks while best > {target_mae} dB")
 
@@ -1280,14 +1460,35 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
     print(f"\nBanned: LoRA, flips/affine, MixUp")
 
     # ── Data ───────────────────────────────────────────────────
-    train_dataset = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, train_transform, mode='train')
-    val_dataset   = MultiImageDataset(VAL_JSON,   FUNDUS_DIR, val_transform,   mode='val', use_tta=USE_TTA)
+    if disc_crop:
+        print("✓ Disc-crop view ON — each eye also gets a laterality-aware optic-disc "
+              "zoom (extra view, prediction-averaged with the full image)")
+    # Heavier augmentation for encoder fine-tuning (208 eyes overfit easily). Mild geometric
+    # only (preserve the anatomical prior orientation) + light photometric; no aggressive crop.
+    tr_tfm = train_transform
+    if heavy_aug:
+        tr_tfm = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.RandomRotation(10),
+            transforms.RandomResizedCrop(224, scale=(0.9, 1.0), ratio=(0.95, 1.05)),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        print("✓ Heavy augmentation ON (rot10 + mild RRC + ColorJitter) — for encoder fine-tune")
+    train_dataset = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, tr_tfm, mode='train',
+                                      disc_crop=disc_crop)
+    val_dataset   = MultiImageDataset(VAL_JSON,   FUNDUS_DIR, val_transform,   mode='val',
+                                      use_tta=USE_TTA, disc_crop=disc_crop)
 
+    bs = batch_size or BATCH_SIZE
+    if bs != BATCH_SIZE:
+        print(f"  Batch size override: {bs} (default {BATCH_SIZE})")
     if reweight == 'lds':
         # LDS reweights at the LOSS level, so it REPLACES severity resampling
         # (Yang et al. 2021). Stacking both triple-counted the deep emphasis and
         # drove the run-4 bias runaway → use uniform sampling here.
-        train_loader = DataLoader(train_dataset, BATCH_SIZE, shuffle=True,
+        train_loader = DataLoader(train_dataset, bs, shuffle=True,
                                   num_workers=0, drop_last=True)
         print(f"  Sampler: UNIFORM (LDS handles imbalance at the loss level)")
     else:
@@ -1298,29 +1499,38 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
             replacement=True
         )
         print(f"  Sampler weight range: [{min(sample_weights):.1f}, {max(sample_weights):.1f}]")
-        train_loader = DataLoader(train_dataset, BATCH_SIZE, sampler=sampler,
+        train_loader = DataLoader(train_dataset, bs, sampler=sampler,
                                   num_workers=0, drop_last=True)
     val_loader   = DataLoader(val_dataset, batch_size=1, shuffle=False,
                               num_workers=0, collate_fn=val_collate_fn)
 
     # ── Model ──────────────────────────────────────────────────
-    model = PerPointVFModel(base_model, use_dist=use_dist, dist_blend=dist_blend)
+    model = PerPointVFModel(base_model, use_dist=use_dist, dist_blend=dist_blend,
+                            unfreeze_blocks=unfreeze_blocks, mean_residual=mean_residual,
+                            global_head=global_head, finetune_norm=finetune_norm)
     model.to(DEVICE)
+    enc_trainable = (unfreeze_blocks > 0) or finetune_norm
 
     # ── Pre-cache frozen encoder features (one-time cost) ──────
     # The RETFound encoder is frozen throughout training, so its outputs for
     # the deterministic val/train-eval sets never change. Cache them once now;
     # each subsequent val check runs only the small trainable decoder (~1 M
     # params) rather than the full 1.2 GB ViT-Large — ~50× faster per check.
-    print(f"\nPre-caching encoder features for val + train-eval sets …")
     train_eval_ds  = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, val_transform,
-                                       mode='val', use_tta=False)
+                                       mode='val', use_tta=False, disc_crop=disc_crop)
     train_eval_pre = DataLoader(train_eval_ds, batch_size=1, shuffle=False,
                                 num_workers=0, collate_fn=val_collate_fn)
-    val_cache        = precompute_features(model, val_loader,    DEVICE, "val")
-    train_eval_cache = precompute_features(model, train_eval_pre, DEVICE, "train-eval")
-    print(f"  Cached {len(val_cache)} val + {len(train_eval_cache)} train-eval samples.")
-    print(f"  Val checks are now ~50× faster (decoder-only, encoder skipped).")
+    if not enc_trainable:
+        print(f"\nPre-caching encoder features for val + train-eval sets …")
+        val_cache        = precompute_features(model, val_loader,    DEVICE, "val")
+        train_eval_cache = precompute_features(model, train_eval_pre, DEVICE, "train-eval")
+        print(f"  Cached {len(val_cache)} val + {len(train_eval_cache)} train-eval samples.")
+        print(f"  Val checks are now ~50× faster (decoder-only, encoder skipped).")
+    else:
+        val_cache = train_eval_cache = None
+        mode = "BitFit norm+bias" if finetune_norm else f"last {unfreeze_blocks} block(s)"
+        print(f"\nEncoder is trainable ({mode}) → feature caching DISABLED "
+              f"(features change each step); val runs the full encoder live (slower but correct).")
     print(f"  Val gate: skip unless epoch train MAE < {TRAIN_MAE_GATE} dB "
           f"(forced every {FORCE_VAL_EVERY} epochs).\n")
 
@@ -1329,12 +1539,22 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
                        list(model.point_head.parameters())
     if use_dist:
         attn_head_params += list(model.dist_head.parameters())
+    if mean_residual:
+        attn_head_params += list(model.mean_head.parameters())
+    if global_head:
+        attn_head_params += list(model.global_spatial.parameters())
     refine_params = list(model.refinement.parameters())
 
-    optimizer = optim.AdamW([
+    param_groups = [
         {'params': attn_head_params, 'lr': ATTN_LR,   'weight_decay': ATTN_WD},
         {'params': refine_params,    'lr': REFINE_LR,  'weight_decay': REFINE_WD},
-    ])
+    ]
+    if enc_trainable:
+        enc_params = [p for p in model.encoder.parameters() if p.requires_grad]
+        param_groups.append({'params': enc_params, 'lr': ENC_LR, 'weight_decay': ENC_WD})
+        print(f"  Encoder fine-tune param group: {len(enc_params)} tensors @ "
+              f"lr={ENC_LR}, wd={ENC_WD}")
+    optimizer = optim.AdamW(param_groups)
 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs, eta_min=1e-6
@@ -1346,6 +1566,10 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
         ema_mods = [model.attention, model.point_head, model.refinement]
         if use_dist:
             ema_mods.append(model.dist_head)
+        if mean_residual:
+            ema_mods.append(model.mean_head)
+        if global_head:
+            ema_mods.append(model.global_spatial)
         ema = WeightEMA(ema_mods, decay=ema_decay)
         print(f"✓ Weight EMA ON (decay={ema_decay})")
 
@@ -1381,7 +1605,8 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
                                          sector_combine=sector_combine,
                                          deep_cfg=deep_cfg,
                                          dist_logits=dist_logits, dist_cfg=dist_cfg,
-                                         lds_weights=lds_weights, bias_penalty=bias_penalty)
+                                         lds_weights=lds_weights, bias_penalty=bias_penalty,
+                                         dispersion_weight=dispersion_weight)
 
             if nv > 0:
                 optimizer.zero_grad()
@@ -1421,11 +1646,17 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
             # Evaluate (and save) the EMA weights, not the raw ones.
             if ema is not None:
                 ema.apply_to()
-            # ── Fast eval from pre-cached encoder latents ───────
-            val_mae, val_corr, val_r2, val_slope, val_eye_corr, val_extra = \
-                evaluate_from_cache(model, val_cache, DEVICE, detailed=True)
-            train_mae, train_corr, train_r2, train_slope, train_eye_corr = \
-                evaluate_from_cache(model, train_eval_cache, DEVICE)
+            # ── Eval: fast cache path (frozen enc) or live path (fine-tune) ──
+            if not enc_trainable:
+                val_mae, val_corr, val_r2, val_slope, val_eye_corr, val_extra = \
+                    evaluate_from_cache(model, val_cache, DEVICE, detailed=True)
+                train_mae, train_corr, train_r2, train_slope, train_eye_corr = \
+                    evaluate_from_cache(model, train_eval_cache, DEVICE)
+            else:
+                val_mae, val_corr, val_r2, val_slope, val_eye_corr, val_extra = \
+                    evaluate(model, val_loader, detailed=True)
+                train_mae, train_corr, train_r2, train_slope, train_eye_corr = \
+                    evaluate(model, train_eval_pre)
             gap = train_mae - val_mae
 
             val_bias  = val_extra.get('bias', float('nan'))
@@ -1473,11 +1704,13 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
                 torch.save({'model': model.state_dict(), 'mae': val_mae,
                             'corr': val_corr, 'r2': val_r2, 'slope': val_slope,
                             'eye_corr': val_eye_corr, 'epoch': epoch,
-                            'use_dist': use_dist, 'dist_blend': dist_blend}, out_best)
+                            'use_dist': use_dist, 'dist_blend': dist_blend,
+                            'mean_residual': mean_residual, 'global_head': global_head}, out_best)
                 torch.save({'model_state_dict': model.state_dict(),
                             'encoder_checkpoint': CHECKPOINT_PATH,
                             'val_mae': val_mae, 'val_corr': val_corr,
-                            'use_dist': use_dist, 'dist_blend': dist_blend}, out_inference)
+                            'use_dist': use_dist, 'dist_blend': dist_blend,
+                            'mean_residual': mean_residual, 'global_head': global_head}, out_inference)
                 print(f"  ✓ Saved! ({', '.join(save_reason)})")
                 print(f"    MAE={val_mae:.2f} | Slope={val_slope:.3f} | EyeCorr={val_eye_corr:.3f} | Score={composite:.2f}")
                 patience = 0
@@ -1575,8 +1808,14 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
         'attn_weight_decay': ATTN_WD, 'attn_lr': ATTN_LR,
         'ema_decay': ema_decay, 'label_noise': LABEL_NOISE_STD,
         'variance_weight': VARIANCE_WEIGHT, 'epochs': epochs,
+        'disc_crop': disc_crop, 'unfreeze_blocks': unfreeze_blocks,
+        'dispersion_weight': dispersion_weight, 'mean_residual': mean_residual,
+        'global_head': global_head, 'entropy_weight': ATTN_ENTROPY_WEIGHT,
+        'finetune_norm': finetune_norm, 'enc_lr': (ENC_LR if (finetune_norm or unfreeze_blocks) else None),
+        'heavy_aug': heavy_aug,
     }
-    _update_champion(best_mae, best_extra, run_config, out_inference)
+    if update_champion:
+        _update_champion(best_mae, best_extra, run_config, out_inference)
     return best_mae, best_extra
 
 
@@ -1632,7 +1871,59 @@ if __name__ == "__main__":
     parser.add_argument('--ema-decay', type=float, default=EMA_DECAY,
                         help="Weight-EMA decay (eval/save the EMA weights). 0 disables. "
                              "Default %(default)s.")
+    parser.add_argument('--disc-crop', action='store_true',
+                        help="Add a fixed laterality-aware optic-disc zoom as an extra "
+                             "per-eye view (prediction-averaged). Signal probe for severe points.")
+    parser.add_argument('--unfreeze-blocks', type=int, default=0,
+                        help="Fine-tune the last N RETFound encoder blocks (+norm) at a tiny "
+                             "LR to raise the corr ceiling. 0=fully frozen (default). Disables "
+                             "feature caching (slower val).")
+    # ── Session-3: honest per-patient evaluation + non-destructive run tagging ──
+    parser.add_argument('--train-json', default=None,
+                        help="Override TRAIN_JSON (e.g. a per-patient CV fold). Default: leaky split.")
+    parser.add_argument('--val-json', default=None,
+                        help="Override VAL_JSON (e.g. a per-patient CV fold). Default: leaky split.")
+    parser.add_argument('--out-tag', default=None,
+                        help="Save checkpoints to results/auto/<tag>_{best,inference}.pth instead "
+                             "of the default paths (keeps dev runs from clobbering anything).")
+    parser.add_argument('--no-champion', action='store_true',
+                        help="Skip the auto champion update (dev runs on a different eval protocol "
+                             "must not be compared against the historical leaky champion).")
+    parser.add_argument('--dispersion-weight', type=float, default=DISPERSION_WEIGHT,
+                        help="Session-3 anti-shrinkage: weight on the per-eye within-field "
+                             "σ_pred≈σ_true match. 0=off (default). Targets slope/floor (severe).")
+    parser.add_argument('--label-noise', type=float, default=None,
+                        help="Override LABEL_NOISE_STD (dB). Lower/0 to un-wash spatial signal.")
+    parser.add_argument('--entropy-weight', type=float, default=None,
+                        help="Override ATTN_ENTROPY_WEIGHT. Lower/0 lets attention localize "
+                             "(less diffuse) — recovers within-eye spatial signal.")
+    parser.add_argument('--mean-residual', action='store_true',
+                        help="Session-3: CLS→eye-mean + zero-mean spatial residual head. "
+                             "Decouples the solved severity signal from the within-eye spatial "
+                             "pattern so the spatial head isn't drowned (MLP probe → eyeCorr 0.51).")
+    parser.add_argument('--global-head', action='store_true',
+                        help="Session-3: JOINT global-spatial head (mean-pool patches‖CLS → 52 "
+                             "pattern) + mean head (severity). Reaches the global-feature eyeCorr "
+                             "(0.51) a shared per-point head can't. GH stays on via sector loss weight.")
+    parser.add_argument('--finetune-norm', action='store_true',
+                        help="Session-3 Lever-2: BitFit encoder fine-tune (norm+bias only, ~50k "
+                             "params) to push past the frozen-feature eyeCorr≈0.51 cap. Disables "
+                             "caching (slower). Use with --heavy-aug + low --enc-lr to avoid overfit.")
+    parser.add_argument('--enc-lr', type=float, default=None,
+                        help="Encoder fine-tune LR (default 1e-5). BitFit can take ~1e-4.")
+    parser.add_argument('--heavy-aug', action='store_true',
+                        help="Stronger train augmentation (rot10 + mild RRC + ColorJitter) — "
+                             "regularizes encoder fine-tuning on the small (208-eye) train set.")
+    parser.add_argument('--batch-size', type=int, default=None,
+                        help="Override batch size (default 32). Use 16 for encoder fine-tune "
+                             "to fit the full-ViT-L backward graph in MPS memory.")
     args = parser.parse_args()
+
+    # Per-patient split / tag overrides (applied before train()).
+    if args.train_json: TRAIN_JSON = os.path.abspath(args.train_json)
+    if args.val_json:   VAL_JSON   = os.path.abspath(args.val_json)
+    if args.train_json or args.val_json:
+        print(f"✓ Data override: TRAIN={os.path.basename(TRAIN_JSON)} VAL={os.path.basename(VAL_JSON)}")
 
     deep_cfg = None
     if args.weighting == 'garway_heath':
@@ -1647,6 +1938,13 @@ if __name__ == "__main__":
     else:
         out_best, out_inference = BEST_SAVE, INFERENCE_SAVE
 
+    if args.out_tag:
+        auto_dir = os.path.join(CURRENT_DIR, "results", "auto")
+        os.makedirs(auto_dir, exist_ok=True)
+        out_best      = os.path.join(auto_dir, f"{args.out_tag}_best.pth")
+        out_inference = os.path.join(auto_dir, f"{args.out_tag}_inference.pth")
+        print(f"✓ Output tag: checkpoints → {out_best}")
+
     train(weighting=args.weighting, sector_combine=args.sector_combine,
           epochs=args.epochs, out_best=out_best, out_inference=out_inference,
           deep_cfg=deep_cfg,
@@ -1655,4 +1953,11 @@ if __name__ == "__main__":
           reweight=args.reweight, lds_sigma=args.lds_sigma, target_mae=args.target_mae,
           bias_penalty=args.bias_penalty,
           attn_dropout=args.dropout, head_dropout=args.dropout,
-          weight_decay=args.weight_decay, lr=args.lr, ema_decay=args.ema_decay)
+          weight_decay=args.weight_decay, lr=args.lr, ema_decay=args.ema_decay,
+          disc_crop=args.disc_crop, unfreeze_blocks=args.unfreeze_blocks,
+          update_champion=(not args.no_champion),
+          dispersion_weight=args.dispersion_weight,
+          label_noise=args.label_noise, entropy_weight=args.entropy_weight,
+          mean_residual=args.mean_residual, global_head=args.global_head,
+          finetune_norm=args.finetune_norm, enc_lr=args.enc_lr, heavy_aug=args.heavy_aug,
+          batch_size=args.batch_size)

@@ -1,0 +1,11 @@
+UWHVF manifold AE | 28943 fields | d=64 | dev mps
+  ep  0 | recon(observed) 3.784 | infill(dropped) 3.934
+  ep 10 | recon(observed) 2.499 | infill(dropped) 2.984
+  ep 20 | recon(observed) 2.241 | infill(dropped) 2.758
+  ep 30 | recon(observed) 2.355 | infill(dropped) 2.997
+  ep 40 | recon(observed) 2.115 | infill(dropped) 2.762
+  ep 50 | recon(observed) 1.925 | infill(dropped) 2.597
+  ep 60 | recon(observed) 1.785 | infill(dropped) 2.482
+  ep 70 | recon(observed) 1.744 | infill(dropped) 2.502
+  ep 79 | recon(observed) 1.709 | infill(dropped) 2.442
+saved -> /Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/pretrained_vf_ae.pth (best recon+0.5infill 2.930)

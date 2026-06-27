@@ -1,0 +1,226 @@
+✓ Using MPS (Apple Silicon GPU)
+✓ Loaded RETFound
+
+=== FOLD 0 ===
+  Longitudinal train: 522 records (313 with prior, 209 visit-1)
+✓ Encoder: FROZEN
+✓ Per-point attention (dropout=0.4, temp_init=2.0)
+✓ Shared point head (dropout=0.4)
+✓ Joint global-spatial head ON (ADDITIVE: per-point pred + zero-mean global pattern from mean-pool patches‖CLS; zero-init=no-op start) — targets eyeCorr 0.51
+✓ Cross-point refinement
+  Trainable: attention=425,985 + head=558,337 + refinement=11,181 = 995,503
+✓ Longitudinal head ON (prior-VF residual on persistence; zero-init delta; interval-gated). AE latent d=64, frozen.
+  warm-start fundus from long_global_f0_best.pth (loaded 446 tensors)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep 4 val MAE 3.785 (best 3.785)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep 6 val MAE 3.652 (best 3.652)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep 8 val MAE 3.653 (best 3.652)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep10 val MAE 3.674 (best 3.652)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep12 val MAE 3.692 (best 3.652)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep14 val MAE 3.682 (best 3.652)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep16 val MAE 3.706 (best 3.652)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep18 val MAE 3.671 (best 3.652)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep20 val MAE 3.696 (best 3.652)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep22 val MAE 3.671 (best 3.652)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep24 val MAE 3.695 (best 3.652)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep26 val MAE 3.699 (best 3.652)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep28 val MAE 3.694 (best 3.652)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  fold0 ep29 val MAE 3.685 (best 3.652)
+  Longitudinal val: 109 records (55 with prior, 54 visit-1)
+  Longitudinal val: 522 records (313 with prior, 209 visit-1)
+  fold 0: MAE 3.652 | floor 7.52(n552) | deep 6.88 | slope 0.679 | corr 0.800 | eyeCorr 0.537 | bias +0.62 | σp/σt 0.85
+
+=== FOLD 1 ===
+  Longitudinal train: 501 records (291 with prior, 210 visit-1)
+✓ Encoder: FROZEN
+✓ Per-point attention (dropout=0.4, temp_init=2.0)
+✓ Shared point head (dropout=0.4)
+✓ Joint global-spatial head ON (ADDITIVE: per-point pred + zero-mean global pattern from mean-pool patches‖CLS; zero-init=no-op start) — targets eyeCorr 0.51
+✓ Cross-point refinement
+  Trainable: attention=425,985 + head=558,337 + refinement=11,181 = 995,503
+✓ Longitudinal head ON (prior-VF residual on persistence; zero-init delta; interval-gated). AE latent d=64, frozen.
+  warm-start fundus from long_global_f1_best.pth (loaded 446 tensors)
+  Longitudinal val: 130 records (77 with prior, 53 visit-1)
+  fold1 ep 4 val MAE 3.817 (best 3.817)
+  Longitudinal val: 130 records (77 with prior, 53 visit-1)
+  fold1 ep 6 val MAE 3.917 (best 3.817)
+  Longitudinal val: 130 records (77 with prior, 53 visit-1)
+  fold1 ep 8 val MAE 3.875 (best 3.817)
+  Longitudinal val: 130 records (77 with prior, 53 visit-1)
+  fold1 ep10 val MAE 3.872 (best 3.817)
+  Longitudinal val: 130 records (77 with prior, 53 visit-1)
+  fold1 ep12 val MAE 3.898 (best 3.817)
+  Longitudinal val: 130 records (77 with prior, 53 visit-1)
+  fold1 ep14 val MAE 3.870 (best 3.817)
+  Longitudinal val: 130 records (77 with prior, 53 visit-1)
+  fold1 ep16 val MAE 3.839 (best 3.817)
+  Longitudinal val: 130 records (77 with prior, 53 visit-1)
+  fold1 ep18 val MAE 3.839 (best 3.817)
+  Longitudinal val: 130 records (77 with prior, 53 visit-1)
+  fold1 ep20 val MAE 3.852 (best 3.817)
+  Longitudinal val: 130 records (77 with prior, 53 visit-1)
+  fold1 ep22 val MAE 3.872 (best 3.817)
+  Longitudinal val: 130 records (77 with prior, 53 visit-1)
+  fold1 ep24 val MAE 3.862 (best 3.817)
+  Longitudinal val: 130 records (77 with prior, 53 visit-1)
+  fold1 ep26 val MAE 3.859 (best 3.817)
+  Longitudinal val: 130 records (77 with prior, 53 visit-1)
+  fold1 ep28 val MAE 3.842 (best 3.817)
+  Longitudinal val: 130 records (77 with prior, 53 visit-1)
+  fold1 ep29 val MAE 3.844 (best 3.817)
+  Longitudinal val: 130 records (77 with prior, 53 visit-1)
+  Longitudinal val: 501 records (291 with prior, 210 visit-1)
+  fold 1: MAE 3.817 | floor 8.92(n550) | deep 7.77 | slope 0.585 | corr 0.683 | eyeCorr 0.512 | bias +0.62 | σp/σt 0.86
+
+=== FOLD 2 ===
+  Longitudinal train: 511 records (302 with prior, 209 visit-1)
+✓ Encoder: FROZEN
+✓ Per-point attention (dropout=0.4, temp_init=2.0)
+✓ Shared point head (dropout=0.4)
+✓ Joint global-spatial head ON (ADDITIVE: per-point pred + zero-mean global pattern from mean-pool patches‖CLS; zero-init=no-op start) — targets eyeCorr 0.51
+✓ Cross-point refinement
+  Trainable: attention=425,985 + head=558,337 + refinement=11,181 = 995,503
+✓ Longitudinal head ON (prior-VF residual on persistence; zero-init delta; interval-gated). AE latent d=64, frozen.
+  warm-start fundus from long_global_f2_best.pth (loaded 446 tensors)
+  Longitudinal val: 120 records (66 with prior, 54 visit-1)
+  fold2 ep 4 val MAE 4.045 (best 4.045)
+  Longitudinal val: 120 records (66 with prior, 54 visit-1)
+  fold2 ep 6 val MAE 4.010 (best 4.010)
+  Longitudinal val: 120 records (66 with prior, 54 visit-1)
+  fold2 ep 8 val MAE 4.002 (best 4.002)
+  Longitudinal val: 120 records (66 with prior, 54 visit-1)
+  fold2 ep10 val MAE 4.224 (best 4.002)
+  Longitudinal val: 120 records (66 with prior, 54 visit-1)
+  fold2 ep12 val MAE 4.124 (best 4.002)
+  Longitudinal val: 120 records (66 with prior, 54 visit-1)
+  fold2 ep14 val MAE 4.168 (best 4.002)
+  Longitudinal val: 120 records (66 with prior, 54 visit-1)
+  fold2 ep16 val MAE 4.077 (best 4.002)
+  Longitudinal val: 120 records (66 with prior, 54 visit-1)
+  fold2 ep18 val MAE 4.092 (best 4.002)
+  Longitudinal val: 120 records (66 with prior, 54 visit-1)
+  fold2 ep20 val MAE 4.087 (best 4.002)
+  Longitudinal val: 120 records (66 with prior, 54 visit-1)
+  fold2 ep22 val MAE 4.161 (best 4.002)
+  Longitudinal val: 120 records (66 with prior, 54 visit-1)
+  fold2 ep24 val MAE 4.109 (best 4.002)
+  Longitudinal val: 120 records (66 with prior, 54 visit-1)
+  fold2 ep26 val MAE 4.143 (best 4.002)
+  Longitudinal val: 120 records (66 with prior, 54 visit-1)
+  fold2 ep28 val MAE 4.109 (best 4.002)
+  Longitudinal val: 120 records (66 with prior, 54 visit-1)
+  fold2 ep29 val MAE 4.137 (best 4.002)
+  Longitudinal val: 120 records (66 with prior, 54 visit-1)
+  Longitudinal val: 511 records (302 with prior, 209 visit-1)
+  fold 2: MAE 4.002 | floor 8.42(n458) | deep 7.47 | slope 0.609 | corr 0.721 | eyeCorr 0.521 | bias +0.31 | σp/σt 0.84
+
+=== FOLD 3 ===
+  Longitudinal train: 490 records (279 with prior, 211 visit-1)
+✓ Encoder: FROZEN
+✓ Per-point attention (dropout=0.4, temp_init=2.0)
+✓ Shared point head (dropout=0.4)
+✓ Joint global-spatial head ON (ADDITIVE: per-point pred + zero-mean global pattern from mean-pool patches‖CLS; zero-init=no-op start) — targets eyeCorr 0.51
+✓ Cross-point refinement
+  Trainable: attention=425,985 + head=558,337 + refinement=11,181 = 995,503
+✓ Longitudinal head ON (prior-VF residual on persistence; zero-init delta; interval-gated). AE latent d=64, frozen.
+  warm-start fundus from long_global_f3_best.pth (loaded 446 tensors)
+  Longitudinal val: 141 records (89 with prior, 52 visit-1)
+  fold3 ep 4 val MAE 3.646 (best 3.646)
+  Longitudinal val: 141 records (89 with prior, 52 visit-1)
+  fold3 ep 6 val MAE 3.579 (best 3.579)
+  Longitudinal val: 141 records (89 with prior, 52 visit-1)
+  fold3 ep 8 val MAE 3.571 (best 3.571)
+  Longitudinal val: 141 records (89 with prior, 52 visit-1)
+  fold3 ep10 val MAE 3.583 (best 3.571)
+  Longitudinal val: 141 records (89 with prior, 52 visit-1)
+  fold3 ep12 val MAE 3.577 (best 3.571)
+  Longitudinal val: 141 records (89 with prior, 52 visit-1)
+  fold3 ep14 val MAE 3.592 (best 3.571)
+  Longitudinal val: 141 records (89 with prior, 52 visit-1)
+  fold3 ep16 val MAE 3.610 (best 3.571)
+  Longitudinal val: 141 records (89 with prior, 52 visit-1)
+  fold3 ep18 val MAE 3.607 (best 3.571)
+  Longitudinal val: 141 records (89 with prior, 52 visit-1)
+  fold3 ep20 val MAE 3.602 (best 3.571)
+  Longitudinal val: 141 records (89 with prior, 52 visit-1)
+  fold3 ep22 val MAE 3.610 (best 3.571)
+  Longitudinal val: 141 records (89 with prior, 52 visit-1)
+  fold3 ep24 val MAE 3.591 (best 3.571)
+  Longitudinal val: 141 records (89 with prior, 52 visit-1)
+  fold3 ep26 val MAE 3.599 (best 3.571)
+  Longitudinal val: 141 records (89 with prior, 52 visit-1)
+  fold3 ep28 val MAE 3.609 (best 3.571)
+  Longitudinal val: 141 records (89 with prior, 52 visit-1)
+  fold3 ep29 val MAE 3.606 (best 3.571)
+  Longitudinal val: 141 records (89 with prior, 52 visit-1)
+  Longitudinal val: 490 records (279 with prior, 211 visit-1)
+  fold 3: MAE 3.571 | floor 6.42(n486) | deep 6.28 | slope 0.762 | corr 0.792 | eyeCorr 0.564 | bias -0.14 | σp/σt 0.96
+
+=== FOLD 4 ===
+  Longitudinal train: 500 records (287 with prior, 213 visit-1)
+✓ Encoder: FROZEN
+✓ Per-point attention (dropout=0.4, temp_init=2.0)
+✓ Shared point head (dropout=0.4)
+✓ Joint global-spatial head ON (ADDITIVE: per-point pred + zero-mean global pattern from mean-pool patches‖CLS; zero-init=no-op start) — targets eyeCorr 0.51
+✓ Cross-point refinement
+  Trainable: attention=425,985 + head=558,337 + refinement=11,181 = 995,503
+✓ Longitudinal head ON (prior-VF residual on persistence; zero-init delta; interval-gated). AE latent d=64, frozen.
+  warm-start fundus from long_global_f4_best.pth (loaded 446 tensors)
+  Longitudinal val: 131 records (81 with prior, 50 visit-1)
+  fold4 ep 4 val MAE 3.783 (best 3.783)
+  Longitudinal val: 131 records (81 with prior, 50 visit-1)
+  fold4 ep 6 val MAE 3.762 (best 3.762)
+  Longitudinal val: 131 records (81 with prior, 50 visit-1)
+  fold4 ep 8 val MAE 3.768 (best 3.762)
+  Longitudinal val: 131 records (81 with prior, 50 visit-1)
+  fold4 ep10 val MAE 3.732 (best 3.732)
+  Longitudinal val: 131 records (81 with prior, 50 visit-1)
+  fold4 ep12 val MAE 3.790 (best 3.732)
+  Longitudinal val: 131 records (81 with prior, 50 visit-1)
+  fold4 ep14 val MAE 3.756 (best 3.732)
+  Longitudinal val: 131 records (81 with prior, 50 visit-1)
+  fold4 ep16 val MAE 3.750 (best 3.732)
+  Longitudinal val: 131 records (81 with prior, 50 visit-1)
+  fold4 ep18 val MAE 3.788 (best 3.732)
+  Longitudinal val: 131 records (81 with prior, 50 visit-1)
+  fold4 ep20 val MAE 3.810 (best 3.732)
+  Longitudinal val: 131 records (81 with prior, 50 visit-1)
+  fold4 ep22 val MAE 3.788 (best 3.732)
+  Longitudinal val: 131 records (81 with prior, 50 visit-1)
+  fold4 ep24 val MAE 3.783 (best 3.732)
+  Longitudinal val: 131 records (81 with prior, 50 visit-1)
+  fold4 ep26 val MAE 3.782 (best 3.732)
+  Longitudinal val: 131 records (81 with prior, 50 visit-1)
+  fold4 ep28 val MAE 3.785 (best 3.732)
+  Longitudinal val: 131 records (81 with prior, 50 visit-1)
+  fold4 ep29 val MAE 3.780 (best 3.732)
+  Longitudinal val: 131 records (81 with prior, 50 visit-1)
+  Longitudinal val: 500 records (287 with prior, 213 visit-1)
+  fold 4: MAE 3.732 | floor 8.33(n460) | deep 7.11 | slope 0.601 | corr 0.685 | eyeCorr 0.559 | bias +0.28 | σp/σt 0.88
+
+==========================================================================================
+LONGITUDINAL 5-FOLD OOF (631 recs)  RAW   MAE 3.751 | floor 7.93(n2506) | deep 7.11 | slope 0.655 | corr 0.741 | eyeCorr 0.539 | bias +0.32 | σp/σt 0.88
+  severity-stratified (per-eye true mean dB):
+    severe   n=101 | MAE 6.215 | floor 6.67 | slope 0.483
+    moderate n=183 | MAE 4.581 | floor 10.03 | slope 0.455
+    mild     n=347 | MAE 2.596 | floor 8.74 | slope 0.530
+LONGITUDINAL 5-FOLD OOF (631 recs)  CALIB MAE 3.888 | floor 7.63(n2506) | deep 7.08 | slope 0.709 | corr 0.740 | eyeCorr 0.539 | bias +0.19 | σp/σt 0.96
+  severity-stratified (per-eye true mean dB):
+    severe   n=101 | MAE 6.180 | floor 6.32 | slope 0.498
+    moderate n=183 | MAE 4.781 | floor 9.80 | slope 0.499
+    mild     n=347 | MAE 2.750 | floor 8.91 | slope 0.592
+==========================================================================================
+refs: fundus-only 4.29 ; persistence 3.71 ; target sub-3.74.

@@ -281,5 +281,5 @@
   "target": "raw threshold sensitivity (dB), clamped 0-35",
   "masked_value_threshold": 99.0,
   "combine": "sector_only",
-  "epochs": 100
+  "epochs": 60
 }
