@@ -248,11 +248,5 @@ if __name__ == "__main__":
                   dev_prefix="grape_long")
     elif cmd == "baseline":
         cmd_baseline()
-    elif cmd == "probe":
-        import probe_features  # lazy heavy import
-        probe_features.main()
-    elif cmd == "eval-champ":
-        import probe_features
-        probe_features.eval_champ()
     else:
         print(f"unknown command {cmd!r}")

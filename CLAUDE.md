@@ -1,92 +1,109 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for working in this repository.
 
 ## Project Overview
 
-Research project predicting Humphrey Visual Field (HVF 24-2) tests from fundus (retinal) images using a frozen RETFound encoder + trainable decoder. Presented at ARVO 2026.
+Predicts the Humphrey Visual Field (HVF 24-2, 52 points, dB) for a glaucoma eye from a fundus
+photo, using a frozen RETFound encoder + a trainable decoder with Garway-Heath anatomical
+sectoring. The current best model is **longitudinal**: it predicts a visit's VF from
+`fundus + the eye's prior VF + the inter-test interval`. For ARVO 2026.
 
-## Common Commands
+**Honest headline result (leak-free per-patient 5-fold CV over 631 records):** pooled pointwise
+MAE **3.75 dB** (raw), calibrated line-of-best-fit slope **0.72**, severe-band MAE **6.06**.
+Fundus-only (no prior VF) baseline on the same eval = **4.29**. Persistence baseline = 3.71.
+
+## Replication pipeline (reproduces the 3.75)
+
+Run from the repo root. All training detects `mps` > `cuda` > `cpu`.
 
 ```bash
-# Stage 1: Pre-train VF auto-decoder on UWHVF data (~29k VF tests, no images)
-python decoder/pretraining.py
+# 1. Build the longitudinal dataset from the GRAPE Excel "Follow-up" sheet
+#    -> data/vf_tests/grape_longitudinal.json (631 fundus->same-visit-VF pairs, each with its
+#       most-recent causal prior VF + interval_years)
+python build_longitudinal_grape.py
 
-# Stage 2: Split GRAPE dataset into train/test (run once, seeds fixed at 42)
-python decoder/separate_datasets.py
+# 2. Per-patient stratified 5-fold split (eye-disjoint, leak-free) -> decoder/results/cv_long/
+python decoder/diagnostics.py split-long
 
-# Stage 3: Train full model (RETFound encoder frozen, decoder trained on GRAPE)
-python decoder/training.py
+# 3. Pretrain the VF-manifold autoencoder on UWHVF (~29k VF-only) -> decoder/pretrained_vf_ae.pth
+python decoder/vf_autoencoder.py
 
-# Run inference and save best predictions by severity category
-python decoder/predict_vf_from_fundus.py \
-  --fundus-file 1_OD_1.jpg \
-  --output-dir decoder/best_prediction_out
+# 4. Train the fundus-only base (warm-start for the longitudinal model + the 4.29 baseline)
+#    -> decoder/results/auto/long_global_f{0..4}_best.pth
+python decoder/run_cv.py --tag long_global --cv-dir decoder/results/cv_long --epochs 60 -- \
+  --weighting garway_heath --sector-combine sector_only --reweight value \
+  --lr 8e-4 --dropout 0.2 --weight-decay 0.005 --global-head
 
-# Generate per-point scatterplot for the current inference model
-python decoder/generate_scatterplot.py
+# 5. Train the longitudinal model (warm-starts the frozen fundus branch from step 4)
+#    -> decoder/results/auto/long_prior_f{0..4}_best.pth + long_prior_cv.{log,json}
+python decoder/train_longitudinal.py --tag long_prior --epochs 16
 
-# Data conversion utilities
-python vf_test_standardizer.py   # Convert UWHVF JSON to standardized format
-python vf_test_converter.py      # Convert GRAPE Excel to JSON
-python decoder/expand_GRAPE.py   # Expand GRAPE with additional image paths
+# 6. Deliverables / proof
+python decoder/eval_strata_longitudinal.py     # per-stratum: with-prior 3.185 vs visit-1 4.55
+python decoder/eval_blend_longitudinal.py       # shows model == deterministic blend (3.752)
+python decoder/make_scatterplot.py              # decoder/results/auto/longitudinal_scatter.png
+
+# Data utilities (only needed to regenerate inputs from raw)
+python vf_test_standardizer.py   # raw UWHVF JSON -> standardized (autoencoder training data)
+python vf_test_converter.py      # GRAPE Excel Baseline sheet -> grape_new_vf_tests.json (mapping ref)
 ```
 
-## Architecture
+## Architecture (longitudinal model)
 
-### Two-stage pipeline
+`decoder/longitudinal_model.py` — `LongitudinalVFModel`, a subclass of `PerPointVFModel`
+(`decoder/training.py`). All 52-vectors are in OD/OS query order.
 
-**Stage 1 — VF Auto-decoder Pre-training** (`decoder/pretraining.py`):
-Trains a VF auto-encoder (encoder-decoder) using UWHVF's ~29k VF-only records. The decoder learns to reconstruct 52-point VF sensitivity vectors from corrupted/masked inputs. Saves `decoder/pretrained_vf_decoder.pth`.
-
-**Stage 2 — Main Model Training** (`decoder/training.py`):
-Uses the GRAPE dataset (fundus images + paired VF tests).
-
-The current model (`PerPointVFModel`, v10.2) architecture:
-1. **RETFound encoder** (frozen `mae_vit_large_patch16_dec512d8b`, ViT-Large) — encodes 224×224 fundus image into 196 patch tokens (1024-dim) + CLS token
-2. **PerPointAttention** — 52 learned query vectors attend over patch tokens with anatomical priors (Gaussian distance bias toward the anatomically corresponding patch region) and learnable temperature. Returns per-point attended features.
-3. **PointHead** — shared MLP per point that takes `[attended_feature ‖ cls_token]` (2048-dim) and predicts scalar sensitivity in dB
-4. **CrossPointRefinement** — small MLP over all 52 predictions jointly, zero-initialized with learned gate, adds spatial coherence
-
-An older simpler model (`MultiImageModel`) in `decoder/predict_vf_from_fundus.py` uses CLS-token → MLP projection instead of per-point attention; used for backward-compatible inference.
+- **Frozen RETFound** (`mae_vit_large_patch16_dec512d8b`, ViT-L) — 224×224 fundus -> 196 patch
+  tokens + CLS. `_encode` runs it WITHOUT the MAE random patch shuffle (a fixed correctness bug).
+- **PerPointAttention** — 52 query vectors attend over patches with a **Garway-Heath** anatomical
+  Gaussian prior (mandatory). + a zero-init global-spatial head + cross-point refinement.
+- **VF-manifold autoencoder** (`decoder/vf_autoencoder.py`, frozen) — encodes the eye's prior VF
+  (mean-imputed + mask channel, non-zeroed) into a 64-d latent; infills missing prior points.
+- **Prediction:** for prior-bearing records, `pred = prior_field + gate(interval)·delta`, with the
+  delta head **zero-initialised** so it starts exactly at persistence (3.185) and only earns
+  corrections. For first-visit records (no prior), `pred =` the warm-started frozen fundus branch.
+- **Key honest finding:** the learned delta adds ~nothing (follow-up stratum is bounded by the
+  2.76 dB test-retest noise floor); the model is equivalent to "persistence on follow-ups +
+  fundus on first-visits." See `decoder/results/auto/iterations.md`.
 
 ### VF grid conventions
-- HVF 24-2 has 52 valid test points out of a 8×9 grid (72 cells). Positions with value ≥ 99.0 are masked/invalid.
-- `mask_OD` defines which cells are valid for the right eye; `mask_OS = np.fliplr(mask_OD)` for left eye.
-- `valid_indices_od` / `valid_indices_os` are flat indices into the 72-element flattened grid.
-- The model always predicts 52 values in OD canonical order; laterality flipping is handled inside `PerPointAttention` by flipping the anatomical prior horizontally.
-- VF data stored as 8×9 Python lists in JSON under key `"hvf"`.
+- 24-2 = 52 valid points of an 8×9 grid (72 cells); value ≥ 99.0 = masked. `mask_OD` is the right
+  eye; `mask_OS = fliplr(mask_OD)`. `valid_indices_od/os` index the flattened 72-grid. The model
+  predicts 52 values in OD canonical (query) order; laterality flip is inside `PerPointAttention`.
+- VF stored as 8×9 lists under `"hvf"`. Record schema:
+  `{"PatientID":int, "Laterality":"OD"|"OS", "VisitNumber":int, "FundusImage":[file], "hvf":[8×9],
+    "interval_years":float, "has_prior":bool, "prior_hvf":[8×9]|null, "delta_t":float}`.
 
 ## Data
-
 ```
 data/
-  fundus/
-    grape_fundus_images/   # GRAPE fundus images (not in git, large)
+  fundus/grape_fundus_images/        # GRAPE fundus images (not in git, large)
   vf_tests/
-    uwhvf_vf_tests.json             # Raw UWHVF data
-    uwhvf_vf_tests_standardized.json # Standardized for pretraining
-    grape_data.xlsx                  # Raw GRAPE spreadsheet
-    grape_new_vf_tests.json          # Processed GRAPE (all eyes)
-    grape_train.json                 # 80% split (seed=42)
-    grape_test.json                  # 20% split (seed=42)
-```
-
-JSON record format (GRAPE):
-```json
-{
-  "PatientID": 1,
-  "FundusImage": ["1_OD_1.jpg", "1_OD_2.jpg"],  // list for multi-image
-  "Laterality": "OD",
-  "hvf": [[...8 rows of 9 values...]]            // 100.0 = masked point
-}
+    grape_data.xlsx                  # GRAPE source (Baseline + Follow-up sheets)
+    grape_longitudinal.json          # 631 per-visit pairs + causal prior VF  (built, step 1)
+    grape_long_train/val.json        # fast dev split (built, step 2)
+    grape_new_vf_tests.json          # 263 baseline eyes (mapping reference / test)
+    uwhvf_vf_tests.json              # raw UWHVF (~29k VF-only)
+    uwhvf_vf_tests_standardized.json # standardized UWHVF (autoencoder training data)
+decoder/results/
+  cv_long/                           # per-patient 5-fold splits (the eval folds)
+  auto/long_prior_f*_best.pth        # the final longitudinal model (5 folds)
+  auto/long_global_f*_best.pth       # fundus-only base / warm-start (5 folds)
+  auto/long_prior_cv.{log,json}      # the 3.75 result (proof)
+  auto/longitudinal_scatter.png      # deliverable scatterplot
+  auto/iterations.md                 # full Sessions 1-4 narrative (what we tried + why)
+  champion/longitudinal_champion.json
+  garway_heath/config.json           # GH sector map (read by garway_heath_weighting.py)
 ```
 
 ## Key Implementation Details
-
-- **MPS (Apple Silicon)**: All training scripts set `PYTORCH_ENABLE_MPS_FALLBACK=1` and detect `mps` > `cuda` > `cpu`. Training won't work on MPS without this env var because some ops fall back to CPU.
-- **Severity weighting**: Training uses `WeightedRandomSampler` to oversample eyes with more severe VF loss (lower mean dB).
-- **TTA**: Test-time augmentation uses rotations `[-5°, 0°, 5°]` during validation; predictions are averaged.
-- **Loss**: Weighted Huber loss + per-eye CCC loss (starts epoch 5) + variance penalty (starts epoch 8) + attention entropy bonus.
-- **Model checkpoints**: `decoder/best_multi_image_model.pth` (training state), `decoder/inference_model.pth` (minimal inference state). `predict_vf_from_fundus.py` tries multiple candidates in priority order.
-- **Metrics target**: Baseline ~3.74 dB MAE. v10.2 trains toward sub-4 dB.
+- **MPS:** scripts set `PYTORCH_ENABLE_MPS_FALLBACK=1`.
+- **Eval:** honest = per-patient 5-fold CV (`decoder/diagnostics.py` `build_patient_folds` +
+  `pooled_metrics` + `stratified_report`). Causal ordering: a target visit uses only that eye's
+  EARLIER visits as the prior input (leak-free; standard longitudinal forecasting).
+- **TTA:** rotations `[-5°, 0°, 5°]` at val, averaged. **Loss:** GH-weighted Huber + per-eye CCC
+  + variance + a small delta regularizer.
+- **Checkpoints are ~1.2 GB** (they bundle the frozen RETFound weights); `eval_ckpt.load_model`
+  reloads the encoder fresh, so only the small decoder/longitudinal tensors matter.
+```
