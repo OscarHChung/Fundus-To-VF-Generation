@@ -38,6 +38,7 @@ from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
 import math
+import copy
 from losses import balanced_mse_loss
 
 # ============== MPS ==============
@@ -109,6 +110,13 @@ VARIANCE_START  = 8
 # barely moves, RAISE bmc_sigma (opposite of a small-σ intuition). See tests_method_a.py.
 LOSS_MODE = 'huber'   # {'huber', 'balanced_mse'}
 BMC_SIGMA = 1.0       # noise scale (dB) for balanced_mse; larger ⇒ stronger de-shrinkage
+
+# ── METHOD B: per-eye TRAINING-target denoising (opt-in; default OFF = raw targets) ──
+# Regress out per-eye test-retest noise by evaluating a robust per-point trend at the target
+# visit's date (build_denoised_targets.py). TRAIN-ONLY: val/eval always score against RAW VF.
+DENOISED_TARGETS_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "data", "vf_tests",
+    "grape_longitudinal_denoised.json")
 
 # ── Session-3: within-eye dispersion match (anti-shrinkage) ──────
 # Iter-A probes proved the model is excessively shrunk: pooled σ_pred/σ_true ≈ 0.53 while
@@ -280,7 +288,7 @@ def disc_crop_pil(img, laterality):
 # ============== Dataset ==============
 class MultiImageDataset(Dataset):
     def __init__(self, json_path, fundus_dir, transform, mode='train', use_tta=False,
-                 disc_crop=False):
+                 disc_crop=False, denoised_lookup=None):
         with open(json_path, 'r') as f:
             self.data = json.load(f)
         self.fundus_dir = fundus_dir
@@ -288,6 +296,11 @@ class MultiImageDataset(Dataset):
         self.mode       = mode
         self.use_tta    = use_tta
         self.disc_crop  = disc_crop
+        # Method B — TRAIN-ONLY target denoising. denoised_lookup maps
+        # "PatientID_Laterality_VisitNumber" -> 8x9 denoised hvf; used for train targets only
+        # (val/eval always keep the RAW observed VF). None = raw targets (baseline).
+        self.denoised_lookup = denoised_lookup if mode == 'train' else None
+        self._n_denoised = 0
         # Views per image: always 'full'; + 'disc' (a laterality-aware disc zoom)
         # when disc_crop is on. Train treats each (image,view) as its own sample;
         # val stacks all views of an eye and averages their predictions.
@@ -298,6 +311,12 @@ class MultiImageDataset(Dataset):
             hvf        = item['hvf']
             laterality = item.get('Laterality', 'OD').strip().upper()
             patient_id = item.get('PatientID', 0)
+            # Method B — swap in the denoised TRAIN target when available (else keep raw).
+            if self.denoised_lookup is not None:
+                key = f"{int(patient_id)}_{laterality}_{int(item.get('VisitNumber', -1))}"
+                if key in self.denoised_lookup:
+                    hvf = self.denoised_lookup[key]
+                    self._n_denoised += 1
             if self.mode == 'train':
                 for img_path in images:
                     for v in views:
@@ -309,7 +328,8 @@ class MultiImageDataset(Dataset):
                                      'hvf': hvf, 'laterality': laterality,
                                      'patient_id': patient_id})
         if self.mode == 'train':
-            print(f"  Train: {len(self.data)} eyes → {len(self.samples)} images")
+            dn = f" | denoised targets: {self._n_denoised}/{len(self.data)}" if self.denoised_lookup else ""
+            print(f"  Train: {len(self.data)} eyes → {len(self.samples)} images{dn}")
         else:
             print(f"  Val: {len(self.data)} eyes with {sum(len(s['images']) for s in self.samples)} images")
             if use_tta:
@@ -604,15 +624,59 @@ class CrossPointRefinement(nn.Module):
         return x + torch.sigmoid(self.alpha) * correction
 
 
+# ============== METHOD C: LoRA adapter for the frozen RETFound encoder ==============
+class LoRALinear(nn.Module):
+    """Low-rank adapter wrapping a frozen nn.Linear: y = base(x) + (α/r)·dropout(x)·A·B.
+
+    base stays frozen (RETFound weights untouched → still a "pretrained RETFound" encoder).
+    A ~ N(0, 1/r), B = 0 at init ⇒ the adapter is an exact NO-OP at start (encoded features
+    equal the frozen-encoder features until training moves B). Only A, B are trainable.
+    """
+    def __init__(self, base, r=8, alpha=16, dropout=0.1):
+        super().__init__()
+        self.base = base
+        for p in self.base.parameters():
+            p.requires_grad = False
+        in_f  = base.in_features
+        out_f = base.out_features
+        self.r = r
+        self.scaling = alpha / r
+        self.dropout = nn.Dropout(dropout)
+        self.A = nn.Parameter(torch.randn(in_f, r) / r)
+        self.B = nn.Parameter(torch.zeros(r, out_f))          # zero-init ⇒ no-op at start
+
+    def forward(self, x):
+        return self.base(x) + self.scaling * (self.dropout(x) @ self.A @ self.B)
+
+
+def inject_lora(encoder, n_blocks, r, alpha, dropout, wrap_proj=False):
+    """Replace the last n_blocks ViT blocks' attention qkv (and optionally proj) projections
+    with LoRALinear wrappers. Returns the number of adapters injected."""
+    n = 0
+    for blk in encoder.blocks[-n_blocks:]:
+        attn = blk.attn
+        if hasattr(attn, 'qkv') and isinstance(attn.qkv, nn.Linear):
+            attn.qkv = LoRALinear(attn.qkv, r, alpha, dropout); n += 1
+        if wrap_proj and hasattr(attn, 'proj') and isinstance(attn.proj, nn.Linear):
+            attn.proj = LoRALinear(attn.proj, r, alpha, dropout); n += 1
+    return n
+
+
 # ============== Full Model ==============
 class PerPointVFModel(nn.Module):
     def __init__(self, encoder, use_dist=False, dist_blend=DIST_BLEND, unfreeze_blocks=0,
-                 mean_residual=False, global_head=False, finetune_norm=False):
+                 mean_residual=False, global_head=False, finetune_norm=False,
+                 lora=False, lora_rank=8, lora_blocks=8, lora_alpha=16, lora_dropout=0.1):
         super().__init__()
-        self.encoder = encoder
+        # Method C — LoRA replaces submodules in place, so it must NOT mutate the shared module-
+        # global base_model (would pollute other models/evals). Adapt a private deep copy instead.
+        self.encoder = copy.deepcopy(encoder) if lora else encoder
         self.embed_dim = 1024
         self.unfreeze_blocks = unfreeze_blocks
         self.finetune_norm = finetune_norm
+        self.lora = lora
+        self.lora_cfg = dict(rank=lora_rank, blocks=lora_blocks, alpha=lora_alpha,
+                             dropout=lora_dropout)
 
         for p in self.encoder.parameters():
             p.requires_grad = False
@@ -638,6 +702,19 @@ class PerPointVFModel(nn.Module):
                   f"({n_enc:,} trainable enc params; rest frozen) — attacks the corr ceiling")
         else:
             print("✓ Encoder: FROZEN")
+
+        # Method C — inject LoRA adapters into the last K blocks' attention (base stays frozen).
+        # The adapted blocks must run WITH grad in _encode; _grad_blocks tracks how many trailing
+        # blocks to graph (max of any encoder-adaptation that needs gradients).
+        self._grad_blocks = unfreeze_blocks
+        if lora:
+            n_adapt = inject_lora(self.encoder, lora_blocks, lora_rank, lora_alpha, lora_dropout)
+            self._grad_blocks = max(self._grad_blocks, lora_blocks)
+            n_lora = sum(p.numel() for n, p in self.encoder.named_parameters()
+                         if p.requires_grad and ('.A' in n or '.B' in n))
+            print(f"✓ Method C: LoRA ON — {n_adapt} adapters in last {lora_blocks} blocks "
+                  f"(rank={lora_rank}, alpha={lora_alpha}, dropout={lora_dropout}); "
+                  f"{n_lora:,} trainable LoRA params; RETFound base frozen")
 
         self.attention = PerPointAttention(
             embed_dim=self.embed_dim,
@@ -767,7 +844,8 @@ class PerPointVFModel(nn.Module):
             for blk in enc.blocks:
                 h = blk(h)
             return enc.norm(h)
-        n_unf = getattr(self, 'unfreeze_blocks', 0)
+        # Trailing blocks that must build a graph: full-unfreeze OR LoRA-adapted (Method C).
+        n_unf = getattr(self, '_grad_blocks', getattr(self, 'unfreeze_blocks', 0))
         n_frozen = len(enc.blocks) - n_unf
         # Frozen prefix always runs under no_grad (no graph, no memory cost).
         with torch.no_grad():
@@ -1405,7 +1483,9 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
           update_champion=True, dispersion_weight=DISPERSION_WEIGHT,
           label_noise=None, entropy_weight=None, mean_residual=False, global_head=False,
           finetune_norm=False, enc_lr=None, heavy_aug=False, batch_size=None,
-          loss_mode='huber', bmc_sigma=None):
+          loss_mode='huber', bmc_sigma=None, denoised_targets=False,
+          lora=False, lora_rank=8, lora_blocks=8, lora_alpha=16, lora_dropout=0.1,
+          lora_lr=2e-4):
     # Regularization / LR overrides (for fast autonomous sweeps without edits).
     global ATTN_DROPOUT, HEAD_DROPOUT, ATTN_WD, ATTN_LR, LABEL_NOISE_STD, ATTN_ENTROPY_WEIGHT, ENC_LR
     global LOSS_MODE, BMC_SIGMA
@@ -1414,6 +1494,7 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
     if weight_decay is not None: ATTN_WD = weight_decay
     if lr is not None: ATTN_LR = lr
     if enc_lr is not None: ENC_LR = enc_lr
+    elif lora:             ENC_LR = lora_lr   # LoRA gets its own (small) LR; ENC_WD stays high
     # Session-3: knobs to UN-wash the within-eye spatial signal (MLP probe showed the
     # frozen features support eyeCorr ~0.51 but the champion only reaches 0.41 — the entropy
     # bonus + label noise over-smooth/shrink the per-point predictions).
@@ -1513,8 +1594,15 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
         print("✓ Heavy augmentation ON (rot10 + mild RRC + ColorJitter) — for encoder fine-tune")
+    # Method B — load the denoised TRAIN-target lookup (train targets only; val stays raw).
+    denoised_lookup = None
+    if denoised_targets:
+        with open(DENOISED_TARGETS_PATH) as f:
+            denoised_lookup = json.load(f)
+        print(f"✓ Method B: denoised TRAIN targets ON ({len(denoised_lookup)} keys from "
+              f"{os.path.basename(DENOISED_TARGETS_PATH)}) — val/eval keep RAW VF")
     train_dataset = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, tr_tfm, mode='train',
-                                      disc_crop=disc_crop)
+                                      disc_crop=disc_crop, denoised_lookup=denoised_lookup)
     val_dataset   = MultiImageDataset(VAL_JSON,   FUNDUS_DIR, val_transform,   mode='val',
                                       use_tta=USE_TTA, disc_crop=disc_crop)
 
@@ -1544,9 +1632,11 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
     # ── Model ──────────────────────────────────────────────────
     model = PerPointVFModel(base_model, use_dist=use_dist, dist_blend=dist_blend,
                             unfreeze_blocks=unfreeze_blocks, mean_residual=mean_residual,
-                            global_head=global_head, finetune_norm=finetune_norm)
+                            global_head=global_head, finetune_norm=finetune_norm,
+                            lora=lora, lora_rank=lora_rank, lora_blocks=lora_blocks,
+                            lora_alpha=lora_alpha, lora_dropout=lora_dropout)
     model.to(DEVICE)
-    enc_trainable = (unfreeze_blocks > 0) or finetune_norm
+    enc_trainable = (unfreeze_blocks > 0) or finetune_norm or lora
 
     # ── Pre-cache frozen encoder features (one-time cost) ──────
     # The RETFound encoder is frozen throughout training, so its outputs for
@@ -1565,7 +1655,9 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
         print(f"  Val checks are now ~50× faster (decoder-only, encoder skipped).")
     else:
         val_cache = train_eval_cache = None
-        mode = "BitFit norm+bias" if finetune_norm else f"last {unfreeze_blocks} block(s)"
+        mode = ("BitFit norm+bias" if finetune_norm else
+                f"LoRA r{lora_rank}×{lora_blocks}blk" if lora else
+                f"last {unfreeze_blocks} block(s)")
         print(f"\nEncoder is trainable ({mode}) → feature caching DISABLED "
               f"(features change each step); val runs the full encoder live (slower but correct).")
     print(f"  Val gate: skip unless epoch train MAE < {TRAIN_MAE_GATE} dB "
@@ -1742,7 +1834,9 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
                             'corr': val_corr, 'r2': val_r2, 'slope': val_slope,
                             'eye_corr': val_eye_corr, 'epoch': epoch,
                             'use_dist': use_dist, 'dist_blend': dist_blend,
-                            'mean_residual': mean_residual, 'global_head': global_head}, out_best)
+                            'mean_residual': mean_residual, 'global_head': global_head,
+                            'lora': lora, 'lora_rank': lora_rank, 'lora_blocks': lora_blocks,
+                            'lora_alpha': lora_alpha, 'lora_dropout': lora_dropout}, out_best)
                 torch.save({'model_state_dict': model.state_dict(),
                             'encoder_checkpoint': CHECKPOINT_PATH,
                             'val_mae': val_mae, 'val_corr': val_corr,
@@ -1935,6 +2029,17 @@ if __name__ == "__main__":
     parser.add_argument('--noise-sigma', type=float, default=BMC_SIGMA,
                         help="BMC noise scale σ (dB) for --loss balanced_mse. Larger ⇒ stronger "
                              "de-shrinkage on this data (pooled target σ≈7.7). Default 1.0.")
+    parser.add_argument('--denoised-targets', action='store_true',
+                        help="Method B: train against per-eye trend-denoised VF targets "
+                             "(build_denoised_targets.py). TRAIN-ONLY; val/eval keep RAW VF.")
+    parser.add_argument('--lora', action='store_true',
+                        help="Method C: LoRA-adapt the last K RETFound blocks' attention (base "
+                             "frozen). Raises r (the MAE+slope lever). Own LR + high weight decay.")
+    parser.add_argument('--lora-rank', type=int, default=8)
+    parser.add_argument('--lora-blocks', type=int, default=8, help="adapt the last N ViT blocks")
+    parser.add_argument('--lora-alpha', type=int, default=16)
+    parser.add_argument('--lora-dropout', type=float, default=0.1)
+    parser.add_argument('--lora-lr', type=float, default=2e-4, help="LoRA param-group LR")
     parser.add_argument('--label-noise', type=float, default=None,
                         help="Override LABEL_NOISE_STD (dB). Lower/0 to un-wash spatial signal.")
     parser.add_argument('--entropy-weight', type=float, default=None,
@@ -2004,4 +2109,7 @@ if __name__ == "__main__":
           mean_residual=args.mean_residual, global_head=args.global_head,
           finetune_norm=args.finetune_norm, enc_lr=args.enc_lr, heavy_aug=args.heavy_aug,
           batch_size=args.batch_size,
-          loss_mode=args.loss, bmc_sigma=args.noise_sigma)
+          loss_mode=args.loss, bmc_sigma=args.noise_sigma,
+          denoised_targets=args.denoised_targets,
+          lora=args.lora, lora_rank=args.lora_rank, lora_blocks=args.lora_blocks,
+          lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout, lora_lr=args.lora_lr)

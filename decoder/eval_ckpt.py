@@ -25,8 +25,15 @@ def load_model(ckpt_path):
     dist_blend = ckpt.get('dist_blend', T.DIST_BLEND)
     mean_res   = ckpt.get('mean_residual', False)
     global_head = ckpt.get('global_head', False)
+    # Method C — LoRA changes the module structure, so it must be rebuilt to apply the learned
+    # A/B (unlike BitFit/unfreeze, which keep the arch). Config is stored in the checkpoint.
+    lora = ckpt.get('lora', False)
     model = T.PerPointVFModel(T.base_model, use_dist=use_dist, dist_blend=dist_blend,
-                              mean_residual=mean_res, global_head=global_head)
+                              mean_residual=mean_res, global_head=global_head,
+                              lora=lora, lora_rank=ckpt.get('lora_rank', 8),
+                              lora_blocks=ckpt.get('lora_blocks', 8),
+                              lora_alpha=ckpt.get('lora_alpha', 16),
+                              lora_dropout=ckpt.get('lora_dropout', 0.1))
     model.load_state_dict(state, strict=False)
     model.to(T.DEVICE)
     return model

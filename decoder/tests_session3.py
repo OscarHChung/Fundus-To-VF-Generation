@@ -157,6 +157,34 @@ def test_balanced_mse_gating():
     P(f"balanced_mse gating: OFF≡Huber σ-independent ({huber_def:.4f}); ON changes loss → {bmc:.4f}")
 
 
+def test_denoised_target_swap():
+    """Method B gating: with a denoised_lookup, TRAIN targets are swapped for matching keys and
+    left raw otherwise; VAL mode ignores the lookup entirely (eval always sees RAW)."""
+    import json, tempfile, training as T
+    recs = [
+        {"PatientID": 1, "Laterality": "OD", "VisitNumber": 2, "FundusImage": ["a.jpg"],
+         "hvf": [[5.0] * 9 for _ in range(8)]},           # has a denoised entry
+        {"PatientID": 9, "Laterality": "OS", "VisitNumber": 1, "FundusImage": ["b.jpg"],
+         "hvf": [[7.0] * 9 for _ in range(8)]},           # NOT in lookup → stays raw
+    ]
+    den = [[25.0] * 9 for _ in range(8)]
+    lookup = {"1_OD_2": den}
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(recs, f); path = f.name
+    ds = T.MultiImageDataset(path, "/nonexistent", T.val_transform, mode='train',
+                             denoised_lookup=lookup)
+    by = {s['patient_id']: np.array(s['hvf']) for s in ds.samples}
+    assert np.allclose(by[1], 25.0), "matching train target must be swapped to denoised"
+    assert np.allclose(by[9], 7.0), "non-matching train target must stay raw"
+    assert ds._n_denoised == 1, ds._n_denoised
+    # VAL mode must ignore the lookup (raw only)
+    dsv = T.MultiImageDataset(path, "/nonexistent", T.val_transform, mode='val',
+                              denoised_lookup=lookup)
+    assert np.allclose(np.array(dsv.samples[0]['hvf']), 5.0), "val must keep RAW target"
+    os.unlink(path)
+    P("denoised targets: train swapped on key match, raw otherwise; val ignores lookup (raw eval)")
+
+
 def test_mean_residual_head():
     import training as T
     torch.manual_seed(0)
@@ -185,6 +213,41 @@ def test_global_head():
     assert torch.allclose(g.mean(1), torch.zeros(2), atol=1e-5), "global residual must be zero-mean"
     assert g.abs().mean() < 0.5, "zero-init global head must be ~no-op at start (degrades to control)"
     P(f"global head: additive, zero-mean residual {float(g.abs().mean()):.3f}≈0 at init; attention kept")
+
+
+def test_lora_adapter():
+    """Method C: LoRA adapts only A/B in the last K blocks' qkv (RETFound base frozen), is a
+    no-op at init (B=0), keeps the output shape, routes grad to the adapter, and — crucially —
+    does NOT mutate the shared base_model (deep-copied)."""
+    import training as T
+    torch.manual_seed(0)
+    K = 4
+    m = T.PerPointVFModel(T.base_model, lora=True, lora_rank=8, lora_blocks=K,
+                          lora_alpha=16, lora_dropout=0.0, global_head=True).to('cpu').eval()
+    # (a) only LoRA A/B trainable in the encoder; base frozen
+    enc_train = [n for n, p in m.encoder.named_parameters() if p.requires_grad]
+    assert enc_train and all(n.endswith('.A') or n.endswith('.B') for n in enc_train), enc_train
+    assert len(enc_train) == K * 2, f"expected {K}×(A,B)={K*2}, got {len(enc_train)}"
+    assert all(not p.requires_grad for n, p in m.encoder.named_parameters() if 'qkv.base.weight' in n)
+    # (b) LoRA params « one full block
+    lora_np   = sum(p.numel() for n, p in m.encoder.named_parameters() if p.requires_grad)
+    one_block = sum(p.numel() for p in m.encoder.blocks[-1].parameters())
+    assert lora_np < one_block, (lora_np, one_block)
+    # (d) no-op at init (B=0): wrapped qkv == frozen base
+    qkv = m.encoder.blocks[-1].attn.qkv
+    assert isinstance(qkv, T.LoRALinear)
+    xin = torch.randn(2, 197, 1024)
+    with torch.no_grad():
+        assert torch.allclose(qkv(xin), qkv.base(xin), atol=1e-6), "LoRA must be a no-op at B=0 init"
+    # (c) forward shape unchanged; grad reaches B (A.grad is 0 at init since B=0)
+    out = m(torch.randn(1, 3, 224, 224), laterality=['OD'], average_multi=False)
+    assert out.shape == (1, 52), out.shape
+    out.sum().backward()
+    assert qkv.B.grad is not None and qkv.B.grad.abs().sum() > 0, "grad must reach LoRA B"
+    # base_model must be UNPOLLUTED (deep copy): its qkv stays a plain Linear
+    assert isinstance(T.base_model.blocks[-1].attn.qkv, torch.nn.Linear), "base_model was mutated!"
+    P(f"LoRA: {lora_np:,} A/B params in last {K} blocks (base frozen); no-op at init; "
+      f"grad→B; base_model unpolluted")
 
 
 def test_bitfit_encoder():
@@ -216,7 +279,9 @@ if __name__ == "__main__":
     test_folds_no_leak()
     test_dispersion_loss()
     test_balanced_mse_gating()
+    test_denoised_target_swap()
     test_mean_residual_head()
     test_global_head()
+    test_lora_adapter()
     test_bitfit_encoder()
     print("ALL PASSED")

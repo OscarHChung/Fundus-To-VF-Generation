@@ -23,6 +23,8 @@ Fold-0 reference strata: severe(n24) 7.651 · moderate(n24) 4.898 · mild(n61) 2
 | (baseline) | Huber | fold0 raw | 4.268 | 0.485 | 0.724 | 7.651 | fold0 ref |
 | bmc_s3 | BMC σ=3, 25ep | fold0 raw | 4.596 | 0.429 | 0.698 | 8.126 | ✗ FAIL (slope<baseline, MAE+0.33, severe worse, σp/σt 0.61) — σ too small; raise it |
 | bmc_s7 | BMC σ=7, 25ep (killed @ep8) | fold0 raw | ~5.27 | ~0.42 | ~0.60 | — | ✗ FAIL (MAE stuck 5.2–5.4, r collapses 0.72→0.60, slope no better than σ=3) — high σ degrades the fit without buying slope |
+| raw25 | baseline recipe, 25ep | fold0 raw | 4.433 | 0.422 | 0.711 | 8.260 | epoch-matched CONTROL for B (35 fewer epochs than the 60ep ref → +0.16 MAE) |
+| denoise25 | +denoised targets, 25ep (best@ep18) | fold0 raw | 4.474 | 0.430 | 0.707 | 8.082 | ~ MARGINAL vs raw25: severe −0.18 ✓, slope +0.008 ✓, MAE +0.04 ✗ (epoch-confounded: best@18 vs raw@~24) |
 
 ---
 
@@ -67,4 +69,44 @@ encoder capacity; Method B — denoised targets — cleans label noise). BMC (ke
 default OFF, unit-tested) becomes worth revisiting only *after* r is raised, exactly as the playbook's
 "BMC converts higher r into slope" note anticipates. Proceeding to Method B, then C, then re-test the
 BMC stack. The slope deliverable, meanwhile, is honestly reportable via the variance-matched calib row.
+
+---
+
+## Method B — per-eye target denoising (training-only)  [in progress]
+
+**Implementation:** `build_denoised_targets.py` fits a robust per-point Theil–Sen trend over each
+eye's visit series and evaluates it at the TARGET visit's date (interpolation → denoises test-retest
+noise without biasing progression). Writes `grape_longitudinal_denoised.json` (631 keys; mean
+|denoised−raw| = **1.24 dB**, 0 whole-eye fallbacks). `training.py --denoised-targets` swaps TRAIN
+targets only; val/eval always score RAW. Unit tests: `tests_method_b.py` (denoise beats raw on
+synthetic truth; <3-visit + sparse/masked fallbacks) and `tests_session3::test_denoised_target_swap`.
+
+**Note on eval fairness:** the fold-0 gate compares to the **epoch-matched** raw25 control
+(MAE 4.433 / slope 0.422 / severe 8.260 @25ep), NOT the 60-epoch reference — the epoch gap alone
+costs ~0.16 MAE. Fast gate: denoise25 MAE ≤ 4.433 AND slope ≥ 0.422 AND severe ≤ 8.260.
+
+### Method B verdict: MARGINAL — carry into the C stack, don't promote alone
+
+denoise25 (best@ep18, TTA raw eval) vs the raw25 control: **severe 8.082 vs 8.260 (−0.18 ✓)**,
+slope 0.430 vs 0.422 (+0.008 ✓), MAE 4.474 vs 4.433 (+0.04, within the epoch-18-vs-24 confound), r
+flat. Denoising moved labels by only 1.24 dB and the improvement is small because — as with Method A
+— the **frozen encoder caps r**, so label-noise cleanup isn't the binding constraint. B does not
+clearly clear its fast gate alone (MAE not below control), so it is NOT promoted to a standalone full
+CV. It mildly helps the severe band without hurting slope, so I'll retest it **stacked under Method C**
+(the r-lever) and keep it only if B+C ≥ C. Proceeding to Method C.
+
+**Infra note:** 17 GB RAM is saturated (swap full); training jobs OOM-die if ANY other Python
+process runs concurrently (even light tests) — all encoder work is strictly serialized, one process
+at a time. denoise25 was killed at ep22 but its ep18 best checkpoint was scored directly via
+eval_ckpt (salvaged without a re-run).
+
+## Method C — LoRA adaptation of RETFound  [implemented, default OFF]
+
+**Implementation:** `LoRALinear` (base frozen; A~N(0,1/r), B=0 ⇒ no-op at init) injected into the
+last K blocks' attention qkv via `inject_lora`; `training.py --lora --lora-rank/-blocks/-alpha/
+-dropout/-lr`. The encoder is deep-copied so the shared `base_model` is never mutated. LoRA blocks
+run with grad in `_encode`; `eval_ckpt.load_model` rebuilds the LoRA arch from ckpt metadata.
+Unit test `tests_session3::test_lora_adapter` (A/B-only trainable, base frozen, no-op at init, shape
+preserved, grad→B, base_model unpolluted). To be fold-0 tested after Method B (one RETFound process
+at a time — 17 GB RAM).
 
