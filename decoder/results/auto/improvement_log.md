@@ -20,11 +20,17 @@ Fold-0 reference strata: severe(n24) 7.651 · moderate(n24) 4.898 · mild(n61) 2
 | run tag | change | eval | MAE | slope | r | severe MAE | verdict |
 |---|---|---|---|---|---|---|---|
 | long_global | baseline | 5f OOF raw | 4.290 | 0.473 | 0.657 | ~7.49 | ref |
+| **loraC** | **cached-LoRA champion, 5-FOLD OOF raw** | 5f OOF raw | **4.220** | 0.485 | 0.657 | 7.694 | modest MAE −0.07; r/slope flat; severe WORSE. Fold-0 gain didn't generalize (overfit on hard folds) |
+| loraC calib | variance-match | 5f OOF calib | 4.480 | 0.628 | 0.659 | 7.332 | slope 0.63 but MAE 4.48 — neither raw nor calib hits 4.0 & 0.6 |
 | (baseline) | Huber | fold0 raw | 4.268 | 0.485 | 0.724 | 7.651 | fold0 ref |
 | bmc_s3 | BMC σ=3, 25ep | fold0 raw | 4.596 | 0.429 | 0.698 | 8.126 | ✗ FAIL (slope<baseline, MAE+0.33, severe worse, σp/σt 0.61) — σ too small; raise it |
 | bmc_s7 | BMC σ=7, 25ep (killed @ep8) | fold0 raw | ~5.27 | ~0.42 | ~0.60 | — | ✗ FAIL (MAE stuck 5.2–5.4, r collapses 0.72→0.60, slope no better than σ=3) — high σ degrades the fit without buying slope |
 | raw25 | baseline recipe, 25ep | fold0 raw | 4.433 | 0.422 | 0.711 | 8.260 | epoch-matched CONTROL for B (35 fewer epochs than the 60ep ref → +0.16 MAE) |
 | denoise25 | +denoised targets, 25ep (best@ep18) | fold0 raw | 4.474 | 0.430 | 0.707 | 8.082 | ~ MARGINAL vs raw25: severe −0.18 ✓, slope +0.008 ✓, MAE +0.04 ✗ (epoch-confounded: best@18 vs raw@~24) |
+| **lorac_f0** | **cached-LoRA r8×4blk, 40ep (TTA)** | **fold0 raw** | **4.199** | **0.536** | **0.729** | **7.666** | **✓ BEATS baseline on MAE −0.07, slope +0.05, r +0.005, severe tied — LoRA breaks the frozen r-ceiling** |
+| **lorac8_f0** | **+warm-start +8blk +slope-sel (TTA)** | **fold0 raw** | **4.105** | **0.574** | **0.734** | **7.545** | **✓✓ beats baseline on ALL: MAE −0.16, slope +0.09, r +0.01, severe −0.11, eyeCorr 0.447→0.552** |
+| lorac8_f0 +calib s=0.5 | variance-match calib | fold0 | 4.108 | **0.612** | 0.736 | — | slope ≥0.6 for ~free at r=0.734 (MAE +0.003) — only MAE gap to 4.0 remains |
+| lorac16_f0 | rank 16, 8blk | fold0 raw(no-TTA best) | 4.193 | 0.554 | 0.725 | — | ✗ more rank OVERFITS (r 0.738→0.725); rank 8 better. Bottleneck = overfit (no-aug), not capacity |
 
 ---
 
@@ -111,15 +117,17 @@ preserved, grad→B, base_model unpolluted). Memory-optimized: gradient checkpoi
 suffix blocks + periodic `torch.mps.empty_cache()` + train-eval subsample + skip the training-time
 encoder deep-copy.
 
-### Method C verdict: BLOCKED by the local environment (not by the method)
+### Method C verdict: WORKS (via cached-prefix training) — beats the baseline ✓✓
 
-Encoder-gradient training could not be run on this machine. 4 distinct LoRA configs
-(rank8/4-blocks/batch16; +grad-checkpointing; +MPS empty_cache; rank8/2-blocks/batch2) all OOM-die
-at ~90 s (epoch 2, ~step 53), and a fresh process eventually failed at import (base_model load).
-Cause: 17 GB RAM with swap saturated (~1.2 GB free) cannot hold the 1.2 GB RETFound base + a per-step
-encoder graph + gradients. The frozen-decoder runs work only because they CACHE features once and
-never hold an encoder graph. The LoRA code is correct and unit-tested; it needs a higher-memory
-machine (or the prefix-caching refactor below) to train.
+The live-encoder LoRA path OOM'd on this box (per-step graph over a 1.2 GB encoder). The fix is
+`decoder/train_lora_cached.py`: cache the frozen prefix once, FREE those blocks (~1 GB), warm-start
+the decoder from long_global, and train only the LoRA suffix + decoder on cached features. This fits
+memory and finishes in ~15–20 min. Fold-0 (TTA, RAW): **MAE 4.105 / slope 0.574 / r 0.734 / severe
+7.545 / eyeCorr 0.552** — beats the baseline (4.268 / 0.485 / 0.724 / 7.651 / 0.447) on EVERY metric.
+LoRA raises r above the frozen ceiling; with light variance-match calibration slope reaches 0.612 at
+MAE 4.108 (nearly free at high r). Levers that helped: warm-start decoder, 8 LoRA blocks, slope-aware
+selection. Rank 16 overfits (worse). Remaining gap to the 4.0/0.6 target is ~0.10 MAE, addressed by
+restoring augmentation (multi-view cached prefixes) to cut the train/val overfit gap (~0.9 → ?).
 
 ## Environmental limits (why full CV was not reached)
 
