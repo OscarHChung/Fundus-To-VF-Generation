@@ -874,6 +874,42 @@ class PerPointVFModel(nn.Module):
                 h = enc.norm(h)
         return h
 
+    # ── Method C (cached-prefix training): split the encoder at the frozen/trainable boundary ──
+    def _encode_prefix(self, x):
+        """Frozen prefix (blocks[:n_frozen]) under no_grad — deterministic given x, so it can be
+        cached once (augmentation OFF) and the prefix blocks then freed to reclaim memory."""
+        enc = self.encoder
+        n_frozen = len(enc.blocks) - getattr(self, '_grad_blocks', 0)
+        with torch.no_grad():
+            h = enc.patch_embed(x)
+            h = h + enc.pos_embed[:, 1:, :]
+            cls = (enc.cls_token + enc.pos_embed[:, :1, :]).expand(h.shape[0], -1, -1)
+            h = torch.cat((cls, h), dim=1)
+            for blk in enc.blocks[:n_frozen]:
+                h = blk(h)
+        return h
+
+    def _encode_suffix(self, h):
+        """Trainable suffix (last _grad_blocks blocks + final norm) WITH grad. Runs on a cached
+        prefix so no per-step 20-block forward and no 1 GB prefix in memory."""
+        enc = self.encoder
+        n_unf = getattr(self, '_grad_blocks', 0)
+        n_frozen = len(enc.blocks) - n_unf
+        if n_unf > 0:
+            use_ckpt = self.training and getattr(self, '_grad_checkpoint', False)
+            for blk in enc.blocks[n_frozen:]:
+                h = torch.utils.checkpoint.checkpoint(blk, h, use_reentrant=False) \
+                    if use_ckpt else blk(h)
+            h = enc.norm(h)
+        else:
+            with torch.no_grad():
+                h = enc.norm(h)
+        return h
+
+    def forward_from_prefix(self, prefix, laterality='OD', average_multi=False):
+        """Decoder forward starting from a cached frozen-prefix feature (trains the LoRA suffix)."""
+        return self.decode_latent(self._encode_suffix(prefix), laterality, average_multi)
+
     def _global_residual(self, cls_token, patches):
         """Zero-mean within-eye PATTERN from a JOINT global→52 map on [mean-pool patches ‖ CLS]
         (eyeCorr 0.51 in probes — a shared per-point head is capped at ~0.41). Added on top of
