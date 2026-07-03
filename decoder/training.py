@@ -38,6 +38,7 @@ from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
 import math
+from losses import balanced_mse_loss
 
 # ============== MPS ==============
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
@@ -98,6 +99,16 @@ PER_EYE_CCC_START  = 5
 # Variance penalty (iter-5 showed removing it overfits → restored)
 VARIANCE_WEIGHT = 0.05
 VARIANCE_START  = 8
+
+# ── METHOD A: Balanced MSE (BMC) loss — the slope fix (opt-in; default OFF = Huber) ──
+# BMC (Ren et al., CVPR'22) replaces the mean-seeking per-point Huber with a distribution-
+# balanced cross-entropy over the batch's targets, de-shrinking σ_pred → higher slope + deeper
+# scotomata, at ~flat pooled MAE. Garway-Heath sector weighting and the per-eye CCC term are
+# KEPT; the variance-matching penalty is DISABLED under BMC (it double-counts spread).
+# NB: on this data (pooled target σ≈7.7 dB) the de-shrink strength grows with σ — if slope
+# barely moves, RAISE bmc_sigma (opposite of a small-σ intuition). See tests_method_a.py.
+LOSS_MODE = 'huber'   # {'huber', 'balanced_mse'}
+BMC_SIGMA = 1.0       # noise scale (dB) for balanced_mse; larger ⇒ stronger de-shrinkage
 
 # ── Session-3: within-eye dispersion match (anti-shrinkage) ──────
 # Iter-A probes proved the model is excessively shrunk: pooled σ_pred/σ_true ≈ 0.53 while
@@ -855,7 +866,8 @@ def attention_entropy_loss(attn_weights):
 def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
                  sector_weights=None, sector_combine='both', deep_cfg=None,
                  dist_logits=None, dist_cfg=None, lds_weights=None,
-                 bias_penalty=BIAS_PENALTY_WEIGHT, dispersion_weight=DISPERSION_WEIGHT):
+                 bias_penalty=BIAS_PENALTY_WEIGHT, dispersion_weight=DISPERSION_WEIGHT,
+                 loss_mode=None, bmc_sigma=None):
     """Weighted Huber loss (+ CCC / variance / attention-entropy terms).
 
     Garway–Heath sector weighting is opt-in and fully backward-compatible:
@@ -883,11 +895,17 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
     if target.dim() == 1:
         target = target.unsqueeze(0)
 
+    # Method A — resolve loss mode / σ (params override the module globals; default = Huber).
+    mode  = loss_mode if loss_mode is not None else LOSS_MODE
+    sigma = bmc_sigma if bmc_sigma is not None else BMC_SIGMA
+    use_bmc = (mode == 'balanced_mse')
+
     total_huber = total_mae = n_valid = 0
     total_dist_ce = 0.0
     eye_ccc_losses = []
     bias_sq_terms  = []
     disp_terms     = []
+    bmc_p, bmc_t, bmc_w = [], [], []   # BMC pools all valid points across the batch
 
     for i, lat in enumerate(laterality):
         valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
@@ -941,6 +959,11 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
         total_mae   += mae.item() * mask.sum().item()
         n_valid     += mask.sum().item()
 
+        # Method A — pool this eye's valid (pred, target, weight) for a single batch-wide BMC.
+        if use_bmc:
+            bmc_p.append(p); bmc_t.append(t)
+            bmc_w.append(weights if torch.is_tensor(weights) else torch.ones_like(p))
+
         # M1 — distributional soft cross-entropy. dist_logits are in query order
         # (same as pred_52), gathered by the same mask. UNWEIGHTED: the soft-CE
         # already gives every deep point a full-strength per-point gradient (its
@@ -968,7 +991,12 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
     if n_valid == 0:
         return torch.tensor(0.0, device=device, requires_grad=True), 0.0, 0
 
-    loss = total_huber / n_valid
+    # Method A — primary term: Balanced-MSE (BMC) over the pooled batch, else the weighted Huber.
+    if use_bmc and len(bmc_p) > 0:
+        P_all = torch.cat(bmc_p); T_all = torch.cat(bmc_t); W_all = torch.cat(bmc_w)
+        loss = balanced_mse_loss(P_all, T_all, sigma=sigma, weights=W_all)
+    else:
+        loss = total_huber / n_valid
 
     # M1 — distributional soft-CE term (the geometry-preserving deep-point loss).
     if dist_logits is not None and dist_cfg is not None and \
@@ -989,8 +1017,9 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
         mean_eye_ccc = torch.stack(eye_ccc_losses).mean()
         loss = loss + PER_EYE_CCC_WEIGHT * mean_eye_ccc
 
-    # Variance penalty
-    if epoch >= VARIANCE_START and pred.shape[0] >= 4:
+    # Variance penalty — DISABLED under BMC (Method A): BMC already de-shrinks σ_pred, so the
+    # variance-match term would double-count spread (the misfire in the earlier BMC attempt).
+    if not use_bmc and epoch >= VARIANCE_START and pred.shape[0] >= 4:
         pred_var_per_point = pred.var(dim=0).mean()
         target_52_list = []
         for i, lat in enumerate(laterality):
@@ -1375,9 +1404,11 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
           ema_decay=EMA_DECAY, disc_crop=False, unfreeze_blocks=0,
           update_champion=True, dispersion_weight=DISPERSION_WEIGHT,
           label_noise=None, entropy_weight=None, mean_residual=False, global_head=False,
-          finetune_norm=False, enc_lr=None, heavy_aug=False, batch_size=None):
+          finetune_norm=False, enc_lr=None, heavy_aug=False, batch_size=None,
+          loss_mode='huber', bmc_sigma=None):
     # Regularization / LR overrides (for fast autonomous sweeps without edits).
     global ATTN_DROPOUT, HEAD_DROPOUT, ATTN_WD, ATTN_LR, LABEL_NOISE_STD, ATTN_ENTROPY_WEIGHT, ENC_LR
+    global LOSS_MODE, BMC_SIGMA
     if attn_dropout is not None: ATTN_DROPOUT = attn_dropout
     if head_dropout is not None: HEAD_DROPOUT = head_dropout
     if weight_decay is not None: ATTN_WD = weight_decay
@@ -1388,6 +1419,12 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
     # bonus + label noise over-smooth/shrink the per-point predictions).
     if label_noise is not None:    LABEL_NOISE_STD = label_noise
     if entropy_weight is not None: ATTN_ENTROPY_WEIGHT = entropy_weight
+    # Method A — Balanced MSE (BMC) loss switch.
+    if loss_mode is not None: LOSS_MODE = loss_mode
+    if bmc_sigma is not None: BMC_SIGMA = bmc_sigma
+    if LOSS_MODE == 'balanced_mse':
+        print(f"✓ Method A: Balanced MSE (BMC) loss ON  (σ={BMC_SIGMA}) — variance term disabled, "
+              f"GH weighting + per-eye CCC kept")
 
     print("=" * 60)
     print("Training v10.2 — Per-point attention + Garway–Heath")
@@ -1892,6 +1929,12 @@ if __name__ == "__main__":
     parser.add_argument('--dispersion-weight', type=float, default=DISPERSION_WEIGHT,
                         help="Session-3 anti-shrinkage: weight on the per-eye within-field "
                              "σ_pred≈σ_true match. 0=off (default). Targets slope/floor (severe).")
+    parser.add_argument('--loss', choices=['huber', 'balanced_mse'], default='huber',
+                        help="Method A: 'balanced_mse' = BMC distribution-balanced loss "
+                             "(the slope fix; disables the variance term). 'huber'=baseline (default).")
+    parser.add_argument('--noise-sigma', type=float, default=BMC_SIGMA,
+                        help="BMC noise scale σ (dB) for --loss balanced_mse. Larger ⇒ stronger "
+                             "de-shrinkage on this data (pooled target σ≈7.7). Default 1.0.")
     parser.add_argument('--label-noise', type=float, default=None,
                         help="Override LABEL_NOISE_STD (dB). Lower/0 to un-wash spatial signal.")
     parser.add_argument('--entropy-weight', type=float, default=None,
@@ -1960,4 +2003,5 @@ if __name__ == "__main__":
           label_noise=args.label_noise, entropy_weight=args.entropy_weight,
           mean_residual=args.mean_residual, global_head=args.global_head,
           finetune_norm=args.finetune_norm, enc_lr=args.enc_lr, heavy_aug=args.heavy_aug,
-          batch_size=args.batch_size)
+          batch_size=args.batch_size,
+          loss_mode=args.loss, bmc_sigma=args.noise_sigma)

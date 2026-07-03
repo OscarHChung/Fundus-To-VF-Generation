@@ -132,6 +132,31 @@ def test_dispersion_loss():
     P(f"dispersion loss: flat penalty {pen_flat:.2f} ≫ matched penalty {pen_match:.3f} (anti-shrinkage works)")
 
 
+def test_balanced_mse_gating():
+    """Method A gating contract: --loss huber (default) is byte-identical & σ-independent
+    (flag OFF ⇒ exact baseline), while --loss balanced_mse changes the loss value."""
+    import training as T
+    torch.manual_seed(0)
+    vi = T.valid_indices_od
+    B = 6
+    target = torch.full((B, 72), 100.0)
+    for i in range(B):
+        target[i, vi] = torch.rand(52) * 30 + 2          # dB spread 2..32
+    pred = torch.rand(B, 52) * 30 + 2
+    lat = ['OD'] * B
+    def L(**kw):
+        l, _, _ = T.compute_loss(pred, target, lat, epoch=10, **kw)
+        return float(l)
+    huber_lo = L(loss_mode='huber', bmc_sigma=0.5)
+    huber_hi = L(loss_mode='huber', bmc_sigma=9.0)
+    huber_def = L()                                       # default path = Huber
+    bmc = L(loss_mode='balanced_mse', bmc_sigma=3.0)
+    assert huber_lo == huber_hi == huber_def, "OFF must be identical & σ-independent (clean gate)"
+    assert abs(bmc - huber_def) > 1e-4, "balanced_mse must change the loss vs Huber"
+    assert np.isfinite(huber_def) and np.isfinite(bmc), (huber_def, bmc)
+    P(f"balanced_mse gating: OFF≡Huber σ-independent ({huber_def:.4f}); ON changes loss → {bmc:.4f}")
+
+
 def test_mean_residual_head():
     import training as T
     torch.manual_seed(0)
@@ -190,6 +215,7 @@ if __name__ == "__main__":
     test_pooled_metrics_flat()
     test_folds_no_leak()
     test_dispersion_loss()
+    test_balanced_mse_gating()
     test_mean_residual_head()
     test_global_head()
     test_bitfit_encoder()
