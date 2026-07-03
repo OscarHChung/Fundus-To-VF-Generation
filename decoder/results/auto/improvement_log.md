@@ -107,6 +107,47 @@ last K blocks' attention qkv via `inject_lora`; `training.py --lora --lora-rank/
 -dropout/-lr`. The encoder is deep-copied so the shared `base_model` is never mutated. LoRA blocks
 run with grad in `_encode`; `eval_ckpt.load_model` rebuilds the LoRA arch from ckpt metadata.
 Unit test `tests_session3::test_lora_adapter` (A/B-only trainable, base frozen, no-op at init, shape
-preserved, grad→B, base_model unpolluted). To be fold-0 tested after Method B (one RETFound process
-at a time — 17 GB RAM).
+preserved, grad→B, base_model unpolluted). Memory-optimized: gradient checkpointing on the graphed
+suffix blocks + periodic `torch.mps.empty_cache()` + train-eval subsample + skip the training-time
+encoder deep-copy.
+
+### Method C verdict: BLOCKED by the local environment (not by the method)
+
+Encoder-gradient training could not be run on this machine. 4 distinct LoRA configs
+(rank8/4-blocks/batch16; +grad-checkpointing; +MPS empty_cache; rank8/2-blocks/batch2) all OOM-die
+at ~90 s (epoch 2, ~step 53), and a fresh process eventually failed at import (base_model load).
+Cause: 17 GB RAM with swap saturated (~1.2 GB free) cannot hold the 1.2 GB RETFound base + a per-step
+encoder graph + gradients. The frozen-decoder runs work only because they CACHE features once and
+never hold an encoder graph. The LoRA code is correct and unit-tested; it needs a higher-memory
+machine (or the prefix-caching refactor below) to train.
+
+## Environmental limits (why full CV was not reached)
+
+- **Wall-clock:** background runs are killed at ~25 min. The frozen denoise25 (25 epochs) was killed
+  at epoch 22 (~24 min). A **60-epoch** fold (needed to match the long_global baseline) therefore
+  cannot complete, so the **full 5-fold CV @60ep — the definition-of-done eval — is infeasible here.**
+- **Memory:** encoder-gradient training (Method C, the r-lever) OOMs at ~90 s (above).
+- **Concurrency:** only ONE RETFound-loading process may run at a time; any second python process (a
+  test, an eval, or a second training job) OOM-kills the first. Monitors/background waiters count.
+
+## Honest best result
+
+No config beat the baseline on the (locally-infeasible) full 5-fold CV. On the epoch-matched fold-0
+signals the baseline is not beaten on raw MAE by A or B; A is dominated by calibration and B is
+marginal. The binding constraint is the **frozen-encoder r-ceiling** (r≈0.66 pooled / 0.72 fold-0):
+- post-hoc variance-matched calibration already delivers the slope headroom (baseline calib slope
+  **0.637** @ MAE 4.54) — honestly reportable and not beaten by in-training BMC;
+- the only lever that can raise r (and thus lower MAE while raising slope) is **Method C (LoRA)**,
+  which is implemented + unit-tested but untrainable on this box.
+
+## Recommended next steps (for a machine with ≥32 GB / a GPU, or via the refactor)
+
+1. Run the Method C fold-0 gate: `--lora --lora-rank 8 --lora-blocks 8 --lora-alpha 16
+   --lora-dropout 0.1 --lora-lr 2e-4` (target r ≥ 0.70). Then stack **B (denoised) under C**, and
+   re-test **A (BMC) on top** (now that r is higher, BMC should finally convert r→slope).
+2. Full 5-fold CV @60ep on the best config; compare to `long_global_cv.json`.
+3. To run C on a memory-tight box: cache the frozen-prefix (block-`n_frozen-1`) output per train
+   image with augmentation OFF, delete the frozen prefix blocks to free ~1 GB, and run only the K
+   LoRA blocks + decoder on the cached prefix features (removes the per-step 20-block forward and
+   the 1 GB prefix from memory).
 

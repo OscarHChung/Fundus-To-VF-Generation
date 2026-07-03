@@ -39,6 +39,7 @@ from PIL import Image
 from tqdm import tqdm
 import math
 import copy
+import torch.utils.checkpoint
 from losses import balanced_mse_loss
 
 # ============== MPS ==============
@@ -666,11 +667,14 @@ def inject_lora(encoder, n_blocks, r, alpha, dropout, wrap_proj=False):
 class PerPointVFModel(nn.Module):
     def __init__(self, encoder, use_dist=False, dist_blend=DIST_BLEND, unfreeze_blocks=0,
                  mean_residual=False, global_head=False, finetune_norm=False,
-                 lora=False, lora_rank=8, lora_blocks=8, lora_alpha=16, lora_dropout=0.1):
+                 lora=False, lora_rank=8, lora_blocks=8, lora_alpha=16, lora_dropout=0.1,
+                 copy_encoder=True):
         super().__init__()
-        # Method C — LoRA replaces submodules in place, so it must NOT mutate the shared module-
-        # global base_model (would pollute other models/evals). Adapt a private deep copy instead.
-        self.encoder = copy.deepcopy(encoder) if lora else encoder
+        # Method C — LoRA replaces submodules in place. When the caller might reuse the shared
+        # module-global base_model (eval: many models per process), deep-copy so it is never
+        # mutated. In a single-model TRAINING subprocess base_model has one owner, so copy_encoder
+        # can be False to save ~1.2 GB (matters on this 17 GB box).
+        self.encoder = copy.deepcopy(encoder) if (lora and copy_encoder) else encoder
         self.embed_dim = 1024
         self.unfreeze_blocks = unfreeze_blocks
         self.finetune_norm = finetune_norm
@@ -707,6 +711,7 @@ class PerPointVFModel(nn.Module):
         # The adapted blocks must run WITH grad in _encode; _grad_blocks tracks how many trailing
         # blocks to graph (max of any encoder-adaptation that needs gradients).
         self._grad_blocks = unfreeze_blocks
+        self._grad_checkpoint = lora        # recompute graphed-block activations in backward
         if lora:
             n_adapt = inject_lora(self.encoder, lora_blocks, lora_rank, lora_alpha, lora_dropout)
             self._grad_blocks = max(self._grad_blocks, lora_blocks)
@@ -855,10 +860,14 @@ class PerPointVFModel(nn.Module):
             h = torch.cat((cls, h), dim=1)
             for blk in enc.blocks[:n_frozen]:
                 h = blk(h)
-        # Trainable suffix (if any) runs WITH grad so backprop reaches its params.
+        # Trainable suffix (if any) runs WITH grad so backprop reaches its params. Gradient-
+        # checkpoint each block (recompute in backward) so activations for the graphed blocks are
+        # not all held at once — essential to fit LoRA/BitFit training on a memory-tight box.
         if n_unf > 0:
+            use_ckpt = self.training and getattr(self, '_grad_checkpoint', False)
             for blk in enc.blocks[n_frozen:]:
-                h = blk(h)
+                h = torch.utils.checkpoint.checkpoint(blk, h, use_reentrant=False) \
+                    if use_ckpt else blk(h)
             h = enc.norm(h)
         else:
             with torch.no_grad():
@@ -1634,7 +1643,8 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
                             unfreeze_blocks=unfreeze_blocks, mean_residual=mean_residual,
                             global_head=global_head, finetune_norm=finetune_norm,
                             lora=lora, lora_rank=lora_rank, lora_blocks=lora_blocks,
-                            lora_alpha=lora_alpha, lora_dropout=lora_dropout)
+                            lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                            copy_encoder=False)   # training owns base_model → no 1.2GB copy
     model.to(DEVICE)
     enc_trainable = (unfreeze_blocks > 0) or finetune_norm or lora
 
@@ -1645,6 +1655,13 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
     # params) rather than the full 1.2 GB ViT-Large — ~50× faster per check.
     train_eval_ds  = MultiImageDataset(TRAIN_JSON, FUNDUS_DIR, val_transform,
                                        mode='val', use_tta=False, disc_crop=disc_crop)
+    # When the encoder is trainable (LoRA/BitFit/unfreeze) the train-eval runs LIVE every val
+    # check; the full train set would dominate wall-clock. It only feeds the train-MAE / gap
+    # monitor (checkpoint selection uses VAL MAE), so subsample it for speed. Frozen-encoder runs
+    # cache it once and keep the full set.
+    if enc_trainable and len(train_eval_ds.samples) > 80:
+        train_eval_ds.samples = train_eval_ds.samples[:80]
+        print(f"  Train-eval subsampled to {len(train_eval_ds.samples)} (enc-trainable monitor speed)")
     train_eval_pre = DataLoader(train_eval_ds, batch_size=1, shuffle=False,
                                 num_workers=0, collate_fn=val_collate_fn)
     if not enc_trainable:
@@ -1721,7 +1738,12 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
         epoch_mae_sum = 0.0
         epoch_mae_n   = 0
 
-        for imgs, hvf, lat in pbar:
+        for _step, (imgs, hvf, lat) in enumerate(pbar):
+            # enc-trainable re-runs the ViT every step (no feature cache); the MPS caching
+            # allocator accumulates freed buffers and OOMs a memory-tight box after ~50 steps.
+            # Periodically return cached blocks to the OS.
+            if enc_trainable and DEVICE.type == 'mps' and _step % 8 == 0:
+                torch.mps.empty_cache()
             imgs = imgs.to(DEVICE)
             pred = model(imgs, laterality=lat, average_multi=False)
 
