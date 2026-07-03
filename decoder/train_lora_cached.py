@@ -27,19 +27,27 @@ from garway_heath_weighting import sector_weight_tensors
 AUTO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "auto")
 
 
-def cache_prefix(model, json_path):
-    """Return list of dicts {prefix:(V,197,1024) cpu, hvf:(72,), lat:str} — frozen prefix per eye."""
-    ds = T.MultiImageDataset(json_path, T.FUNDUS_DIR, T.val_transform, mode='val', use_tta=False)
-    loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=T.val_collate_fn)
-    out = []
-    model.eval()
-    with torch.no_grad():
-        for imgs, hvf, lat in loader:
-            imgs = imgs.to(T.DEVICE) if imgs.dim() == 4 else imgs[0].to(T.DEVICE)
-            pre = model._encode_prefix(imgs).cpu()                       # (V,197,1024)
-            lat_s = lat[0] if isinstance(lat, (list, tuple)) else lat
-            hv = hvf[0] if hvf.dim() > 1 else hvf
-            out.append({'prefix': pre, 'hvf': hv, 'lat': lat_s})
+def cache_prefix(model, json_path, transform=None, n_passes=1, batch=16, denoised_lookup=None):
+    """Return list of {prefix:(1,197,1024) cpu, hvf:(72,), lat:str} — one entry per (eye, view).
+    Uses train-mode single-image samples + BATCHED encoder forward (fast). n_passes>1 with a random
+    `transform` caches augmented views. denoised_lookup swaps TRAIN targets (Method B) — pass it only
+    for the train cache; val stays RAW."""
+    transform = transform or T.val_transform
+    old_noise = T.LABEL_NOISE_STD; T.LABEL_NOISE_STD = 0.0     # cached targets stay RAW (no noise)
+    try:
+        ds = T.MultiImageDataset(json_path, T.FUNDUS_DIR, transform, mode='train',
+                                 denoised_lookup=denoised_lookup)
+        loader = DataLoader(ds, batch_size=batch, shuffle=False, num_workers=0)
+        out = []
+        model.eval()
+        with torch.no_grad():
+            for _ in range(n_passes):
+                for imgs, hvf, lat in loader:
+                    pre = model._encode_prefix(imgs.to(T.DEVICE)).half().cpu()   # fp16 (B,197,1024)
+                    for b in range(pre.shape[0]):
+                        out.append({'prefix': pre[b:b + 1], 'hvf': hvf[b], 'lat': lat[b]})
+    finally:
+        T.LABEL_NOISE_STD = old_noise
     return out
 
 
@@ -56,7 +64,7 @@ def val_metrics(model, cache):
     model.eval()
     with torch.no_grad():
         for item in cache:
-            pre = item['prefix'].to(T.DEVICE)
+            pre = item['prefix'].to(T.DEVICE).float()
             pred = model.forward_from_prefix(pre, [item['lat']], average_multi=True).cpu().numpy()[0]
             vi = T.valid_indices_od if item['lat'].startswith('OD') else T.valid_indices_os
             t = np.asarray(item['hvf'], float)[vi]; t[t >= T.MASKED_VALUE_THRESHOLD] = np.nan
@@ -78,16 +86,41 @@ def main():
     ap.add_argument('--lora-lr', type=float, default=2e-4)
     ap.add_argument('--head-lr', type=float, default=8e-4)
     ap.add_argument('--val-every', type=int, default=2)
+    ap.add_argument('--warm-start', default=None,
+                    help="checkpoint to warm-start the DECODER from (e.g. long_global_f0_best.pth)")
+    ap.add_argument('--select', choices=['mae', 'mae_slope'], default='mae_slope',
+                    help="checkpoint selection: min MAE, or min (MAE - 0.5*slope) to value slope")
+    ap.add_argument('--aug-views', type=int, default=1,
+                    help="cache this many augmented prefix views per TRAIN eye (>1 restores "
+                         "augmentation regularization; val stays deterministic)")
+    ap.add_argument('--denoised', action='store_true',
+                    help="Method B: use per-eye trend-denoised TRAIN targets (val stays RAW)")
     a = ap.parse_args()
+    denoised_lookup = None
+    if a.denoised:
+        with open(T.DENOISED_TARGETS_PATH) as f:
+            denoised_lookup = json.load(f)
 
     model = T.PerPointVFModel(T.base_model, global_head=True, lora=True, lora_rank=a.lora_rank,
                               lora_blocks=a.lora_blocks, lora_alpha=a.lora_alpha,
                               lora_dropout=a.lora_dropout, copy_encoder=False).to(T.DEVICE)
+    if a.warm_start:
+        ck = torch.load(a.warm_start, map_location='cpu', weights_only=False)
+        sd = ck.get('model', ck.get('model_state_dict', ck))
+        # load only matching-shape keys (the decoder; encoder qkv differs due to LoRA wrapping)
+        own = model.state_dict()
+        keep = {k: v for k, v in sd.items() if k in own and own[k].shape == v.shape}
+        model.load_state_dict(keep, strict=False)
+        print(f"Warm-started {len(keep)} tensors from {os.path.basename(a.warm_start)} "
+              f"(decoder + frozen encoder; LoRA A/B fresh).", flush=True)
     n_frozen = len(model.encoder.blocks) - model._grad_blocks
 
-    print(f"Caching frozen prefix (blocks[:{n_frozen}]) — train …", flush=True)
-    train_cache = cache_prefix(model, a.train_json)
-    print(f"  {len(train_cache)} train eyes cached. Val …", flush=True)
+    tr_tfm = T.train_transform if a.aug_views > 1 else T.val_transform
+    print(f"Caching frozen prefix (blocks[:{n_frozen}]) — train ×{a.aug_views} views"
+          f"{' +denoised' if a.denoised else ''} …", flush=True)
+    train_cache = cache_prefix(model, a.train_json, tr_tfm, n_passes=a.aug_views,
+                               denoised_lookup=denoised_lookup)
+    print(f"  {len(train_cache)} train views cached. Val …", flush=True)
     val_cache = cache_prefix(model, a.val_json)
     print(f"  {len(val_cache)} val eyes cached.", flush=True)
 
@@ -114,7 +147,9 @@ def main():
     idx = list(range(len(train_cache)))
     sampler = WeightedRandomSampler(weights, num_samples=len(train_cache), replacement=True)
 
-    best = {'mae': float('inf')}
+    best = {'mae': float('inf'), 'score': float('inf')}
+    score_of = (lambda m: m['mae']) if a.select == 'mae' else \
+               (lambda m: m['mae'] - 0.5 * m['slope'])   # value slope alongside MAE
     out_best = os.path.join(AUTO, f"{a.out_tag}_best.pth")
     for epoch in range(1, a.epochs + 1):
         model.train()
@@ -122,7 +157,7 @@ def main():
         ep_mae = ep_n = 0
         for s in range(0, len(order), a.batch_size):
             bidx = order[s:s + a.batch_size]
-            pre = torch.cat([train_cache[i]['prefix'] for i in bidx]).to(T.DEVICE)   # (B,197,1024)
+            pre = torch.cat([train_cache[i]['prefix'] for i in bidx]).to(T.DEVICE).float()  # (B,197,1024)
             hvf = torch.stack([torch.as_tensor(train_cache[i]['hvf'], dtype=torch.float32)
                                for i in bidx]).to(T.DEVICE)
             lat = [train_cache[i]['lat'] for i in bidx]
@@ -141,8 +176,9 @@ def main():
             vp, vt = val_metrics(model, val_cache)
             m = D.pooled_metrics(vp, vt)
             tag = ""
-            if m['mae'] < best['mae']:
-                best = {'mae': m['mae'], 'slope': m['slope'], 'corr': m['corr'], 'epoch': epoch}
+            if score_of(m) < best['score']:
+                best = {'mae': m['mae'], 'slope': m['slope'], 'corr': m['corr'], 'epoch': epoch,
+                        'score': score_of(m)}
                 torch.save({'model': model.state_dict(), 'mae': m['mae'], 'slope': m['slope'],
                             'corr': m['corr'], 'epoch': epoch, 'use_dist': False,
                             'dist_blend': T.DIST_BLEND, 'mean_residual': False, 'global_head': True,
