@@ -33,7 +33,9 @@ def load_model(ckpt_path):
                               lora=lora, lora_rank=ckpt.get('lora_rank', 8),
                               lora_blocks=ckpt.get('lora_blocks', 8),
                               lora_alpha=ckpt.get('lora_alpha', 16),
-                              lora_dropout=ckpt.get('lora_dropout', 0.1))
+                              lora_dropout=ckpt.get('lora_dropout', 0.1),
+                              severity_head=ckpt.get('severity_head', False),
+                              severity_blend=ckpt.get('severity_blend', 1.0))
     model.load_state_dict(state, strict=False)
     model.to(T.DEVICE)
     return model

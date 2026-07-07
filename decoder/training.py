@@ -668,7 +668,7 @@ class PerPointVFModel(nn.Module):
     def __init__(self, encoder, use_dist=False, dist_blend=DIST_BLEND, unfreeze_blocks=0,
                  mean_residual=False, global_head=False, finetune_norm=False,
                  lora=False, lora_rank=8, lora_blocks=8, lora_alpha=16, lora_dropout=0.1,
-                 copy_encoder=True):
+                 copy_encoder=True, severity_head=False, severity_blend=1.0):
         super().__init__()
         # Method C — LoRA replaces submodules in place. When the caller might reuse the shared
         # module-global base_model (eval: many models per process), deep-copy so it is never
@@ -776,6 +776,30 @@ class PerPointVFModel(nn.Module):
         if global_head:
             print("✓ Joint global-spatial head ON (ADDITIVE: per-point pred + zero-mean global "
                   "pattern from mean-pool patches‖CLS; zero-init=no-op start) — targets eyeCorr 0.51")
+
+        # M1 — first-class SEVERITY (eye-mean / MD) correction head. CLS→scalar DELTA on the
+        # field's emergent eye-mean, supervised DIRECTLY with a de-shrink loss so between-eye
+        # severity (56% of VF variance and the decisive lever — design doc §0) is de-shrunk and
+        # sharpened instead of left EMERGING (compressed, eye-mean slope ~0.71) from the deep-
+        # point-dominated per-point loss. The delta is a UNIFORM field shift, so the within-eye
+        # pattern (the proven point+global path) is preserved exactly → eyeCorr untouched (unlike
+        # the old --mean-residual, which swapped in the weak LOCAL residual and dropped eyeCorr
+        # 0.42→0.36). ZERO-INIT (final layer) ⇒ delta 0 at start ⇒ the warm-started emergent
+        # severity (sev_corr already ~0.875 on easy folds) is preserved and only de-shrink
+        # CORRECTIONS are earned — the same safe-start trick as the additive global head.
+        # Always built (checkpoints load strict=False either way); only USED when use_severity_head.
+        self.use_severity_head = severity_head
+        self.severity_blend = severity_blend
+        self.severity_head = nn.Sequential(
+            nn.Linear(self.embed_dim, 256), nn.LayerNorm(256), nn.GELU(), nn.Dropout(HEAD_DROPOUT),
+            nn.Linear(256, 128), nn.LayerNorm(128), nn.GELU(), nn.Dropout(HEAD_DROPOUT),
+            nn.Linear(128, 1))
+        nn.init.zeros_(self.severity_head[-1].weight)      # zero-init ⇒ delta starts at 0 (no-op)
+        nn.init.zeros_(self.severity_head[-1].bias)
+        self._last_severity = None
+        if severity_head:
+            print(f"✓ M1: severity head ON (CLS→ΔMD uniform-shift correction on the emergent "
+                  f"eye-mean, zero-init=no-op start, blend={severity_blend}) — de-shrunk severity")
 
         if use_dist:
             print(f"✓ Distributional head ON (bins={len(DIST_BIN_CENTERS)}, "
@@ -919,6 +943,17 @@ class PerPointVFModel(nn.Module):
         g = self.global_spatial(torch.cat([pooled, cls_token], dim=1))     # (B,52)
         return g - g.mean(dim=1, keepdim=True)                             # zero-mean
 
+    def _apply_severity(self, pred, cls_token):
+        """M1 — add a dedicated severity (MD) correction to the field's emergent eye-mean as a
+        UNIFORM shift (within-eye pattern untouched). The head is a ZERO-INIT delta, so at start
+        the field == the warm-started prediction (no cold-start). self._last_severity holds the
+        resulting (B,1) predicted eye-mean for the de-shrink loss; blend scales the correction."""
+        emergent = pred.mean(dim=1, keepdim=True)
+        delta = self.severity_head(cls_token)                        # (B,1) zero-init ⇒ 0 at start
+        new_mean = emergent + self.severity_blend * delta
+        self._last_severity = new_mean                               # full predicted MD
+        return pred + self.severity_blend * delta                    # uniform field shift
+
     def forward(self, x, laterality='OD', average_multi=True):
         if x.dim() != 4:
             raise ValueError(f"Expected 4D input, got {x.shape}")
@@ -933,6 +968,8 @@ class PerPointVFModel(nn.Module):
         pred = self._apply_heads(point_feats, cls_token, x.shape[0])
         if self.use_global_head:
             pred = pred + self._global_residual(cls_token, patches)
+        if self.use_severity_head:
+            pred = self._apply_severity(pred, cls_token)
         pred = self._finish(pred, average_multi)
         self._last_attn_weights = attn_weights   # for entropy regularization (training)
         return pred
@@ -946,6 +983,8 @@ class PerPointVFModel(nn.Module):
         pred = self._apply_heads(point_feats, cls_token, latent.shape[0])
         if self.use_global_head:
             pred = pred + self._global_residual(cls_token, patches)
+        if self.use_severity_head:
+            pred = self._apply_severity(pred, cls_token)
         pred = self._finish(pred, average_multi)
         self._last_attn_weights = attn_weights
         return pred
@@ -990,7 +1029,7 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
                  sector_weights=None, sector_combine='both', deep_cfg=None,
                  dist_logits=None, dist_cfg=None, lds_weights=None,
                  bias_penalty=BIAS_PENALTY_WEIGHT, dispersion_weight=DISPERSION_WEIGHT,
-                 loss_mode=None, bmc_sigma=None):
+                 loss_mode=None, bmc_sigma=None, severity_pred=None, severity_cfg=None):
     """Weighted Huber loss (+ CCC / variance / attention-entropy terms).
 
     Garway–Heath sector weighting is opt-in and fully backward-compatible:
@@ -1029,6 +1068,7 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
     bias_sq_terms  = []
     disp_terms     = []
     bmc_p, bmc_t, bmc_w = [], [], []   # BMC pools all valid points across the batch
+    sev_hat, sev_true, sev_w = [], [], []   # M1 — per-eye (predicted MD, true eye-mean, eye weight)
 
     for i, lat in enumerate(laterality):
         valid_idx = valid_indices_od if lat.startswith('OD') else valid_indices_os
@@ -1111,6 +1151,17 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
             eye_ccc = per_eye_ccc(pred_52, target_52, mask)
             eye_ccc_losses.append(eye_ccc)
 
+        # M1 — collect this eye's (predicted MD, true eye-mean) for the severity de-shrink loss.
+        # Eye-level weight concentrates the severity term on moderate+severe eyes (where all the
+        # MAE excess and slope deficit live — design doc §0), guarded by the pooled-bias CCC term.
+        if severity_pred is not None and severity_cfg is not None:
+            tm_true = t.mean()
+            sev_hat.append(severity_pred[i].reshape(()))
+            sev_true.append(tm_true)
+            ew = 1.0 + severity_cfg.get('eye_scale', 2.0) * \
+                 (MAX_DB - tm_true).clamp(min=0) / MAX_DB
+            sev_w.append(ew)
+
     if n_valid == 0:
         return torch.tensor(0.0, device=device, requires_grad=True), 0.0, 0
 
@@ -1139,6 +1190,23 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
     if len(eye_ccc_losses) > 0:
         mean_eye_ccc = torch.stack(eye_ccc_losses).mean()
         loss = loss + PER_EYE_CCC_WEIGHT * mean_eye_ccc
+
+    # M1 — SEVERITY (eye-mean / MD) supervision + de-shrink. A weighted Huber pins each eye's
+    # predicted MD to its true mean (mod+severe focused); a batch-CCC on the eye-means de-shrinks
+    # them (penalizes bias + under-dispersion + low corr → raises sev_corr AND sev_shrink toward
+    # 1). This is the decisive between-eye lever, isolated from the deep-point-dominated per-point
+    # loss so the severity signal gets a clean, full-strength gradient.
+    if severity_pred is not None and severity_cfg is not None and len(sev_hat) > 0:
+        sp = torch.stack(sev_hat); st = torch.stack(sev_true); sw = torch.stack(sev_w)
+        sev_huber = (F.huber_loss(sp, st, reduction='none', delta=HUBER_DELTA) * sw).sum() \
+                    / sw.sum().clamp(min=1e-6)
+        loss = loss + severity_cfg.get('weight', 0.5) * sev_huber
+        if len(sev_hat) >= 3 and st.std(unbiased=False) > 1e-6:
+            pm, tm = sp.mean(), st.mean()
+            pv, tv = sp.var(unbiased=False), st.var(unbiased=False)
+            cov = ((sp - pm) * (st - tm)).mean()
+            ccc = (2 * cov) / (pv + tv + (pm - tm) ** 2 + 1e-8)
+            loss = loss + severity_cfg.get('ccc', 0.5) * (1.0 - ccc)
 
     # Variance penalty — DISABLED under BMC (Method A): BMC already de-shrinks σ_pred, so the
     # variance-match term would double-count spread (the misfire in the earlier BMC attempt).

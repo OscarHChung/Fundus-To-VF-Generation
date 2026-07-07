@@ -95,6 +95,22 @@ def main():
                          "augmentation regularization; val stays deterministic)")
     ap.add_argument('--denoised', action='store_true',
                     help="Method B: use per-eye trend-denoised TRAIN targets (val stays RAW)")
+    # M1 — first-class severity (eye-mean / MD) head + de-shrink loss (default OFF ≡ long_global).
+    ap.add_argument('--severity-head', action='store_true',
+                    help="M1: add a CLS→MD head that replaces the field eye-mean, de-shrunk by a "
+                         "batch-CCC loss on eye-means (the decisive between-eye lever)")
+    ap.add_argument('--severity-blend', type=float, default=1.0,
+                    help="mix the field mean: blend·severity_head + (1-blend)·emergent mean")
+    ap.add_argument('--severity-weight', type=float, default=0.5,
+                    help="λ on the eye-mean Huber (severity supervision)")
+    ap.add_argument('--severity-ccc', type=float, default=0.5,
+                    help="λ on the batch-CCC de-shrink term over eye-means")
+    ap.add_argument('--severity-eye-scale', type=float, default=2.0,
+                    help="eye-level severity reweight scale (focus moderate+severe eyes)")
+    # M3 — variance reduction: EMA of the trainable (LoRA + decoder) params.
+    ap.add_argument('--ema', action='store_true',
+                    help="M3: keep an EMA of trainable params; eval + save the EMA weights")
+    ap.add_argument('--ema-decay', type=float, default=0.998)
     a = ap.parse_args()
     denoised_lookup = None
     if a.denoised:
@@ -103,7 +119,13 @@ def main():
 
     model = T.PerPointVFModel(T.base_model, global_head=True, lora=True, lora_rank=a.lora_rank,
                               lora_blocks=a.lora_blocks, lora_alpha=a.lora_alpha,
-                              lora_dropout=a.lora_dropout, copy_encoder=False).to(T.DEVICE)
+                              lora_dropout=a.lora_dropout, copy_encoder=False,
+                              severity_head=a.severity_head,
+                              severity_blend=a.severity_blend).to(T.DEVICE)
+    severity_cfg = None
+    if a.severity_head:
+        severity_cfg = dict(weight=a.severity_weight, ccc=a.severity_ccc,
+                            eye_scale=a.severity_eye_scale)
     if a.warm_start:
         ck = torch.load(a.warm_start, map_location='cpu', weights_only=False)
         sd = ck.get('model', ck.get('model_state_dict', ck))
@@ -142,6 +164,13 @@ def main():
         {'params': head_params, 'lr': a.head_lr, 'weight_decay': 5e-3},
         {'params': lora_params, 'lr': a.lora_lr, 'weight_decay': 1e-2}])
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.epochs, eta_min=1e-6)
+    # M3 — EMA over the trainable (LoRA A/B + decoder) params; the frozen prefix is already
+    # freed so WeightEMA picks up exactly the trainable set. Evaluated + saved instead of the raw
+    # weights to cut plateau variance (the fold-0→pooled overfit gap).
+    ema = T.WeightEMA([model], decay=a.ema_decay) if a.ema else None
+    if ema:
+        print(f"  M3: EMA ON (decay={a.ema_decay}) over {len(ema.params)} trainable tensors",
+              flush=True)
 
     weights = [eye_severity_weight(it['hvf'], it['lat']) for it in train_cache]
     idx = list(range(len(train_cache)))
@@ -164,15 +193,19 @@ def main():
             pred = model.forward_from_prefix(pre, lat, average_multi=False)
             loss, mae, nv = T.compute_loss(pred, hvf, lat, epoch=epoch,
                                            attn_weights=model._last_attn_weights,
-                                           sector_weights=sector_weights, sector_combine='sector_only')
+                                           sector_weights=sector_weights, sector_combine='sector_only',
+                                           severity_pred=model._last_severity,
+                                           severity_cfg=severity_cfg)
             if nv > 0:
                 opt.zero_grad(); loss.backward()
                 torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
                 opt.step(); ep_mae += mae * nv; ep_n += nv
+                if ema: ema.update()
             if T.DEVICE.type == 'mps' and (s // a.batch_size) % 8 == 0:
                 torch.mps.empty_cache()
         sched.step()
         if epoch % a.val_every == 0 or epoch <= 3:
+            if ema: ema.apply_to()      # evaluate + save the EMA weights (M3)
             vp, vt = val_metrics(model, val_cache)
             m = D.pooled_metrics(vp, vt)
             tag = ""
@@ -183,8 +216,11 @@ def main():
                             'corr': m['corr'], 'epoch': epoch, 'use_dist': False,
                             'dist_blend': T.DIST_BLEND, 'mean_residual': False, 'global_head': True,
                             'lora': True, 'lora_rank': a.lora_rank, 'lora_blocks': a.lora_blocks,
-                            'lora_alpha': a.lora_alpha, 'lora_dropout': a.lora_dropout}, out_best)
+                            'lora_alpha': a.lora_alpha, 'lora_dropout': a.lora_dropout,
+                            'severity_head': a.severity_head,
+                            'severity_blend': a.severity_blend}, out_best)
                 tag = " ✓ saved"
+            if ema: ema.restore()       # back to raw weights for continued training
             print(f"[E{epoch:02d}] train MAE {ep_mae/max(ep_n,1):.2f} | VAL MAE {m['mae']:.3f} "
                   f"slope {m['slope']:.3f} corr {m['corr']:.3f} σp/σt {m['sig_ratio']:.2f}{tag}", flush=True)
     print(f"BEST val: MAE {best['mae']:.3f} slope {best.get('slope',0):.3f} "
