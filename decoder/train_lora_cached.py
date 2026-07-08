@@ -135,6 +135,10 @@ def main():
         model.load_state_dict(keep, strict=False)
         print(f"Warm-started {len(keep)} tensors from {os.path.basename(a.warm_start)} "
               f"(decoder + frozen encoder; LoRA A/B fresh).", flush=True)
+        # Free the ~1.2 GB warm-start checkpoint (encoder tensors included) — otherwise ck/sd/keep
+        # stay resident in CPU RAM for the whole run. Pure memory hygiene; no effect on training.
+        del ck, sd, own, keep
+        gc.collect()
     n_frozen = len(model.encoder.blocks) - model._grad_blocks
 
     tr_tfm = T.train_transform if a.aug_views > 1 else T.val_transform
@@ -201,8 +205,11 @@ def main():
                 torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
                 opt.step(); ep_mae += mae * nv; ep_n += nv
                 if ema: ema.update()
-            if T.DEVICE.type == 'mps' and (s // a.batch_size) % 8 == 0:
+            if T.DEVICE.type == 'mps' and (s // a.batch_size) % 2 == 0:
                 torch.mps.empty_cache()
+        gc.collect()
+        if T.DEVICE.type == 'mps':
+            torch.mps.empty_cache()
         sched.step()
         if epoch % a.val_every == 0 or epoch <= 3:
             if ema: ema.apply_to()      # evaluate + save the EMA weights (M3)

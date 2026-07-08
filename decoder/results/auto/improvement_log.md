@@ -33,6 +33,8 @@ Fold-0 reference strata: severe(n24) 7.651 · moderate(n24) 4.898 · mild(n61) 2
 | lorac16_f0 | rank 16, 8blk | fold0 raw(no-TTA best) | 4.193 | 0.554 | 0.725 | — | ✗ more rank OVERFITS (r 0.738→0.725); rank 8 better. Bottleneck = overfit (no-aug), not capacity |
 | **m1m3_f0** | **M1 severity head + M3 EMA (lorac8 recipe)** | **fold0 raw TTA** | **4.206** | **0.552** | **0.721** | **7.612** | ~ beats BASE not lorac8. Sev de-shrunk (sev_shr 0.74→0.83) ✓ but EMA blurred spatial (res_corr 0.495→0.441). See SESSION-M1 section. Fold-0 severity is SATURATED (weak gate) |
 | **m1sev_f0** | **M1 severity head, NO EMA** | fold0 no-TTA (interrupted@E24) | ~4.16 | ~0.56 | ~0.73 | — | best@E10; TTA eval + full CV TODO on faster box. Isolates M1 (spatially neutral). See SESSION-M1 section |
+| **m1sev** | **M1 severity head, NO EMA — FULL 5-FOLD OOF (TTA)** | **5f OOF raw** | **4.256** | **0.543** | **0.665** | **7.251** | ✓ beats long_global on ALL (MAE −0.03, slope +0.07, r +0.008, severe −0.24) & beats loraC on slope/r/severe (severe **−0.44**, fixes loraC's severe regression) at MAE +0.036. **Misses hard target**: de-shrink worked (sev_shr 0.71→**0.98**) but **sev_corr flat 0.81** (uniform shift can't add corr) ⇒ r-ceiling binds. See M1-RESULT section |
+| m1sev calib | variance-match | 5f OOF calib | 4.495 | **0.646** | 0.665 | 7.154 | slope≥0.60 for free; MAE 4.50. Neither raw nor calib hits 4.0 |
 
 ---
 
@@ -253,4 +255,50 @@ rank8 / 8 LoRA blocks / alpha16 / dropout0.1 / lora-lr 2e-4 / head-lr 8e-4 (defa
 warm-start long_global_f{fold} / select mae_slope / severity-weight 0.5 / severity-ccc 0.5 /
 eye-scale 2.0 / (m1m3 also: ema-decay 0.998). Cached-prefix trainer ~15–18 min/fold on the 17 GB
 MPS box. Checkpoints on disk: `m1m3_f0_best.pth`, `m1sev_f0_best.pth` (fold-0 only; folds 1–4 TODO).
+
+---
+
+# ═══════════ M1-RESULT: full 5-fold OOF DONE (severity head, NO EMA) ═══════════
+# Ran the M1-alone 5-fold CV to completion on a new box (this session). `m1sev_cv.json` on disk.
+
+## Result (leak-free per-patient 5-fold OOF, TTA, vs RAW VF) — `m1sev_cv.json`
+- **RAW:  MAE 4.256 / slope 0.543 / r 0.665 / eyeCorr 0.471 / severe 7.251 / bias +0.22 / σp/σt 0.82**
+- CALIB: MAE 4.495 / slope 0.646 / r 0.665 / severe 7.154
+- SEVERITY decomp: **sev_corr 0.813 / sev_shrink 0.98** / sev_mae 2.63 | res_corr 0.406 / res_shrink 0.53
+- Per-fold RAW MAE/slope/r: f0 4.142/0.615/0.734 · f1 4.127/0.498/0.640 · f2 4.660/0.557/0.646 ·
+  f3 4.082/0.555/0.718 · f4 4.298/0.461/0.566. (f2/f4 = the hard, low-r folds.)
+- Strata (raw): severe(n101) 7.251 · moderate(n183) 5.440 · mild(n347) 2.760.
+
+## Verdict: MODEST WIN over baseline; misses the hard target. sev_corr is the confirmed bottleneck.
+- vs **long_global** (4.290/0.473/r0.657/severe~7.49): BETTER on **all** — MAE −0.034, slope +0.070,
+  r +0.008, severe −0.24. A clean Pareto improvement on the baseline.
+- vs **loraC** (4.220/0.485/r0.657/severe7.694): slope **+0.058**, r +0.008, severe **−0.443** (M1
+  FIXES the severe-band regression loraC caused), at MAE **+0.036** (a wash on MAE). By the design
+  doc's "judge on moderate+severe; a gain that worsens severe is NOT a win" rule, m1sev ≥ loraC.
+- **Target NOT reached** (MAE<4.0 & slope≥0.60 raw & severe≤base & r≥0.72): MAE 4.256, raw slope
+  0.543, r 0.665 all short. Per §0 frontier, MAE<4.0 is impossible at r≈0.665 — **r must rise**.
+- **Mechanistic finding (the important one):** the M1 uniform-shift head DE-SHRINKS as designed —
+  **sev_shrink 0.71→0.98** (eye-means no longer compressed) — which is exactly what lifted slope
+  (+0.07) and helped the severe band. **But sev_corr stayed 0.81** (target was 0.875). A uniform
+  shift can rescale/de-bias predicted eye-means but **cannot manufacture correlation** with the true
+  eye-mean. So M1 delivered the *slope/severe* half of §0's promise, NOT the *MAE* half — the MAE
+  half needed sev_corr 0.80→0.875, which requires **better features, not a de-shrink head**.
+
+## INFRA FIX this session (essential; memory-only, no effect on training math)
+The box is memory-marginal (swap ~full); repeated encoder runs died (SIGKILL, no jetsam log) after
+the session's first run. Two safe fixes in `train_lora_cached.py`: (1) `del ck,sd,own,keep;
+gc.collect()` after warm-start — the 1.2 GB checkpoint was staying resident in CPU RAM for the whole
+run; (2) `torch.mps.empty_cache()` every 2 steps + gc per epoch. These are deterministic no-ops on
+results, so fold-0 (trained pre-fix) stays consistent with folds 1–4. Eval: run **one fold per fresh
+process** (`eval_oof_cached.py --tag m1sev --folds N`, resumable via per-fold `.npz`) — a single
+fold survives; all-5-in-one-process accumulates and dies. A fold trains in ~40 min on this box.
+
+## PIVOT (evidence-driven, updates the plan's M1→M3→M2 order)
+The plan said "if M1 helps but misses, stack a non-blurring M3 variance lever." M1 helps, BUT the
+new evidence says the bottleneck is **sev_corr / feature quality (the r-ceiling)**, which neither M1
+(de-shrink) nor M3 (variance reduction toward the current ceiling) can raise. The lever that raises
+sev_corr is **M2 — fundus→RNFL structural surrogate** (design doc §M2, "raises the r ceiling"). So
+NEXT: audit OCT-RNFL/CCT/age coverage in `grape_data.xlsx` (cheap, no encoder); if coverage is
+adequate, build M2 (train-only aux head) on top of the m1sev base. Keep m1sev as the working base.
+Checkpoints on disk: `m1sev_f{0..4}_best.pth` (all 5 folds, complete); `m1sev_cv.json` (the result).
 

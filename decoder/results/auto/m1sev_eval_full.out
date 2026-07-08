@@ -1,0 +1,30 @@
+✓ Using MPS (Apple Silicon GPU)
+✓ Loaded RETFound
+  fold 0: loaded cached preds (109 val / 522 train) ← m1sev_f0.npz
+  fold 0: MAE 4.142 | floor 8.10(n552) | deep 7.45 | slope 0.615 | corr 0.734 | eyeCorr 0.476 | bias +0.18 | σp/σt 0.84
+  fold 1: loaded cached preds (130 val / 501 train) ← m1sev_f1.npz
+  fold 1: MAE 4.127 | floor 9.42(n550) | deep 7.60 | slope 0.498 | corr 0.640 | eyeCorr 0.448 | bias +0.29 | σp/σt 0.78
+  fold 2: loaded cached preds (120 val / 511 train) ← m1sev_f2.npz
+  fold 2: MAE 4.660 | floor 9.51(n458) | deep 8.52 | slope 0.557 | corr 0.646 | eyeCorr 0.430 | bias -0.20 | σp/σt 0.86
+  fold 3: loaded cached preds (141 val / 490 train) ← m1sev_f3.npz
+  fold 3: MAE 4.082 | floor 7.88(n486) | deep 6.77 | slope 0.555 | corr 0.718 | eyeCorr 0.489 | bias -0.08 | σp/σt 0.77
+  fold 4: loaded cached preds (131 val / 500 train) ← m1sev_f4.npz
+  fold 4: MAE 4.298 | floor 11.28(n460) | deep 9.03 | slope 0.461 | corr 0.566 | eyeCorr 0.505 | bias +0.89 | σp/σt 0.81
+
+============================================================================================
+m1sev  5-FOLD OOF (631 recs)  RAW    MAE 4.256 | floor 9.19(n2506) | deep 7.88 | slope 0.543 | corr 0.665 | eyeCorr 0.471 | bias +0.22 | σp/σt 0.82
+  severity-stratified (per-eye true mean dB):
+    severe   n=101 | MAE 7.251 | floor 7.18 | slope 0.251
+    moderate n=183 | MAE 5.440 | floor 12.41 | slope 0.230
+    mild     n=347 | MAE 2.760 | floor 13.42 | slope 0.399
+m1sev  5-FOLD OOF (631 recs)  CALIB  MAE 4.495 | floor 8.58(n2506) | deep 7.88 | slope 0.646 | corr 0.665 | eyeCorr 0.471 | bias +0.14 | σp/σt 0.97
+  severity-stratified (per-eye true mean dB):
+    severe   n=101 | MAE 7.154 | floor 6.42 | slope 0.279
+    moderate n=183 | MAE 5.889 | floor 12.03 | slope 0.279
+    mild     n=347 | MAE 2.987 | floor 13.86 | slope 0.476
+
+  SEVERITY decomp (pooled OOF): sev_corr 0.813  sev_shrink 0.98  sev_mae 2.63 | res_corr 0.406  res_shrink 0.53
+============================================================================================
+refs: long_global 4.290/0.473/r0.657/severe~7.49 ; loraC 4.220/0.485/r0.657/severe7.694
+TARGET: MAE<4.00 AND slope≥0.60 (raw), severe not worse, r≥0.72 ideally.
+→ /Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/results/auto/m1sev_cv.json
