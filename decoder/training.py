@@ -668,7 +668,7 @@ class PerPointVFModel(nn.Module):
     def __init__(self, encoder, use_dist=False, dist_blend=DIST_BLEND, unfreeze_blocks=0,
                  mean_residual=False, global_head=False, finetune_norm=False,
                  lora=False, lora_rank=8, lora_blocks=8, lora_alpha=16, lora_dropout=0.1,
-                 copy_encoder=True, severity_head=False, severity_blend=1.0):
+                 copy_encoder=True, severity_head=False, severity_blend=1.0, rnfl_aux=False):
         super().__init__()
         # Method C — LoRA replaces submodules in place. When the caller might reuse the shared
         # module-global base_model (eval: many models per process), deep-copy so it is never
@@ -800,6 +800,21 @@ class PerPointVFModel(nn.Module):
         if severity_head:
             print(f"✓ M1: severity head ON (CLS→ΔMD uniform-shift correction on the emergent "
                   f"eye-mean, zero-init=no-op start, blend={severity_blend}) — de-shrunk severity")
+
+        # M2 — TRAIN-ONLY structural-surrogate aux head: CLS → 5-value OCT-RNFL [Mean,S,N,I,T].
+        # It NEVER touches `pred` (only sets self._last_rnfl for the aux loss), so inference stays
+        # fundus-only and byte-identical whether or not this head exists. Built ONLY when on, so
+        # rnfl_aux=False ≡ the current model exactly. Gradients from the aux loss flow back through
+        # the trainable LoRA suffix → sharpen the fundus features toward structure (raises sev_corr).
+        self.use_rnfl_aux = rnfl_aux
+        self._last_rnfl = None
+        if rnfl_aux:
+            self.rnfl_head = nn.Sequential(
+                nn.Linear(self.embed_dim, 256), nn.LayerNorm(256), nn.GELU(), nn.Dropout(HEAD_DROPOUT),
+                nn.Linear(256, 128), nn.LayerNorm(128), nn.GELU(), nn.Dropout(HEAD_DROPOUT),
+                nn.Linear(128, 5))
+            print("✓ M2: fundus→RNFL aux head ON (CLS→[Mean,S,N,I,T], train-only; unused at "
+                  "inference) — structural surrogate to raise sev_corr / the r-ceiling")
 
         if use_dist:
             print(f"✓ Distributional head ON (bins={len(DIST_BIN_CENTERS)}, "
@@ -970,6 +985,8 @@ class PerPointVFModel(nn.Module):
             pred = pred + self._global_residual(cls_token, patches)
         if self.use_severity_head:
             pred = self._apply_severity(pred, cls_token)
+        if self.use_rnfl_aux:
+            self._last_rnfl = self.rnfl_head(cls_token)   # (B,5) aux only — does NOT touch pred
         pred = self._finish(pred, average_multi)
         self._last_attn_weights = attn_weights   # for entropy regularization (training)
         return pred
@@ -985,6 +1002,8 @@ class PerPointVFModel(nn.Module):
             pred = pred + self._global_residual(cls_token, patches)
         if self.use_severity_head:
             pred = self._apply_severity(pred, cls_token)
+        if self.use_rnfl_aux:
+            self._last_rnfl = self.rnfl_head(cls_token)   # (B,5) aux only — does NOT touch pred
         pred = self._finish(pred, average_multi)
         self._last_attn_weights = attn_weights
         return pred

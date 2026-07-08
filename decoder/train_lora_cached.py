@@ -27,13 +27,19 @@ from garway_heath_weighting import sector_weight_tensors
 AUTO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "auto")
 
 
-def cache_prefix(model, json_path, transform=None, n_passes=1, batch=16, denoised_lookup=None):
+def cache_prefix(model, json_path, transform=None, n_passes=1, batch=16, denoised_lookup=None,
+                 rnfl_lookup=None):
     """Return list of {prefix:(1,197,1024) cpu, hvf:(72,), lat:str} — one entry per (eye, view).
     Uses train-mode single-image samples + BATCHED encoder forward (fast). n_passes>1 with a random
     `transform` caches augmented views. denoised_lookup swaps TRAIN targets (Method B) — pass it only
-    for the train cache; val stays RAW."""
+    for the train cache; val stays RAW. rnfl_lookup (M2) attaches a z-scored 5-value RNFL target +
+    mask per view (train cache only); DataLoader(shuffle=False) keeps entry k aligned to ds.samples[k]."""
     transform = transform or T.val_transform
     old_noise = T.LABEL_NOISE_STD; T.LABEL_NOISE_STD = 0.0     # cached targets stay RAW (no noise)
+    rnfl_eyes = rnfl_lookup['eyes'] if rnfl_lookup else None
+    if rnfl_lookup:
+        rmean = np.asarray(rnfl_lookup['norm']['rnfl_mean'], dtype=np.float32)
+        rstd  = np.asarray(rnfl_lookup['norm']['rnfl_std'],  dtype=np.float32)
     try:
         ds = T.MultiImageDataset(json_path, T.FUNDUS_DIR, transform, mode='train',
                                  denoised_lookup=denoised_lookup)
@@ -42,10 +48,22 @@ def cache_prefix(model, json_path, transform=None, n_passes=1, batch=16, denoise
         model.eval()
         with torch.no_grad():
             for _ in range(n_passes):
+                si = 0
                 for imgs, hvf, lat in loader:
                     pre = model._encode_prefix(imgs.to(T.DEVICE)).half().cpu()   # fp16 (B,197,1024)
                     for b in range(pre.shape[0]):
-                        out.append({'prefix': pre[b:b + 1], 'hvf': hvf[b], 'lat': lat[b]})
+                        entry = {'prefix': pre[b:b + 1], 'hvf': hvf[b], 'lat': lat[b]}
+                        if rnfl_eyes is not None:
+                            s = ds.samples[si]
+                            rec = rnfl_eyes.get(f"{int(s['patient_id'])}_{s['laterality']}")
+                            if rec is not None:
+                                entry['rnfl'] = (np.asarray(rec['rnfl'], dtype=np.float32) - rmean) / rstd
+                                entry['rnfl_mask'] = 1.0
+                            else:
+                                entry['rnfl'] = np.zeros(5, dtype=np.float32)
+                                entry['rnfl_mask'] = 0.0
+                        out.append(entry)
+                        si += 1
     finally:
         T.LABEL_NOISE_STD = old_noise
     return out
@@ -111,17 +129,30 @@ def main():
     ap.add_argument('--ema', action='store_true',
                     help="M3: keep an EMA of trainable params; eval + save the EMA weights")
     ap.add_argument('--ema-decay', type=float, default=0.998)
+    # M2 — fundus→RNFL structural-surrogate aux head (TRAIN-ONLY; fundus-only at inference).
+    ap.add_argument('--rnfl-aux', action='store_true',
+                    help="M2: add a train-only CLS→RNFL[Mean,S,N,I,T] aux head to sharpen features")
+    ap.add_argument('--rnfl-weight', type=float, default=0.3,
+                    help="λ on the masked RNFL aux Huber (eyes without RNFL are masked out)")
+    ap.add_argument('--rnfl-lookup', default=os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "vf_tests",
+        "grape_rnfl_lookup.json"))
     a = ap.parse_args()
     denoised_lookup = None
     if a.denoised:
         with open(T.DENOISED_TARGETS_PATH) as f:
             denoised_lookup = json.load(f)
+    rnfl_lookup = None
+    if a.rnfl_aux:
+        with open(a.rnfl_lookup) as f:
+            rnfl_lookup = json.load(f)
 
     model = T.PerPointVFModel(T.base_model, global_head=True, lora=True, lora_rank=a.lora_rank,
                               lora_blocks=a.lora_blocks, lora_alpha=a.lora_alpha,
                               lora_dropout=a.lora_dropout, copy_encoder=False,
                               severity_head=a.severity_head,
-                              severity_blend=a.severity_blend).to(T.DEVICE)
+                              severity_blend=a.severity_blend,
+                              rnfl_aux=a.rnfl_aux).to(T.DEVICE)
     severity_cfg = None
     if a.severity_head:
         severity_cfg = dict(weight=a.severity_weight, ccc=a.severity_ccc,
@@ -145,7 +176,10 @@ def main():
     print(f"Caching frozen prefix (blocks[:{n_frozen}]) — train ×{a.aug_views} views"
           f"{' +denoised' if a.denoised else ''} …", flush=True)
     train_cache = cache_prefix(model, a.train_json, tr_tfm, n_passes=a.aug_views,
-                               denoised_lookup=denoised_lookup)
+                               denoised_lookup=denoised_lookup, rnfl_lookup=rnfl_lookup)
+    if a.rnfl_aux:
+        _nr = sum(int(e.get('rnfl_mask', 0.0)) for e in train_cache)
+        print(f"  M2: RNFL aux targets on {_nr}/{len(train_cache)} train views", flush=True)
     print(f"  {len(train_cache)} train views cached. Val …", flush=True)
     val_cache = cache_prefix(model, a.val_json)
     print(f"  {len(val_cache)} val eyes cached.", flush=True)
@@ -200,6 +234,15 @@ def main():
                                            sector_weights=sector_weights, sector_combine='sector_only',
                                            severity_pred=model._last_severity,
                                            severity_cfg=severity_cfg)
+            if a.rnfl_aux and model._last_rnfl is not None:
+                rt = torch.stack([torch.as_tensor(train_cache[i]['rnfl'], dtype=torch.float32)
+                                  for i in bidx]).to(T.DEVICE)                       # (B,5) z-scored
+                rm = torch.tensor([train_cache[i]['rnfl_mask'] for i in bidx],
+                                  dtype=torch.float32, device=T.DEVICE)              # (B,)
+                aux = torch.nn.functional.smooth_l1_loss(
+                    model._last_rnfl, rt, reduction='none').mean(dim=1)              # (B,)
+                aux_loss = (aux * rm).sum() / rm.sum().clamp_min(1.0)               # masked mean
+                loss = loss + a.rnfl_weight * aux_loss
             if nv > 0:
                 opt.zero_grad(); loss.backward()
                 torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
@@ -225,7 +268,8 @@ def main():
                             'lora': True, 'lora_rank': a.lora_rank, 'lora_blocks': a.lora_blocks,
                             'lora_alpha': a.lora_alpha, 'lora_dropout': a.lora_dropout,
                             'severity_head': a.severity_head,
-                            'severity_blend': a.severity_blend}, out_best)
+                            'severity_blend': a.severity_blend,
+                            'rnfl_aux': a.rnfl_aux}, out_best)
                 tag = " ✓ saved"
             if ema: ema.restore()       # back to raw weights for continued training
             print(f"[E{epoch:02d}] train MAE {ep_mae/max(ep_n,1):.2f} | VAL MAE {m['mae']:.3f} "
