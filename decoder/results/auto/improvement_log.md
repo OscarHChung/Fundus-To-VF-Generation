@@ -35,6 +35,7 @@ Fold-0 reference strata: severe(n24) 7.651 · moderate(n24) 4.898 · mild(n61) 2
 | **m1sev_f0** | **M1 severity head, NO EMA** | fold0 no-TTA (interrupted@E24) | ~4.16 | ~0.56 | ~0.73 | — | best@E10; TTA eval + full CV TODO on faster box. Isolates M1 (spatially neutral). See SESSION-M1 section |
 | **m1sev** | **M1 severity head, NO EMA — FULL 5-FOLD OOF (TTA)** | **5f OOF raw** | **4.256** | **0.543** | **0.665** | **7.251** | ✓ beats long_global on ALL (MAE −0.03, slope +0.07, r +0.008, severe −0.24) & beats loraC on slope/r/severe (severe **−0.44**, fixes loraC's severe regression) at MAE +0.036. **Misses hard target**: de-shrink worked (sev_shr 0.71→**0.98**) but **sev_corr flat 0.81** (uniform shift can't add corr) ⇒ r-ceiling binds. See M1-RESULT section |
 | m1sev calib | variance-match | 5f OOF calib | 4.495 | **0.646** | 0.665 | 7.154 | slope≥0.60 for free; MAE 4.50. Neither raw nor calib hits 4.0 |
+| **m2rnfl** | **M1 + M2 fundus→RNFL aux (weight 0.3) — FULL 5-FOLD OOF** | 5f OOF raw | 4.222 | 0.528 | 0.666 | 7.368 | ✗ WASH/FAIL: MAE −0.03 vs m1sev but **severe WORSE +0.12** (bias+) & **pooled r FLAT** (0.665→0.666). The fold-2 gate win (r +0.03) did NOT generalize. Not a win (severe regression). See M2-RESULT |
 
 ---
 
@@ -301,4 +302,47 @@ sev_corr is **M2 — fundus→RNFL structural surrogate** (design doc §M2, "rai
 NEXT: audit OCT-RNFL/CCT/age coverage in `grape_data.xlsx` (cheap, no encoder); if coverage is
 adequate, build M2 (train-only aux head) on top of the m1sev base. Keep m1sev as the working base.
 Checkpoints on disk: `m1sev_f{0..4}_best.pth` (all 5 folds, complete); `m1sev_cv.json` (the result).
+
+---
+
+# ═══════════ M2-RESULT: fundus→RNFL aux head — full 5-fold OOF (WASH/FAIL) ═══════════
+# Built + unit-tested + full CV done. Honest verdict: does NOT beat m1sev; reverted. `m2rnfl_cv.json`.
+
+## What was built (scaffold committed e15e744; default OFF ≡ m1sev, verified)
+GRAPE Baseline sheet has a per-eye 5-value OCT RNFL vector [Mean,S,N,I,T] + age/CCT/IOP at **94%
+record coverage** (594/631). `build_rnfl_lookup.py` → side-car `grape_rnfl_lookup.json` (does NOT
+touch the frozen folds/eval). `training.py`: a conditional CLS→RNFL(5) aux head that NEVER touches
+`pred` (only sets `_last_rnfl`) ⇒ inference stays fundus-only & byte-identical. `train_lora_cached.py
+--rnfl-aux --rnfl-weight`: caches a z-scored RNFL target+mask per view (shuffle=False keeps entry k
+↔ ds.samples[k]); masked Huber aux loss (eyes w/o RNFL masked) → grads flow back through the LoRA
+suffix to shape features. Tests `tests_method_m2.py` PASS; M1+session3 regressions PASS.
+
+## Result (5-fold OOF, TTA, RAW, weight 0.3, stacked on M1) — `m2rnfl_cv.json`
+- RAW:  MAE **4.222** / slope 0.528 / r **0.666** / eyeCorr 0.482 / **severe 7.368** / bias +0.17
+- CALIB: 4.465 / slope 0.637 / r 0.664 / severe 7.326
+- SEVERITY decomp: sev_corr 0.809 / sev_shrink 0.94 / res_corr **0.422** (spatial +0.016 vs m1sev)
+- Per-fold RAW MAE/slope/r: f0 4.194/0.600/0.727 · f1 4.088/0.456/0.621 · f2 4.466/0.504/0.676 ·
+  f3 4.089/0.578/0.711 · f4 4.299/0.463/0.568. Strata (raw): severe 7.368 · moderate 5.272 · mild 2.753.
+
+## Verdict: WASH — reverted (m1sev stays champion). Not a win by the severe-band rule.
+- vs **m1sev** (4.256/0.543/r0.665/severe7.251): MAE −0.034 (tied w/ loraC 4.220), moderate −0.17,
+  res_corr +0.016 — BUT **pooled r FLAT (0.665→0.666)** and **severe WORSE +0.12** (positive bias).
+  "A pooled gain that worsens severe is NOT a win" ⇒ FAIL.
+- **The single-fold gate LIED:** fold-2 looked great (MAE −0.19, r +0.03) but did NOT generalize —
+  folds 0/1 lost r (f0 0.734→0.727, f1 0.640→0.621), cancelling the pooled r. Lesson: a hard
+  single-fold gate is necessary but NOT sufficient for M2-type feature levers; they need the full CV.
+- **Why M2 didn't raise the r-ceiling** (the hypothesis was Medeiros fundus→RNFL is learnable):
+  (a) only the last 8 ViT blocks are adaptable — the frozen 16-block prefix dominates the features,
+  so the aux has little leverage on fundamental feature quality; (b) the RNFL is BASELINE but the VF
+  target is a FOLLOW-UP visit (progression) — a timepoint mismatch that dilutes the structural signal.
+- **One-fix decision (deprioritized, honest):** a weight sweep (→0.15) only pulls M2 toward m1sev
+  (weight→0) and can't manufacture pooled r that isn't there; low EV vs the ~3.5 h cost. Logged & moved on.
+
+## NEXT (r is stuck ~0.665 across LoRA/M1/M2 — the binding constraint):
+The r-ceiling has resisted three levers. Two honest directions: (1) **M4 — imbalance-aware/structured
+output for the severe band** (LDS/FDS, VF-AE-latent/archetype target, ordinal head) to directly fix
+the severe MAE 7.25 + slope 0.54 (the binding weakness now), severe-guarded; (2) **M5 — disc/cup
+segmentation ROI + inference-safe metadata** (MLEDL hit 3.1–3.9 fundus-only at 633 pts) to attack r
+at the source (peripapillary structure) rather than via a weak aux. m1sev remains the champion
+(4.256/0.543/r0.665/severe7.251; calib slope 0.646). Checkpoints: `m2rnfl_f{0..4}_best.pth`, `m2rnfl_cv.json`.
 
