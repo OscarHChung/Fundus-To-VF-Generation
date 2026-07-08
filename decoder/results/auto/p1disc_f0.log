@@ -1,0 +1,42 @@
+launch Wed Jul  8 15:00:56 PDT 2026
+✓ Using MPS (Apple Silicon GPU)
+✓ Loaded RETFound
+✓ Encoder: FROZEN
+✓ Method C: LoRA ON — 8 adapters in last 8 blocks (rank=8, alpha=16, dropout=0.1); 262,144 trainable LoRA params; RETFound base frozen
+✓ Per-point attention (dropout=0.4, temp_init=2.0)
+✓ Shared point head (dropout=0.4)
+✓ Joint global-spatial head ON (ADDITIVE: per-point pred + zero-mean global pattern from mean-pool patches‖CLS; zero-init=no-op start) — targets eyeCorr 0.51
+✓ M1: severity head ON (CLS→ΔMD uniform-shift correction on the emergent eye-mean, zero-init=no-op start, blend=1.0) — de-shrunk severity
+✓ Cross-point refinement
+  Trainable: attention=425,985 + head=558,337 + refinement=11,181 = 995,503
+Warm-started 430 tensors from long_global_f0_best.pth (decoder + frozen encoder; LoRA A/B fresh).
+✓ P1: disc-ROI is the SOLE input (DISC_HALF=0.27, cx OD/OS 0.78/0.22). Fundus-only at inference.
+Caching frozen prefix (blocks[:16]) — train ×1 views +disc_only …
+  Train: 522 eyes → 522 images
+  522 train views cached. Val …
+  Train: 109 eyes → 109 images
+  109 val eyes cached.
+  Freed 16 prefix blocks. Trainable params: 3,144,946
+[E01] train MAE 4.54 | VAL MAE 4.362 slope 0.515 corr 0.726 σp/σt 0.71 ✓ saved
+[E02] train MAE 4.40 | VAL MAE 4.887 slope 0.453 corr 0.707 σp/σt 0.64
+[E03] train MAE 4.38 | VAL MAE 4.371 slope 0.547 corr 0.737 σp/σt 0.74 ✓ saved
+[E04] train MAE 4.24 | VAL MAE 4.122 slope 0.527 corr 0.750 σp/σt 0.70 ✓ saved
+[E06] train MAE 4.17 | VAL MAE 4.901 slope 0.636 corr 0.740 σp/σt 0.86
+[E08] train MAE 3.86 | VAL MAE 4.266 slope 0.527 corr 0.725 σp/σt 0.73
+[E10] train MAE 3.89 | VAL MAE 4.172 slope 0.560 corr 0.729 σp/σt 0.77
+[E12] train MAE 3.87 | VAL MAE 4.181 slope 0.533 corr 0.739 σp/σt 0.72
+[E14] train MAE 3.71 | VAL MAE 4.463 slope 0.574 corr 0.745 σp/σt 0.77
+[E16] train MAE 3.78 | VAL MAE 4.112 slope 0.582 corr 0.745 σp/σt 0.78 ✓ saved
+[E18] train MAE 3.60 | VAL MAE 4.189 slope 0.555 corr 0.735 σp/σt 0.76
+[E20] train MAE 3.58 | VAL MAE 4.127 slope 0.581 corr 0.744 σp/σt 0.78
+[E22] train MAE 3.44 | VAL MAE 4.141 slope 0.555 corr 0.738 σp/σt 0.75
+[E24] train MAE 3.33 | VAL MAE 4.170 slope 0.583 corr 0.739 σp/σt 0.79
+[E26] train MAE 3.38 | VAL MAE 4.182 slope 0.611 corr 0.739 σp/σt 0.83
+[E28] train MAE 3.31 | VAL MAE 4.130 slope 0.581 corr 0.741 σp/σt 0.78
+[E30] train MAE 3.34 | VAL MAE 4.184 slope 0.553 corr 0.738 σp/σt 0.75
+[E32] train MAE 3.24 | VAL MAE 4.101 slope 0.588 corr 0.745 σp/σt 0.79 ✓ saved
+[E34] train MAE 3.14 | VAL MAE 4.117 slope 0.595 corr 0.743 σp/σt 0.80
+[E36] train MAE 3.14 | VAL MAE 4.121 slope 0.592 corr 0.741 σp/σt 0.80
+[E38] train MAE 3.19 | VAL MAE 4.139 slope 0.589 corr 0.742 σp/σt 0.79
+[E40] train MAE 3.20 | VAL MAE 4.128 slope 0.590 corr 0.741 σp/σt 0.80
+BEST val: MAE 4.101 slope 0.588 corr 0.745 @ep32 → /Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/results/auto/p1disc_f0_best.pth

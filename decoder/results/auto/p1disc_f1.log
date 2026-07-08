@@ -1,0 +1,25 @@
+===== FOLD 1 start Wed Jul  8 15:44:47 PDT 2026 =====
+✓ Using MPS (Apple Silicon GPU)
+✓ Loaded RETFound
+✓ Encoder: FROZEN
+✓ Method C: LoRA ON — 8 adapters in last 8 blocks (rank=8, alpha=16, dropout=0.1); 262,144 trainable LoRA params; RETFound base frozen
+✓ Per-point attention (dropout=0.4, temp_init=2.0)
+✓ Shared point head (dropout=0.4)
+✓ Joint global-spatial head ON (ADDITIVE: per-point pred + zero-mean global pattern from mean-pool patches‖CLS; zero-init=no-op start) — targets eyeCorr 0.51
+✓ M1: severity head ON (CLS→ΔMD uniform-shift correction on the emergent eye-mean, zero-init=no-op start, blend=1.0) — de-shrunk severity
+✓ Cross-point refinement
+  Trainable: attention=425,985 + head=558,337 + refinement=11,181 = 995,503
+Warm-started 430 tensors from long_global_f1_best.pth (decoder + frozen encoder; LoRA A/B fresh).
+✓ P1: disc-ROI is the SOLE input (DISC_HALF=0.27, cx OD/OS 0.78/0.22). Fundus-only at inference.
+Caching frozen prefix (blocks[:16]) — train ×1 views +disc_only …
+  Train: 501 eyes → 501 images
+  501 train views cached. Val …
+  Train: 130 eyes → 130 images
+  130 val eyes cached.
+  Freed 16 prefix blocks. Trainable params: 3,144,946
+[E01] train MAE 5.08 | VAL MAE 4.219 slope 0.366 corr 0.569 σp/σt 0.64 ✓ saved
+[E02] train MAE 5.03 | VAL MAE 4.178 slope 0.298 corr 0.596 σp/σt 0.50 ✓ saved
+[E03] train MAE 4.41 | VAL MAE 4.025 slope 0.406 corr 0.627 σp/σt 0.65 ✓ saved
+[E04] train MAE 4.24 | VAL MAE 4.069 slope 0.477 corr 0.634 σp/σt 0.75
+[E06] train MAE 4.23 | VAL MAE 4.214 slope 0.458 corr 0.635 σp/σt 0.72
+[E08] train MAE 4.03 | VAL MAE 4.128 slope 0.572 corr 0.657 σp/σt 0.87

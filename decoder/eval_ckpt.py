@@ -38,12 +38,17 @@ def load_model(ckpt_path):
                               severity_blend=ckpt.get('severity_blend', 1.0))
     model.load_state_dict(state, strict=False)
     model.to(T.DEVICE)
+    # P1 — if the model was trained on disc-ROI crops, eval MUST crop identically (fundus-only).
+    model._disc_only = ckpt.get('disc_only', False)
+    if model._disc_only and ckpt.get('disc_half') is not None:
+        T.DISC_HALF = ckpt['disc_half']
     return model
 
 
 def per_eye_preds(model, json_path, use_tta=True):
     """Return (preds, trues): lists of (52,) arrays in OD/OS query order, nan at masked."""
-    ds = T.MultiImageDataset(json_path, T.FUNDUS_DIR, T.val_transform, mode='val', use_tta=use_tta)
+    ds = T.MultiImageDataset(json_path, T.FUNDUS_DIR, T.val_transform, mode='val', use_tta=use_tta,
+                             disc_only=getattr(model, '_disc_only', False))
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=T.val_collate_fn)
     cache = T.precompute_features(model, loader, T.DEVICE, os.path.basename(json_path))
     preds, trues = [], []

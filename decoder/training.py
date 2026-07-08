@@ -289,7 +289,7 @@ def disc_crop_pil(img, laterality):
 # ============== Dataset ==============
 class MultiImageDataset(Dataset):
     def __init__(self, json_path, fundus_dir, transform, mode='train', use_tta=False,
-                 disc_crop=False, denoised_lookup=None):
+                 disc_crop=False, denoised_lookup=None, disc_only=False):
         with open(json_path, 'r') as f:
             self.data = json.load(f)
         self.fundus_dir = fundus_dir
@@ -297,15 +297,22 @@ class MultiImageDataset(Dataset):
         self.mode       = mode
         self.use_tta    = use_tta
         self.disc_crop  = disc_crop
+        self.disc_only  = disc_only
         # Method B — TRAIN-ONLY target denoising. denoised_lookup maps
         # "PatientID_Laterality_VisitNumber" -> 8x9 denoised hvf; used for train targets only
         # (val/eval always keep the RAW observed VF). None = raw targets (baseline).
         self.denoised_lookup = denoised_lookup if mode == 'train' else None
         self._n_denoised = 0
-        # Views per image: always 'full'; + 'disc' (a laterality-aware disc zoom)
-        # when disc_crop is on. Train treats each (image,view) as its own sample;
-        # val stacks all views of an eye and averages their predictions.
-        views = ['full', 'disc'] if disc_crop else ['full']
+        # Views per image. Default: 'full' only (baseline). --disc-crop adds a 2nd 'disc' view
+        # fused by prediction-averaging (iter-11, failed). P1 (disc_only) REPLACES the input with
+        # the laterality-aware disc/ROI crop as the SOLE view — sole-input, not an averaged extra.
+        # disc_only takes precedence over disc_crop.
+        if disc_only:
+            views = ['disc']
+        elif disc_crop:
+            views = ['full', 'disc']
+        else:
+            views = ['full']
         self.samples = []
         for item in self.data:
             images     = item['FundusImage'] if isinstance(item['FundusImage'], list) else [item['FundusImage']]

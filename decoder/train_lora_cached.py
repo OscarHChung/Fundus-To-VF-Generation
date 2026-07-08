@@ -28,7 +28,7 @@ AUTO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "auto
 
 
 def cache_prefix(model, json_path, transform=None, n_passes=1, batch=16, denoised_lookup=None,
-                 rnfl_lookup=None):
+                 rnfl_lookup=None, disc_only=False):
     """Return list of {prefix:(1,197,1024) cpu, hvf:(72,), lat:str} — one entry per (eye, view).
     Uses train-mode single-image samples + BATCHED encoder forward (fast). n_passes>1 with a random
     `transform` caches augmented views. denoised_lookup swaps TRAIN targets (Method B) — pass it only
@@ -42,7 +42,7 @@ def cache_prefix(model, json_path, transform=None, n_passes=1, batch=16, denoise
         rstd  = np.asarray(rnfl_lookup['norm']['rnfl_std'],  dtype=np.float32)
     try:
         ds = T.MultiImageDataset(json_path, T.FUNDUS_DIR, transform, mode='train',
-                                 denoised_lookup=denoised_lookup)
+                                 denoised_lookup=denoised_lookup, disc_only=disc_only)
         loader = DataLoader(ds, batch_size=batch, shuffle=False, num_workers=0)
         out = []
         model.eval()
@@ -113,6 +113,13 @@ def main():
                          "augmentation regularization; val stays deterministic)")
     ap.add_argument('--denoised', action='store_true',
                     help="Method B: use per-eye trend-denoised TRAIN targets (val stays RAW)")
+    # P1 — disc-ROI as the SOLE encoder input (fundus-only; replaces the full image, not averaged).
+    ap.add_argument('--disc-only', action='store_true',
+                    help="P1: use a laterality-aware disc/ROI crop as the SOLE input (high-res "
+                         "peripapillary detail for the severity channel). Fundus-only at inference.")
+    ap.add_argument('--disc-half', type=float, default=None,
+                    help="override DISC_HALF (crop half-size, fraction of W/H). 0.27=tight disc, "
+                         "0.45=disc+macula ROI. Stored in the ckpt so eval crops identically.")
     # M1 — first-class severity (eye-mean / MD) head + de-shrink loss (default OFF ≡ long_global).
     ap.add_argument('--severity-head', action='store_true',
                     help="M1: add a CLS→MD head that replaces the field eye-mean, de-shrunk by a "
@@ -172,16 +179,23 @@ def main():
         gc.collect()
     n_frozen = len(model.encoder.blocks) - model._grad_blocks
 
+    if a.disc_half is not None:
+        T.DISC_HALF = a.disc_half           # eval reloads this from the ckpt (see eval_ckpt.load_model)
+    if a.disc_only:
+        print(f"✓ P1: disc-ROI is the SOLE input (DISC_HALF={T.DISC_HALF}, cx OD/OS "
+              f"{T.DISC_CX_OD}/{T.DISC_CX_OS}). Fundus-only at inference.", flush=True)
+
     tr_tfm = T.train_transform if a.aug_views > 1 else T.val_transform
     print(f"Caching frozen prefix (blocks[:{n_frozen}]) — train ×{a.aug_views} views"
-          f"{' +denoised' if a.denoised else ''} …", flush=True)
+          f"{' +denoised' if a.denoised else ''}{' +disc_only' if a.disc_only else ''} …", flush=True)
     train_cache = cache_prefix(model, a.train_json, tr_tfm, n_passes=a.aug_views,
-                               denoised_lookup=denoised_lookup, rnfl_lookup=rnfl_lookup)
+                               denoised_lookup=denoised_lookup, rnfl_lookup=rnfl_lookup,
+                               disc_only=a.disc_only)
     if a.rnfl_aux:
         _nr = sum(int(e.get('rnfl_mask', 0.0)) for e in train_cache)
         print(f"  M2: RNFL aux targets on {_nr}/{len(train_cache)} train views", flush=True)
     print(f"  {len(train_cache)} train views cached. Val …", flush=True)
-    val_cache = cache_prefix(model, a.val_json)
+    val_cache = cache_prefix(model, a.val_json, disc_only=a.disc_only)
     print(f"  {len(val_cache)} val eyes cached.", flush=True)
 
     # Free the frozen prefix blocks (~1 GB) — only the LoRA suffix + decoder train from here.
@@ -269,7 +283,10 @@ def main():
                             'lora_alpha': a.lora_alpha, 'lora_dropout': a.lora_dropout,
                             'severity_head': a.severity_head,
                             'severity_blend': a.severity_blend,
-                            'rnfl_aux': a.rnfl_aux}, out_best)
+                            'rnfl_aux': a.rnfl_aux,
+                            'disc_only': a.disc_only,
+                            'disc_half': (a.disc_half if a.disc_half is not None else T.DISC_HALF)},
+                           out_best)
                 tag = " ✓ saved"
             if ema: ema.restore()       # back to raw weights for continued training
             print(f"[E{epoch:02d}] train MAE {ep_mae/max(ep_n,1):.2f} | VAL MAE {m['mae']:.3f} "
