@@ -72,9 +72,10 @@ sev_corr at n=505 = **0.738**; trained-decoder sev_corr = **0.807**; sub-4.0 fro
 > general-domain SSL loses to the retinal-domain MAE, as theory predicts). But the plan's **actual top
 > pick RETFound-DINOv2 and DINOv3-L are GATED HuggingFace repos** (401 — need the user's HF login +
 > license acceptance) and **VisionFM has no local weights** — all three UNTESTED. So we may **not** yet
-> conclude "encoder swap does not help"; only "the *general* DINOv2 does not." **Decision pending (user):
-> grant HF access to test the retinal RETFound-DINOv2, or pivot to Phase B.** See progress log at EOF.
-> A3 not started (gated on an A2 winner). Champion unchanged: **p1disc 4.113**.
+> conclude "encoder swap does not help"; only "the *general* DINOv2 does not." **USER DECISION (2026-07-10):
+> "Use RETFound, not the dino one" → keep RETFound-MAE; do NOT pursue the gated retinal-DINOv2/DINOv3.
+> Phase A is CLOSED (encoder = RETFound-MAE).** A3 not started (no winning encoder to integrate). Champion
+> unchanged: **p1disc 4.113**. → Proceed to **Phase B** (data-efficiency, keeps RETFound-MAE, no access).
 
 ### Task A1: Swappable frozen-encoder loader
 
@@ -286,3 +287,10 @@ not a regression; gate on the in-run number.
 via `python decoder/diag_encoder_bakeoff.py --cache --only retfound_dinov2` then `--probe`, apply the same
 gate; OR (b) accept the partial negative and start **Phase B / Task B2** (data-efficiency without new data:
 VF-manifold decoder warm-start, disc-crop geometric augmentation — both cheap fold-0 scouts).
+
+**RESOLVED (2026-07-10):** user chose to **keep RETFound-MAE** ("use retfound not the dino one"). Phase A
+closed with no encoder swap. The generic-DINOv2 negative stands; the retinal-DINOv2 lever is left untested
+by choice (re-openable later if HF access is granted — the loader + bake-off are ready, just `--cache
+--only retfound_dinov2 && --probe`). Moving to Phase B. Cheapest decisive remaining probe is actually
+**Task C1** (RNFL spatial-metadata partial-corr — numpy, minutes, no training) — run it before the B2
+training scouts per "cheapest decisive first," then B2.
