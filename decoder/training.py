@@ -274,22 +274,38 @@ DISC_CX_OS = 0.22
 DISC_CY    = 0.49
 DISC_HALF  = 0.27   # half box size (fraction of W/H) → ~54% crop, resized to 224
 
-def disc_crop_pil(img, laterality):
+def disc_crop_pil(img, laterality, cx_off=0.0, cy_off=0.0, half=None):
+    """Laterality-aware disc box. cx_off/cy_off shift the centre and `half` overrides the box
+    half-size (fractions of W/H) — the train-only geometric-jitter augmentation (B2). All defaults
+    (0, 0, None→DISC_HALF) reproduce the fixed champion crop byte-for-byte."""
     w, h = img.size
-    cx = DISC_CX_OD if str(laterality).startswith('OD') else DISC_CX_OS
-    left   = int(max(0, (cx - DISC_HALF) * w))
-    right  = int(min(w, (cx + DISC_HALF) * w))
-    top    = int(max(0, (DISC_CY - DISC_HALF) * h))
-    bottom = int(min(h, (DISC_CY + DISC_HALF) * h))
+    cx = (DISC_CX_OD if str(laterality).startswith('OD') else DISC_CX_OS) + cx_off
+    cy = DISC_CY + cy_off
+    hf = DISC_HALF if half is None else half
+    left   = int(max(0, (cx - hf) * w))
+    right  = int(min(w, (cx + hf) * w))
+    top    = int(max(0, (cy - hf) * h))
+    bottom = int(min(h, (cy + hf) * h))
     if right - left < 8 or bottom - top < 8:   # degenerate guard
         return img
     return img.crop((left, top, right, bottom))
 
 
+def rotate_then_disc_crop(img, laterality, deg):
+    """Crop-safe TTA for the disc view (P1 dir-1). The naive path cropped the tight disc box FIRST
+    and then rotated it → the rotation fills the crop corners with black border AND shifts the disc
+    off-centre, which on a tight crop injects the +1.4 dB TTA bias (fold-0 TTA 4.69 vs no-TTA 4.10).
+    Here we rotate the FULL image about its centre first, THEN crop the disc at its fixed fractional
+    location: the disc stays centred, the crop is interior to the image, and (unlike the tight-box
+    rotate) essentially no black border enters. deg=0 is a plain disc crop (no rotation)."""
+    rot = img if deg == 0 else transforms.functional.rotate(img, deg)
+    return disc_crop_pil(rot, laterality)
+
+
 # ============== Dataset ==============
 class MultiImageDataset(Dataset):
     def __init__(self, json_path, fundus_dir, transform, mode='train', use_tta=False,
-                 disc_crop=False, denoised_lookup=None, disc_only=False):
+                 disc_crop=False, denoised_lookup=None, disc_only=False, disc_jitter=0.0):
         with open(json_path, 'r') as f:
             self.data = json.load(f)
         self.fundus_dir = fundus_dir
@@ -298,6 +314,10 @@ class MultiImageDataset(Dataset):
         self.use_tta    = use_tta
         self.disc_crop  = disc_crop
         self.disc_only  = disc_only
+        # B2 augmentation: stochastic scale/shift jitter on the disc crop, TRAIN ONLY (0.0 = OFF,
+        # byte-identical to the fixed champion crop). Only meaningful with multi-pass caching
+        # (--aug-views >1), which caches several jittered views per eye.
+        self.disc_jitter = disc_jitter if mode == 'train' else 0.0
         # Method B — TRAIN-ONLY target denoising. denoised_lookup maps
         # "PatientID_Laterality_VisitNumber" -> 8x9 denoised hvf; used for train targets only
         # (val/eval always keep the RAW observed VF). None = raw targets (baseline).
@@ -367,7 +387,14 @@ class MultiImageDataset(Dataset):
         if self.mode == 'train':
             img = Image.open(os.path.join(self.fundus_dir, sample['image'])).convert('RGB')
             if sample.get('view') == 'disc':
-                img = disc_crop_pil(img, sample['laterality'])
+                if self.disc_jitter > 0:
+                    j = self.disc_jitter
+                    cx_off = np.random.uniform(-0.2 * j, 0.2 * j)   # shift centre (±0.2·j of W/H)
+                    cy_off = np.random.uniform(-0.2 * j, 0.2 * j)
+                    half   = DISC_HALF * (1.0 + np.random.uniform(-j, j))   # scale box ±j
+                    img = disc_crop_pil(img, sample['laterality'], cx_off, cy_off, half)
+                else:
+                    img = disc_crop_pil(img, sample['laterality'])
             hvf = np.array(sample['hvf'], dtype=np.float32).flatten()
             hvf_tensor = torch.tensor(hvf)
             # Label noise — small gaussian perturbation on train targets
@@ -386,8 +413,14 @@ class MultiImageDataset(Dataset):
             for img_path, view in image_views:
                 img = Image.open(os.path.join(self.fundus_dir, img_path)).convert('RGB')
                 if view == 'disc':
-                    img = disc_crop_pil(img, sample['laterality'])
-                if self.use_tta:
+                    # crop-safe TTA (dir-1): rotate the FULL image then disc-crop, so no black
+                    # border / disc-shift is injected. No-TTA (deg=0 only) is a plain disc crop —
+                    # byte-identical to the previous disc no-TTA behavior.
+                    degs = TTA_ROTATIONS if self.use_tta else [0]
+                    for deg in degs:
+                        all_imgs.append(self.transform(
+                            rotate_then_disc_crop(img, sample['laterality'], deg)))
+                elif self.use_tta:
                     for t in get_tta_transforms():
                         all_imgs.append(t(img))
                 else:

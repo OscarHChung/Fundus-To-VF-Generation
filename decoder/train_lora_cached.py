@@ -28,7 +28,7 @@ AUTO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "auto
 
 
 def cache_prefix(model, json_path, transform=None, n_passes=1, batch=16, denoised_lookup=None,
-                 rnfl_lookup=None, disc_only=False):
+                 rnfl_lookup=None, disc_only=False, disc_jitter=0.0):
     """Return list of {prefix:(1,197,1024) cpu, hvf:(72,), lat:str} — one entry per (eye, view).
     Uses train-mode single-image samples + BATCHED encoder forward (fast). n_passes>1 with a random
     `transform` caches augmented views. denoised_lookup swaps TRAIN targets (Method B) — pass it only
@@ -42,7 +42,8 @@ def cache_prefix(model, json_path, transform=None, n_passes=1, batch=16, denoise
         rstd  = np.asarray(rnfl_lookup['norm']['rnfl_std'],  dtype=np.float32)
     try:
         ds = T.MultiImageDataset(json_path, T.FUNDUS_DIR, transform, mode='train',
-                                 denoised_lookup=denoised_lookup, disc_only=disc_only)
+                                 denoised_lookup=denoised_lookup, disc_only=disc_only,
+                                 disc_jitter=disc_jitter)
         loader = DataLoader(ds, batch_size=batch, shuffle=False, num_workers=0)
         out = []
         model.eval()
@@ -117,6 +118,9 @@ def main():
     ap.add_argument('--disc-only', action='store_true',
                     help="P1: use a laterality-aware disc/ROI crop as the SOLE input (high-res "
                          "peripapillary detail for the severity channel). Fundus-only at inference.")
+    ap.add_argument('--disc-jitter', type=float, default=0.0,
+                    help="B2: train-only geometric jitter on the disc crop (scale ±j, shift ±0.2j). "
+                         "0.0=OFF (byte-identical). Use with --aug-views >1 to cache several views/eye.")
     ap.add_argument('--disc-half', type=float, default=None,
                     help="override DISC_HALF (crop half-size, fraction of W/H). 0.27=tight disc, "
                          "0.45=disc+macula ROI. Stored in the ckpt so eval crops identically.")
@@ -190,7 +194,7 @@ def main():
           f"{' +denoised' if a.denoised else ''}{' +disc_only' if a.disc_only else ''} …", flush=True)
     train_cache = cache_prefix(model, a.train_json, tr_tfm, n_passes=a.aug_views,
                                denoised_lookup=denoised_lookup, rnfl_lookup=rnfl_lookup,
-                               disc_only=a.disc_only)
+                               disc_only=a.disc_only, disc_jitter=a.disc_jitter)
     if a.rnfl_aux:
         _nr = sum(int(e.get('rnfl_mask', 0.0)) for e in train_cache)
         print(f"  M2: RNFL aux targets on {_nr}/{len(train_cache)} train views", flush=True)
