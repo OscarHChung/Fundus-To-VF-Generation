@@ -79,13 +79,15 @@ def _dinov2_prefix(backbone, imgs):
     return out
 
 
-def _load_dinov2_family(name):
+def _load_dinov2_family(name, input_size=224):
+    """DINOv2/v3 interpolate their position embeddings, so we run them at OUR pipeline resolution
+    (224, ImageNet-norm) for an apples-to-apples comparison with RETFound-MAE — NOT the model's
+    native cfg.image_size (dinov2-large is 518). Grid is therefore derived from 224, not the config."""
     from transformers import AutoModel
     hf_id = _HF_IDS[name]
     backbone = AutoModel.from_pretrained(hf_id)
     cfg = backbone.config
     dim = int(cfg.hidden_size)
-    input_size = int(getattr(cfg, "image_size", 224))
     patch = int(getattr(cfg, "patch_size", 14))
     g = input_size // patch
     return FrozenEncoder(backbone, grid=(g, g), dim=dim, input_size=input_size, prefix_fn=_dinov2_prefix)

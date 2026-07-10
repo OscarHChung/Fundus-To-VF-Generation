@@ -32,6 +32,24 @@ def test_encode_prefix_is_deterministic_and_nograd():
     assert not a.requires_grad
 
 
+def _try(name):
+    try:
+        return EN.load_encoder(name)
+    except Exception as e:                                    # gated repo / no weights / offline
+        pytest.skip(f"{name} unavailable: {type(e).__name__}: {e}")
+
+
+def test_dinov2_l_shapes_at_224():
+    """DINOv2 runs at OUR 224 pipeline resolution (interpolated pos-embed) -> 16x16 grid, D=1024,
+    with the CLS token first and register tokens (none for dinov2-large) dropped."""
+    enc = _try("dinov2_l")
+    assert enc.input_size == 224 and enc.grid == (16, 16) and enc.dim == 1024
+    x = torch.randn(2, 3, enc.input_size, enc.input_size)
+    h = enc.encode_prefix(x)
+    assert h.shape == (2, 1 + 16 * 16, 1024)
+    assert not h.requires_grad
+
+
 def test_retfound_mae_matches_training_encode():
     """default-identity guard: encoders' retfound_mae == training.PerPointVFModel._encode (frozen).
 
