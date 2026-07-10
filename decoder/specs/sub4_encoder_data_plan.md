@@ -294,3 +294,33 @@ by choice (re-openable later if HF access is granted — the loader + bake-off a
 --only retfound_dinov2 && --probe`). Moving to Phase B. Cheapest decisive remaining probe is actually
 **Task C1** (RNFL spatial-metadata partial-corr — numpy, minutes, no training) — run it before the B2
 training scouts per "cheapest decisive first," then B2.
+
+### Task C1 (DONE, DEAD) — RNFL spatial-metadata probe closes the metadata lever
+
+`diag_metadata_value.py --spatial` (leak-free per-point ridge: 4 RNFL sectors → true within-eye residual,
+fit per fold's train; then partial-corr vs true | fundus p1disc residual, patient-bootstrap). Result over
+631 eyes / 32,812 pts (RNFL coverage 94%):
+
+| quantity | value |
+|---|---|
+| raw corr(fundus_resid, true_resid) | +0.494 |
+| raw corr(RNFL_resid, true_resid) | +0.191 |
+| **PARTIAL corr(RNFL, true \| fundus)** | **+0.095**, 95% CI [+0.040, **+0.147**] |
+| incremental R² of RNFL over fundus | +0.0068 |
+
+**GATE (≥0.15) FAILED** (CI upper 0.147 < 0.15). RNFL's coarse 4-sector spatial signal (0.191) is almost
+entirely redundant with the disc-crop fundus (collapses to 0.095 once controlled). **Metadata is now CLOSED
+on BOTH channels** — severity (Diag B: ~0 dB) AND within-eye spatial (C1: 0.095). Strengthens the ceiling
+write-up ("fundus-only IS severity estimation, and clinical metadata adds neither severity nor pattern").
+Do NOT build a metadata-fusion head. Phase C done/dead.
+
+### Remaining open levers (post Session 5)
+- **Phase B/Task B2 — data-efficiency (NO new data):** two fold-0 training scouts (~40 min each, one torch
+  process): (1) VF-manifold decoder warm-start (init per-point head from `pretrained_vf_ae.pth`; gate:
+  fold-0 sev_corr +≥0.02); (2) disc-crop geometric augmentation (scale/shift jitter, NOT photometric;
+  gate: fold-0 MAE not worse → full-CV §6.5). Low prior EV (project sits near its fundus ceiling) but
+  pre-registered and cheap-ish. Each needs a default-OFF byte-identical flag + unit test before the scout.
+- **Phase B/Task B1 — more paired fundus+24-2 data:** the theoretically-indicated lever per D1
+  (data-limited). No compute, but a data-acquisition/harmonization project (web search → schema-match to
+  `MultiImageDataset` → pretrain pool, NEVER re-split cv_long → fine-tune + eval on cv_long).
+- **Phase D — longitudinal re-eval:** only fires AFTER a promoted fundus-branch improvement (none yet).

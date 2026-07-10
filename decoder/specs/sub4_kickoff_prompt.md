@@ -85,15 +85,22 @@ After every milestone (a gate decision, a promoted change, a killed idea):
   SSL < retinal MAE). **RETFound-DINOv2 + DINOv3 are GATED HF repos** (401, box has no HF token) → the top
   pick is UNTESTED. VisionFM has no local weights.
 
-## START HERE (next open task — decision-gated)
-The encoder lever is unresolved, not dead. Pick one:
-- **(a) Test the top pick** (if the user grants HF access / provides a token with the RETFound-DINOv2 +
-  DINOv3 license accepted): `python decoder/diag_encoder_bakeoff.py --cache --only retfound_dinov2` then
-  `--probe`; apply the same +0.03 sev / +0.05 spatial gate vs the in-run 0.724 / 0.176. If it clears →
-  Task A3 (integrate, fold-0 scout vs p1disc_f0 4.101, gated 5-fold + `paired_decision.py`).
-- **(b) Pivot to Phase B / Task B2** (data-efficiency without new data, no access needed): VF-manifold
-  decoder warm-start (gate: fold-0 sev_corr +≥0.02) and disc-crop geometric augmentation (gate: fold-0 MAE
-  not worse → full-CV §6.5). Both are cheap fold-0 scouts on the memory-tight box.
+## START HERE (Session 6 — Phase A CLOSED, Phase C DEAD; only Phase B remains)
+Session 5 closed the two cheap levers: **encoder** (generic DINOv2 worse; retinal-DINOv2 declined by the
+user → keep RETFound-MAE) and **metadata** (Task C1: RNFL spatial partial-corr 0.095 < 0.15 → dead on both
+severity AND spatial). Champion still **p1disc 4.113**; native <4.0 still NO. Remaining levers, both Phase B:
+- **Task B2 — data-efficiency, NO new data (next; needs no access):** two gated fold-0 training scouts
+  (~40 min each, ONE torch process): (1) VF-manifold decoder warm-start from `pretrained_vf_ae.pth` (gate:
+  fold-0 sev_corr +≥0.02); (2) disc-crop geometric augmentation — scale/shift jitter, NOT photometric
+  (gate: fold-0 MAE not worse → full-CV §6.5). Each: TDD a default-OFF byte-identical flag + unit test
+  BEFORE the scout. **Low prior EV** (project sits near its fundus ceiling — 3 of 4 levers now closed);
+  confirm with the user before spending the training hours.
+- **Task B1 — more paired fundus+24-2 data:** the lever D1 actually points at (data-limited). No compute,
+  but a data-acquisition/harmonization project (find open cohort → schema-match `MultiImageDataset` →
+  pretrain pool, NEVER re-split cv_long → fine-tune + eval on cv_long → re-run diag_d1 to confirm the curve
+  extends). Re-open the encoder lever only if the user grants HF access (loader + bake-off are ready).
+- If the user wants to STOP: the honest write-up is strong — see "What we will publish either way" (§6.6)
+  plus the composition floor (p1disc beats TDV-Net in all 3 strata) and the now-complete negative levers.
 
 ## Honesty mandate
 Report failures with the actual numbers. Distinguish "provably sub-noise/dead" from "not yet tested."
