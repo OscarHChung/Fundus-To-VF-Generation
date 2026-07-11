@@ -85,7 +85,26 @@ After every milestone (a gate decision, a promoted change, a killed idea):
   SSL < retinal MAE). **RETFound-DINOv2 + DINOv3 are GATED HF repos** (401, box has no HF token) → the top
   pick is UNTESTED. VisionFM has no local weights.
 
-## START HERE (Session 6 — Phase A CLOSED, Phase C DEAD; only Phase B remains)
+## Session 5 outcome (2026-07-11): 4 levers closed, champion UNCHANGED p1disc 4.113
+Encoder (generic DINOv2 worse; retinal declined) · metadata (dead both channels) · **disc-crop jitter
+`--disc-jitter` full 5-fold CV = 4.060, DO NOT PROMOTE** (−0.053 vs p1disc, sub-threshold + CI incl 0; the
+fold-0 −0.109 washed to −0.053 = the M2 dilution, exactly as pre-flagged; it DOES improve severe −0.345 &
+slope 0.572 but not past the §6.5 gate). Native <4.0 still decisively NO. Every cheap+medium fundus-only
+lever is now exhausted with an honest negative — the ceiling write-up (§6.6) is the strongest deliverable.
+
+## START HERE (Session 6 — only high-cost levers remain)
+- **Task B2b — VF-manifold decoder warm-start:** architecturally fuzzy (the per-point `SharedPointHead`
+  2048→scalar does NOT shape-match the VF-AE decoder 64→52; needs a real design, not a weight copy). Low
+  prior. If attempted, gate: fold-0 sev_corr +≥0.02.
+- **Task B1 — more paired fundus+24-2 data:** the only lever D1 still endorses (data-limited). No compute
+  but a data-acquisition project; highest ceiling, highest effort.
+- **Re-open encoder** if the user grants HF access (loader + `diag_encoder_bakeoff.py` ready): test the
+  retinal RETFound-DINOv2 — the one genuinely-untested top pick.
+- **Or WRITE UP** the ceiling result (recommended if no new data/access): fundus-only IS severity
+  estimation; metadata adds nothing; generic encoders lose to retinal; disc-crop is the best lever
+  (composition floor beats TDV-Net in all 3 strata); every sub-4.0 attempt hits the noise/data ceiling.
+
+## (historical) Session-5 START HERE — Phase A CLOSED, Phase C DEAD; Phase B was next
 Session 5 closed the two cheap levers: **encoder** (generic DINOv2 worse; retinal-DINOv2 declined by the
 user → keep RETFound-MAE) and **metadata** (Task C1: RNFL spatial partial-corr 0.095 < 0.15 → dead on both
 severity AND spatial). Champion still **p1disc 4.113**; native <4.0 still NO. Remaining levers, both Phase B:

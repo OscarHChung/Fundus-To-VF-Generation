@@ -339,6 +339,25 @@ the harness `run_in_background` (which gets reaped ~E03) and NOT `setsid` (absen
 ONE `train_lora_cached` proc before each launch — overlapping torch procs OOM the box AND corrupt the shared
 log (cost this session 4 false-OOM attempts before the root cause — concurrency, not aug memory — was found).
 
+**B2a FULL CV — RESOLVED: DO NOT PROMOTE (sub-threshold, the M2 dilution replayed).** All 5 jit folds
+trained (nohup, batch 12, after the box RAM recovered). Pooled no-TTA OOF (631 recs) via
+`eval_oof_cached --tag p1disc_jit --no-tta`:
+
+| comparison | pooled ΔMAE | CI (95%) | folds − | severe ΔMAE (CI upper) | slope | §6.5 |
+|---|---|---|---|---|---|---|
+| **p1disc_jit 4.060 vs p1disc 4.113** | **−0.053** | [−0.138, **+0.025**] | 4/5 | −0.345 (+0.004) | 0.572>0.536 | **✗ pooled & CI** |
+| p1disc_jit 4.060 vs m1sev 4.259 | −0.199 | [−0.335, −0.065] | 5/5 | −0.278 (**+0.187**) | 0.572>0.527 | ✗ severe CI only |
+
+Per-fold Δ vs p1disc: f0 −0.109, f1 **+0.047**, f2 −0.112, f3 −0.062, f4 −0.041. The fold-0 −0.109 (the
+scout) **diluted to −0.053 pooled** — exactly the M2 failure mode (one fold, f1, went the other way). vs
+p1disc it fails the primary pooled gate (−0.053, not ≤ −0.12; CI includes 0, P(Δ≥0)=0.10). vs m1sev it
+clears pooled/CI/folds/slope but is blocked by the **same noise-dominated severe-band CI wall** (+0.187) that
+blocked p1disc. **Champion UNCHANGED: p1disc 4.113** (do not move the goalpost). Native <4.0 still NO
+(4.060, CI upper 4.404). Notes: jitter DOES improve severe (point −0.345/−0.278), slope (0.536→0.572), corr,
+and yields the numerically-lowest fundus-only pooled (4.060) — a real but sub-promotion gain. Best epochs
+were often very early (f1/f4 = ep3) → the gain is partly early-stop regularization, not augmentation signal.
+`--disc-jitter` code committed + tested; checkpoints `p1disc_jit_f{0..4}` on disk (not git).
+
 **Full-CV attempt BLOCKED by box memory degradation (Session 5).** Fold-0 completed (3.992) when the box
 was fresh (83% free). After the session's cumulative training load the box degraded to **free 0.1 GB /
 compressed 5.6 GB / wired 4.2 GB** — only ~2.7 GB reclaimable vs the ~5 GB a fold needs — so **fold-1 was
