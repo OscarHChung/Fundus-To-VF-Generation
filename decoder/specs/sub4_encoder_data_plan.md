@@ -314,6 +314,31 @@ on BOTH channels** — severity (Diag B: ~0 dB) AND within-eye spatial (C1: 0.09
 write-up ("fundus-only IS severity estimation, and clinical metadata adds neither severity nor pattern").
 Do NOT build a metadata-fusion head. Phase C done/dead.
 
+### Task B2a (DONE fold-0, PASSES gate → full CV pending) — disc-crop geometric jitter
+
+`--disc-jitter 0.15 --aug-views 2` (train-only stochastic scale ±j / shift ±0.2j on the disc crop;
+default OFF byte-identical, 15/15 tests). Fold-0 honest no-TTA eval (`eval_ckpt`, both best-epoch
+selected, fixed-crop val):
+
+| stratum (n) | champion p1disc_f0 | jitter p1disc_jit_f0 | Δ |
+|---|---|---|---|
+| pooled (109) | 4.101 | **3.992** | **−0.109** |
+| severe (24) | 7.528 | **7.287** | −0.241 |
+| moderate (24) | 4.844 | 4.637 | −0.207 |
+| mild (61) | 2.461 | 2.442 | −0.019 |
+| slope / corr | 0.588 / 0.745 | 0.589 / 0.756 | +0.001 / +0.011 |
+
+**PASSES the fold-0 scout gate cleanly** (better on ALL strata incl. severe; slope not worse) — the first
+lever this session to beat the champion. **Caveats:** single fold; −0.109 ≈ the 0.12 MDE; bias rose
++0.13→+0.69 (systematic upward shift, may be fold-specific); best epoch early (ep16, val then regressed to
+~4.15) so selection may be optimistic. Per §6.5 a single fold can KILL not PROMOTE → **full 5-fold CV +
+`paired_decision.py` is the pending decision** (~4.5 hr: folds 1–4 via nohup, one at a time).
+
+**Execution lesson (hard-won):** long trainings MUST be launched **detached with `nohup … & disown`**, NOT
+the harness `run_in_background` (which gets reaped ~E03) and NOT `setsid` (absent on macOS). Verify exactly
+ONE `train_lora_cached` proc before each launch — overlapping torch procs OOM the box AND corrupt the shared
+log (cost this session 4 false-OOM attempts before the root cause — concurrency, not aug memory — was found).
+
 ### Remaining open levers (post Session 5)
 - **Phase B/Task B2 — data-efficiency (NO new data):** two fold-0 training scouts (~40 min each, one torch
   process): (1) VF-manifold decoder warm-start (init per-point head from `pretrained_vf_ae.pth`; gate:
