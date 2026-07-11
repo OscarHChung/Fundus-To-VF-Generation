@@ -339,6 +339,16 @@ the harness `run_in_background` (which gets reaped ~E03) and NOT `setsid` (absen
 ONE `train_lora_cached` proc before each launch — overlapping torch procs OOM the box AND corrupt the shared
 log (cost this session 4 false-OOM attempts before the root cause — concurrency, not aug memory — was found).
 
+**Full-CV attempt BLOCKED by box memory degradation (Session 5).** Fold-0 completed (3.992) when the box
+was fresh (83% free). After the session's cumulative training load the box degraded to **free 0.1 GB /
+compressed 5.6 GB / wired 4.2 GB** — only ~2.7 GB reclaimable vs the ~5 GB a fold needs — so **fold-1 was
+OOM-killed at E22** (best-so-far ep14 = 4.051 saved, but incomplete/unfair). Remaining folds will OOM the
+same way until the box RAM recovers (reboot/logout, or run in a fresh terminal without the session's
+overhead). p1disc_jit_f1_best.pth is a partial 22-epoch ckpt — do NOT use it in the CV. **To finish the CV:
+run folds 1–4 fresh (`nohup … --disc-jitter 0.15 --aug-views 2 --batch-size 12 … --warm-start
+long_global_f{f}` per fold, ONE at a time), then `eval_oof_cached.py --tag p1disc_jit --no-tta --cache-dir
+results/auto/oof_cache_notta` + `paired_decision.py --new p1disc_jit --ref p1disc`.**
+
 ### Remaining open levers (post Session 5)
 - **Phase B/Task B2 — data-efficiency (NO new data):** two fold-0 training scouts (~40 min each, one torch
   process): (1) VF-manifold decoder warm-start (init per-point head from `pretrained_vf_ae.pth`; gate:
