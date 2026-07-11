@@ -224,6 +224,17 @@ The DATA lever therefore requires a **data-access request or collaboration**, ra
 a *pretraining* pool then fine-tune on cv_long, never re-split); (2) **Harvard AI Lab collaboration** (largest
 by far); (3) **email TDV-Net authors** for their cohort. None is a quick win; all are weeks-scale acquisition.
 
+**UPDATE — HARD CONSTRAINT (user): free-download-only, no requests/DUAs/collaborations.** This EXCLUDES OHTS,
+Harvard, and TDV-Net (all requests). Under it the paired-data lever is **CLOSED**: **GRAPE (ours) is the only
+freely-downloadable fundus + per-point-24-2 dataset.** The only free data that touches the pipeline is
+**VF-only** — Rotterdam ROD-Rep (`rodrep.com`, 5,108 24-2 fields, 139 glauc + 22 healthy) — which can only
+grow the VF-manifold AE (UWHVF already 29k; the manifold does NOT drive the encoder→VF gain → **low EV**).
+Fundus+label-only sets (SMDG-19, AIROGS 100k, ORIGA/REFUGE/RIM-ONE/DRISHTI-GS/Leuven-Haifa; PAPILA = MD-only)
+cannot train the 52-point decoder, and the encoder is not our lever (A2 bake-off). **Verdict: with
+free-download data only, "more paired data" is unachievable → all four sub-4.0 levers are closed under our
+constraints → the ceiling write-up (§6.6) is the deliverable.** (Optional low-EV: fold Rotterdam into the
+VF-AE and re-check the longitudinal prior — cheap, but our own diagnostics say the manifold isn't the lever.)
+
 ### Task B2: Data-efficiency without new data
 **Objective:** Squeeze more from 144 patients (what a data-limited regime rewards).
 - [ ] Decoder warm-start from the VF-manifold: already have `pretrained_vf_ae.pth`; test initializing the
