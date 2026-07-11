@@ -1,0 +1,1314 @@
+[
+  {
+    "eye_id": "papila_RET002OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET002OD.jpg",
+    "Laterality": "OD",
+    "md": -0.07,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET004OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET004OD.jpg",
+    "Laterality": "OD",
+    "md": -3.26,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET005OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET005OD.jpg",
+    "Laterality": "OD",
+    "md": -14.98,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET006OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET006OD.jpg",
+    "Laterality": "OD",
+    "md": -2.07,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET007OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET007OD.jpg",
+    "Laterality": "OD",
+    "md": -2.3,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET008OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET008OD.jpg",
+    "Laterality": "OD",
+    "md": -0.28,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET009OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET009OD.jpg",
+    "Laterality": "OD",
+    "md": -3.69,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET010OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET010OD.jpg",
+    "Laterality": "OD",
+    "md": -12.58,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET013OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET013OD.jpg",
+    "Laterality": "OD",
+    "md": -14.24,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET014OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET014OD.jpg",
+    "Laterality": "OD",
+    "md": -11.37,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET015OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET015OD.jpg",
+    "Laterality": "OD",
+    "md": -12.52,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET016OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET016OD.jpg",
+    "Laterality": "OD",
+    "md": -3.27,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET018OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET018OD.jpg",
+    "Laterality": "OD",
+    "md": -0.24,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET019OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET019OD.jpg",
+    "Laterality": "OD",
+    "md": -6.14,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET020OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET020OD.jpg",
+    "Laterality": "OD",
+    "md": -3.03,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET021OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET021OD.jpg",
+    "Laterality": "OD",
+    "md": -2.65,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET023OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET023OD.jpg",
+    "Laterality": "OD",
+    "md": -30.15,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET024OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET024OD.jpg",
+    "Laterality": "OD",
+    "md": 1.55,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET025OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET025OD.jpg",
+    "Laterality": "OD",
+    "md": -3.06,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET026OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET026OD.jpg",
+    "Laterality": "OD",
+    "md": 0.73,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET027OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET027OD.jpg",
+    "Laterality": "OD",
+    "md": -0.09,
+    "label": "healthy",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET041OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET041OD.jpg",
+    "Laterality": "OD",
+    "md": -0.66,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET042OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET042OD.jpg",
+    "Laterality": "OD",
+    "md": -0.35,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET044OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET044OD.jpg",
+    "Laterality": "OD",
+    "md": -6.8,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET045OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET045OD.jpg",
+    "Laterality": "OD",
+    "md": 0.67,
+    "label": "healthy",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET046OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET046OD.jpg",
+    "Laterality": "OD",
+    "md": -1.02,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET047OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET047OD.jpg",
+    "Laterality": "OD",
+    "md": -8.02,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET048OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET048OD.jpg",
+    "Laterality": "OD",
+    "md": -13.74,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET050OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET050OD.jpg",
+    "Laterality": "OD",
+    "md": -10.04,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET051OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET051OD.jpg",
+    "Laterality": "OD",
+    "md": -21.36,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET053OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET053OD.jpg",
+    "Laterality": "OD",
+    "md": -1.99,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET055OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET055OD.jpg",
+    "Laterality": "OD",
+    "md": -8.68,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET056OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET056OD.jpg",
+    "Laterality": "OD",
+    "md": -0.53,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET057OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET057OD.jpg",
+    "Laterality": "OD",
+    "md": 0.7,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET062OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET062OD.jpg",
+    "Laterality": "OD",
+    "md": -3.54,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET064OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET064OD.jpg",
+    "Laterality": "OD",
+    "md": -14.22,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET065OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET065OD.jpg",
+    "Laterality": "OD",
+    "md": -8.11,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET066OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET066OD.jpg",
+    "Laterality": "OD",
+    "md": -1.0,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET067OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET067OD.jpg",
+    "Laterality": "OD",
+    "md": -2.11,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET068OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET068OD.jpg",
+    "Laterality": "OD",
+    "md": -1.78,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET069OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET069OD.jpg",
+    "Laterality": "OD",
+    "md": -0.25,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET072OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET072OD.jpg",
+    "Laterality": "OD",
+    "md": -1.09,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET073OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET073OD.jpg",
+    "Laterality": "OD",
+    "md": -0.35,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET074OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET074OD.jpg",
+    "Laterality": "OD",
+    "md": -20.28,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET077OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET077OD.jpg",
+    "Laterality": "OD",
+    "md": -3.35,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET079OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET079OD.jpg",
+    "Laterality": "OD",
+    "md": -3.87,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET081OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET081OD.jpg",
+    "Laterality": "OD",
+    "md": 0.54,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET084OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET084OD.jpg",
+    "Laterality": "OD",
+    "md": -2.07,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET087OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET087OD.jpg",
+    "Laterality": "OD",
+    "md": -2.62,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET088OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET088OD.jpg",
+    "Laterality": "OD",
+    "md": -6.32,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET089OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET089OD.jpg",
+    "Laterality": "OD",
+    "md": -2.42,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET090OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET090OD.jpg",
+    "Laterality": "OD",
+    "md": -4.31,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET091OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET091OD.jpg",
+    "Laterality": "OD",
+    "md": -1.32,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET092OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET092OD.jpg",
+    "Laterality": "OD",
+    "md": -2.36,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET093OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET093OD.jpg",
+    "Laterality": "OD",
+    "md": -2.89,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET096OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET096OD.jpg",
+    "Laterality": "OD",
+    "md": 0.9,
+    "label": "healthy",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET098OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET098OD.jpg",
+    "Laterality": "OD",
+    "md": 0.51,
+    "label": "healthy",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET101OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET101OD.jpg",
+    "Laterality": "OD",
+    "md": 0.43,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET102OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET102OD.jpg",
+    "Laterality": "OD",
+    "md": 0.58,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET104OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET104OD.jpg",
+    "Laterality": "OD",
+    "md": 0.95,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET105OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET105OD.jpg",
+    "Laterality": "OD",
+    "md": -3.14,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET106OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET106OD.jpg",
+    "Laterality": "OD",
+    "md": 0.03,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET107OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET107OD.jpg",
+    "Laterality": "OD",
+    "md": 0.11,
+    "label": "healthy",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET108OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET108OD.jpg",
+    "Laterality": "OD",
+    "md": -5.78,
+    "label": "healthy",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET112OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET112OD.jpg",
+    "Laterality": "OD",
+    "md": 0.05,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET113OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET113OD.jpg",
+    "Laterality": "OD",
+    "md": -2.51,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET114OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET114OD.jpg",
+    "Laterality": "OD",
+    "md": -3.72,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET116OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET116OD.jpg",
+    "Laterality": "OD",
+    "md": -1.69,
+    "label": "healthy",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET119OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET119OD.jpg",
+    "Laterality": "OD",
+    "md": -2.89,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET120OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET120OD.jpg",
+    "Laterality": "OD",
+    "md": -0.28,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET121OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET121OD.jpg",
+    "Laterality": "OD",
+    "md": -5.24,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET122OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET122OD.jpg",
+    "Laterality": "OD",
+    "md": 0.84,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET123OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET123OD.jpg",
+    "Laterality": "OD",
+    "md": 0.29,
+    "label": "healthy",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET124OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET124OD.jpg",
+    "Laterality": "OD",
+    "md": -9.24,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET180OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET180OD.jpg",
+    "Laterality": "OD",
+    "md": 0.95,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET193OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET193OD.jpg",
+    "Laterality": "OD",
+    "md": -1.95,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET195OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET195OD.jpg",
+    "Laterality": "OD",
+    "md": -2.84,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET233OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET233OD.jpg",
+    "Laterality": "OD",
+    "md": -2.74,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET248OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET248OD.jpg",
+    "Laterality": "OD",
+    "md": -4.83,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET264OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET264OD.jpg",
+    "Laterality": "OD",
+    "md": -0.34,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET265OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET265OD.jpg",
+    "Laterality": "OD",
+    "md": -24.87,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET276OD",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET276OD.jpg",
+    "Laterality": "OD",
+    "md": 1.05,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET002OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET002OS.jpg",
+    "Laterality": "OS",
+    "md": 0.17,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET004OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET004OS.jpg",
+    "Laterality": "OS",
+    "md": -6.77,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET005OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET005OS.jpg",
+    "Laterality": "OS",
+    "md": -7.44,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET006OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET006OS.jpg",
+    "Laterality": "OS",
+    "md": -3.31,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET007OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET007OS.jpg",
+    "Laterality": "OS",
+    "md": -2.61,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET008OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET008OS.jpg",
+    "Laterality": "OS",
+    "md": 0.97,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET009OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET009OS.jpg",
+    "Laterality": "OS",
+    "md": -3.37,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET010OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET010OS.jpg",
+    "Laterality": "OS",
+    "md": -11.44,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET013OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET013OS.jpg",
+    "Laterality": "OS",
+    "md": -7.75,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET014OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET014OS.jpg",
+    "Laterality": "OS",
+    "md": -4.65,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET015OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET015OS.jpg",
+    "Laterality": "OS",
+    "md": -27.02,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET016OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET016OS.jpg",
+    "Laterality": "OS",
+    "md": -0.97,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET018OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET018OS.jpg",
+    "Laterality": "OS",
+    "md": -1.6,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET019OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET019OS.jpg",
+    "Laterality": "OS",
+    "md": -19.99,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET020OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET020OS.jpg",
+    "Laterality": "OS",
+    "md": -4.74,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET021OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET021OS.jpg",
+    "Laterality": "OS",
+    "md": -0.14,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET023OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET023OS.jpg",
+    "Laterality": "OS",
+    "md": -30.47,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET024OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET024OS.jpg",
+    "Laterality": "OS",
+    "md": 0.54,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET025OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET025OS.jpg",
+    "Laterality": "OS",
+    "md": -23.31,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET026OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET026OS.jpg",
+    "Laterality": "OS",
+    "md": -0.21,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET027OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET027OS.jpg",
+    "Laterality": "OS",
+    "md": -4.01,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET041OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET041OS.jpg",
+    "Laterality": "OS",
+    "md": -1.99,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET042OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET042OS.jpg",
+    "Laterality": "OS",
+    "md": 0.76,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET044OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET044OS.jpg",
+    "Laterality": "OS",
+    "md": -2.02,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET045OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET045OS.jpg",
+    "Laterality": "OS",
+    "md": -13.66,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET046OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET046OS.jpg",
+    "Laterality": "OS",
+    "md": -0.58,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET047OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET047OS.jpg",
+    "Laterality": "OS",
+    "md": -2.99,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET048OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET048OS.jpg",
+    "Laterality": "OS",
+    "md": -2.64,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET050OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET050OS.jpg",
+    "Laterality": "OS",
+    "md": 0.17,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET051OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET051OS.jpg",
+    "Laterality": "OS",
+    "md": -1.71,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET053OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET053OS.jpg",
+    "Laterality": "OS",
+    "md": -0.9,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET055OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET055OS.jpg",
+    "Laterality": "OS",
+    "md": -6.05,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET056OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET056OS.jpg",
+    "Laterality": "OS",
+    "md": -2.54,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET057OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET057OS.jpg",
+    "Laterality": "OS",
+    "md": -1.53,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET062OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET062OS.jpg",
+    "Laterality": "OS",
+    "md": -2.33,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET064OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET064OS.jpg",
+    "Laterality": "OS",
+    "md": -3.31,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET065OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET065OS.jpg",
+    "Laterality": "OS",
+    "md": -0.13,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET066OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET066OS.jpg",
+    "Laterality": "OS",
+    "md": -2.98,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET067OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET067OS.jpg",
+    "Laterality": "OS",
+    "md": -4.05,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET068OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET068OS.jpg",
+    "Laterality": "OS",
+    "md": -5.21,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET069OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET069OS.jpg",
+    "Laterality": "OS",
+    "md": -2.84,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET072OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET072OS.jpg",
+    "Laterality": "OS",
+    "md": -1.8,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET073OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET073OS.jpg",
+    "Laterality": "OS",
+    "md": -1.06,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET074OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET074OS.jpg",
+    "Laterality": "OS",
+    "md": -4.62,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET077OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET077OS.jpg",
+    "Laterality": "OS",
+    "md": -1.74,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET079OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET079OS.jpg",
+    "Laterality": "OS",
+    "md": -2.77,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET081OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET081OS.jpg",
+    "Laterality": "OS",
+    "md": -2.04,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET084OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET084OS.jpg",
+    "Laterality": "OS",
+    "md": -2.69,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET087OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET087OS.jpg",
+    "Laterality": "OS",
+    "md": -9.17,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET088OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET088OS.jpg",
+    "Laterality": "OS",
+    "md": -9.63,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET089OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET089OS.jpg",
+    "Laterality": "OS",
+    "md": -1.31,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET090OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET090OS.jpg",
+    "Laterality": "OS",
+    "md": -1.4,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET091OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET091OS.jpg",
+    "Laterality": "OS",
+    "md": 0.16,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET092OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET092OS.jpg",
+    "Laterality": "OS",
+    "md": -3.62,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET093OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET093OS.jpg",
+    "Laterality": "OS",
+    "md": -1.52,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET096OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET096OS.jpg",
+    "Laterality": "OS",
+    "md": -19.63,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET098OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET098OS.jpg",
+    "Laterality": "OS",
+    "md": -6.08,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET101OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET101OS.jpg",
+    "Laterality": "OS",
+    "md": -0.79,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET102OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET102OS.jpg",
+    "Laterality": "OS",
+    "md": -1.06,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET104OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET104OS.jpg",
+    "Laterality": "OS",
+    "md": 0.22,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET105OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET105OS.jpg",
+    "Laterality": "OS",
+    "md": -6.75,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET106OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET106OS.jpg",
+    "Laterality": "OS",
+    "md": 0.28,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET107OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET107OS.jpg",
+    "Laterality": "OS",
+    "md": -4.78,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET108OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET108OS.jpg",
+    "Laterality": "OS",
+    "md": -4.79,
+    "label": "healthy",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET112OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET112OS.jpg",
+    "Laterality": "OS",
+    "md": -1.4,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET113OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET113OS.jpg",
+    "Laterality": "OS",
+    "md": -1.9,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET114OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET114OS.jpg",
+    "Laterality": "OS",
+    "md": -1.84,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET116OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET116OS.jpg",
+    "Laterality": "OS",
+    "md": -10.36,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET119OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET119OS.jpg",
+    "Laterality": "OS",
+    "md": -3.75,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET120OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET120OS.jpg",
+    "Laterality": "OS",
+    "md": -0.86,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET121OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET121OS.jpg",
+    "Laterality": "OS",
+    "md": -1.97,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET122OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET122OS.jpg",
+    "Laterality": "OS",
+    "md": 0.03,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET123OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET123OS.jpg",
+    "Laterality": "OS",
+    "md": -22.69,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET124OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET124OS.jpg",
+    "Laterality": "OS",
+    "md": -5.3,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET180OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET180OS.jpg",
+    "Laterality": "OS",
+    "md": 1.06,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET193OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET193OS.jpg",
+    "Laterality": "OS",
+    "md": -2.66,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET195OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET195OS.jpg",
+    "Laterality": "OS",
+    "md": 1.55,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET233OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET233OS.jpg",
+    "Laterality": "OS",
+    "md": -1.05,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET248OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET248OS.jpg",
+    "Laterality": "OS",
+    "md": -14.72,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET264OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET264OS.jpg",
+    "Laterality": "OS",
+    "md": -0.81,
+    "label": "suspect",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET265OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET265OS.jpg",
+    "Laterality": "OS",
+    "md": -1.11,
+    "label": "glaucoma",
+    "source": "papila"
+  },
+  {
+    "eye_id": "papila_RET276OS",
+    "image": "/Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/data/external/papila/PapilaDB-PAPILA-17f8fa7746adb20275b5b6a0d99dc9dfe3007e9f/FundusImages/RET276OS.jpg",
+    "Laterality": "OS",
+    "md": 1.19,
+    "label": "suspect",
+    "source": "papila"
+  }
+]

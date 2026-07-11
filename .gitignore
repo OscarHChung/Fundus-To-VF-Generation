@@ -4,6 +4,11 @@ data/*.pt
 decoder/*.pth
 encoder/*.pth
 
+# PAPILA raw download (zip + extracted images/spreadsheets) -- see data/external/papila/SOURCE.md
+# Only the harmonized data/external/papila_records.json + SOURCE.md are tracked.
+data/external/papila/*
+!data/external/papila/SOURCE.md
+
 # Python bytecode
 __pycache__/
 *.pyc
