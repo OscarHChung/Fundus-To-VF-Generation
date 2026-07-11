@@ -19,6 +19,7 @@ Backbones
 Memory rule: exactly one torch process at a time; every backbone is frozen + .eval().
 """
 import os
+import sys
 import torch
 import torch.nn as nn
 
@@ -28,6 +29,11 @@ _HF_IDS = {
     "dinov3_l":        "facebook/dinov3-vitl16-pretrain-lvd1689m",
     "retfound_dinov2": "YukunZhou/RETFound_dinov2_meh",
 }
+
+# encoder/RETFound_MAE/util/pos_embed.py — needed to regenerate the sin-cos pos-embed at a
+# non-224 grid (see _mae_prefix below). Added to sys.path lazily (not at import time) so this
+# module stays cheap to import when only the DINOv2/VisionFM backbones are needed.
+_RETFOUND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "encoder", "RETFound_MAE")
 
 
 class FrozenEncoder(nn.Module):
@@ -44,18 +50,44 @@ class FrozenEncoder(nn.Module):
             p.requires_grad_(False)
 
     @torch.no_grad()
-    def encode_prefix(self, imgs):
-        """(B,3,H,W) -> (B, 1+gh*gw, D). CLS/first token at index 0, then row-major patch tokens."""
-        return self._prefix_fn(self.backbone, imgs)
+    def encode_prefix(self, imgs, input_size=224):
+        """(B,3,H,W) -> (B, 1+gh*gw, D). CLS/first token at index 0, then row-major patch tokens.
+
+        input_size selects the patch grid to run the (RETFound-MAE) forward at; the default 224
+        reproduces the original fixed-224 forward byte-for-byte (see _mae_prefix). Other backbones
+        currently ignore this kwarg and always run at their configured `self.input_size`."""
+        return self._prefix_fn(self.backbone, imgs, input_size)
 
 
 # ----------------------------------------------------------------------------- RETFound-MAE
-def _mae_prefix(backbone, imgs):
-    """Frozen ViT-L/16 forward, byte-identical to training.PerPointVFModel._encode (frozen branch):
-    patch-embed, add pos-embed, prepend (cls + pos), all 24 blocks, then enc.norm. No random_masking."""
-    h = backbone.patch_embed(imgs)
-    h = h + backbone.pos_embed[:, 1:, :]
-    cls = (backbone.cls_token + backbone.pos_embed[:, :1, :]).expand(h.shape[0], -1, -1)
+def _mae_prefix(backbone, imgs, input_size=224):
+    """Frozen ViT-L/16 forward, byte-identical to training.PerPointVFModel._encode (frozen branch)
+    AT input_size==224 (the default): patch-embed, add pos-embed, prepend (cls + pos), all 24
+    blocks, then enc.norm. No random_masking. This 224 branch is UNCHANGED from before high-res
+    support was added — test_default_224_byte_identical (decoder/tests_bakeoff_highres.py) guards it.
+
+    For input_size != 224, timm's PatchEmbed.forward hard-asserts H==img_size, so we bypass it:
+    run the inner Conv2d projection directly (kernel16/stride16 — works at any size divisible by
+    16) and regenerate the sin-cos positional embedding at the new grid via get_2d_sincos_pos_embed.
+    Every other op mirrors the 224 forward exactly (same cls-token handling, same blocks, same norm)."""
+    if input_size == 224:
+        h = backbone.patch_embed(imgs)
+        h = h + backbone.pos_embed[:, 1:, :]
+        cls = (backbone.cls_token + backbone.pos_embed[:, :1, :]).expand(h.shape[0], -1, -1)
+        h = torch.cat((cls, h), dim=1)
+        for blk in backbone.blocks:
+            h = blk(h)
+        return backbone.norm(h)
+    if _RETFOUND_DIR not in sys.path:
+        sys.path.insert(0, _RETFOUND_DIR)
+    from util.pos_embed import get_2d_sincos_pos_embed
+    h = backbone.patch_embed.proj(imgs).flatten(2).transpose(1, 2)      # (B, P, D); Conv2d k16/s16
+    grid_size = input_size // 16
+    embed_dim = backbone.pos_embed.shape[-1]
+    pos = get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=True)  # (1+P, D) numpy, float32
+    pos = torch.from_numpy(pos).float().unsqueeze(0).to(device=h.device, dtype=h.dtype)  # (1,1+P,D)
+    h = h + pos[:, 1:, :]
+    cls = (backbone.cls_token + pos[:, :1, :]).expand(h.shape[0], -1, -1)
     h = torch.cat((cls, h), dim=1)
     for blk in backbone.blocks:
         h = blk(h)
@@ -69,9 +101,11 @@ def _load_retfound_mae():
 
 
 # ----------------------------------------------------------------------------- DINOv2 family
-def _dinov2_prefix(backbone, imgs):
+def _dinov2_prefix(backbone, imgs, input_size=224):
     """HF Dinov2/Dinov3 model -> (B, 1+P, D). last_hidden_state is [CLS, (registers), patches];
-    drop any register tokens so the output is exactly [CLS] + gh*gw row-major patch tokens."""
+    drop any register tokens so the output is exactly [CLS] + gh*gw row-major patch tokens.
+    input_size is accepted-and-ignored (ONLY the RETFound-MAE prefix honours it): DINOv2/DINOv3
+    always run at whatever resolution the loader configured (see _load_dinov2_family)."""
     n_reg = int(getattr(backbone.config, "num_register_tokens", 0) or 0)
     out = backbone(pixel_values=imgs).last_hidden_state          # (B, 1+n_reg+P, D)
     if n_reg > 0:
@@ -106,7 +140,7 @@ def _load_visionfm():
     state = state.get("model", state.get("teacher", state))
     backbone.load_state_dict({k.replace("backbone.", ""): v for k, v in state.items()}, strict=False)
 
-    def _prefix(bb, imgs):
+    def _prefix(bb, imgs, input_size=224):
         h = bb.patch_embed(imgs)
         cls = bb.cls_token.expand(h.shape[0], -1, -1)
         h = torch.cat((cls, h), dim=1) + bb.pos_embed
