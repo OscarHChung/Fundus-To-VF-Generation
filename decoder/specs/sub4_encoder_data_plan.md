@@ -202,6 +202,28 @@ VF-only so it can only pretrain the VF-manifold, not the encoder→VF map).
   re-split cv_long), pretrain the decoder, then fine-tune + eval on cv_long. Re-run `diag_d1` to confirm
   the curve extends.
 
+**B1 DATA SURVEY (Session 5, 2026-07-11, live web search) — the per-point VF is the bottleneck.** Our
+decoder needs paired *color-fundus + per-point 24-2 VF (52 values)*; nearly every public release gives only
+MD/labels. Findings:
+
+| dataset | paired fundus + per-point 24-2 VF? | access | verdict for us |
+|---|---|---|---|
+| **GRAPE** (ours) | yes (52-pt HVF) | Figshare, public | already used |
+| **PAPILA** (Nat Sci Data 2022, figshare 14798004) | fundus disc-centered + OD/OS, **but VF = MD only**, 30-2, subset of 244 pts | public CC-BY | **NOT usable** (no per-point VF) |
+| **HYGD** (PhysioNet 2026) | 747 fundus + GON labels only, **no VF, no laterality** | public ODC-BY | **NOT usable** |
+| **MLEDL / Zhejiang** (npj Dig Med 2025) | fundus + **Octopus-900 59-pt (not 24-2)**; public portion **= GRAPE** | private, request authors | redundant + wrong grid |
+| **TDV-Net cohort** (Graefe's 2026) | 31k fundus + 24-2 (per-point) | **private**, request Korean authors | requestable, uncertain |
+| **Harvard GRN / Mass Eye&Ear** (ophai.hms.harvard.edu) | 602k 24-2 VFs + 1.9M fundus | **consortium/DUA only** | needs collaboration/agreement |
+| **OHTS** (NEI, dbGaP phs000240) | **stereoscopic disc photos + 24-2 per-point VF**, longitudinal, 1,636 pts | **NIH controlled-access request** | **best requestable fit** (disc-centered!) but FILM stereo photos (domain gap vs digital CFP) + ocular-HTN case-mix (mostly mild) |
+| UK Biobank | fundus yes, **no HVF 24-2** | fee | not paired |
+| UWHVF (ours) | VF-only | public | VF-manifold pretrain only |
+
+**Conclusion:** there is **no new instant-download public** paired fundus+per-point-24-2 dataset beyond GRAPE.
+The DATA lever therefore requires a **data-access request or collaboration**, ranked: (1) **OHTS via dbGaP**
+(concrete, disc-centered, per-point 24-2; caveats: film stereo photos → RETFound OOD, mild case-mix; use as
+a *pretraining* pool then fine-tune on cv_long, never re-split); (2) **Harvard AI Lab collaboration** (largest
+by far); (3) **email TDV-Net authors** for their cohort. None is a quick win; all are weeks-scale acquisition.
+
 ### Task B2: Data-efficiency without new data
 **Objective:** Squeeze more from 144 patients (what a data-limited regime rewards).
 - [ ] Decoder warm-start from the VF-manifold: already have `pretrained_vf_ae.pth`; test initializing the
