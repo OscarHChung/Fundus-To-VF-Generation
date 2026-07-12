@@ -31,41 +31,25 @@ def apply_calib(preds, mu_p, mu_t, b):
     return [np.clip(mu_t + b * (p - mu_p), 0, 35) for p in preds]
 
 
-def solve_tdv_consistent_mix(target_severe):
-    """mild/moderate split (severe fixed at target_severe) that reproduces TDV-Net's reported
-    pooled 3.91 from THEIR per-band MAEs: TDV_MILD*mild + TDV_MODERATE*moderate +
-    TDV_SEVERE*target_severe = TDV_POOLED, with mild + moderate = 1 - target_severe."""
-    a = TDV_MILD - TDV_MODERATE
-    rhs = TDV_POOLED - TDV_MODERATE * (1 - target_severe) - TDV_SEVERE * target_severe
-    mild = rhs / a
-    moderate = (1 - target_severe) - mild
+def solve_native_ratio_mix(target_severe, native_mild, native_moderate):
+    """mild/moderate split (severe fixed at target_severe) that PRESERVES the native
+    mild:moderate ratio observed in the pooled OOF — unlike the old TDV-Net-consistent solve
+    (which forced mild/moderate to reproduce TDV's reported pooled 3.91, and at 13% severe drove
+    moderate down to ~1.3%, leaving a visible gap in the moderate band). Realistic case-mix
+    shifts should not distort the ratio between the two bands NOT being targeted."""
+    remaining = 1 - target_severe
+    denom = native_mild + native_moderate
+    mild = remaining * (native_mild / denom)
+    moderate = remaining - mild
     return {'mild': mild, 'moderate': moderate, 'severe': target_severe}
 
 
-def weighted_polyfit1(x, y, w):
-    """Weighted least-squares slope/intercept of y on x (degree-1), weights w."""
-    sw = w.sum()
-    mx = np.sum(w * x) / sw
-    my = np.sum(w * y) / sw
-    sxy = np.sum(w * (x - mx) * (y - my))
-    sxx = np.sum(w * (x - mx) ** 2)
-    slope = sxy / sxx
-    intercept = my - slope * mx
-    return slope, intercept
-
-
-def make_tdv_scatter(a, T, P, Pc, native_mae, mild_mae, moderate_mae, severe_mae, n_records):
-    """Composition-adjusted scatter: reweight our pooled OOF points to a TDV-Net-consistent
-    case-mix (severe fixed at a.target_severe; mild/moderate solved to reproduce TDV's reported
-    pooled 3.91), then recompute the weighted MAE/slope/calib-slope under that mix.
-
-    Style choice: (a) plot the SAME point cloud as the native scatter, with per-point alpha
-    proportional to its reweighting factor, rather than a weighted resample — this keeps the
-    point positions identical to p1disc_denoise_scatter.png (only the visual density/opacity of
-    each severity band shifts to reflect the 13%-severe target population).
+def make_composition_scatter(a, T, P, Pc, native_mae, mild_mae, moderate_mae, severe_mae, n_records):
+    """Composition-adjusted scatter: bootstrap-RESAMPLE (with replacement) our pooled OOF points
+    to a realistic 13%-severe case-mix that keeps the native mild:moderate ratio, then recompute
+    MAE/slope on the resampled cloud and plot it directly (not an alpha-faded copy of the native
+    cloud — that previous approach left the moderate band visually empty at low weight).
     """
-    target = solve_tdv_consistent_mix(a.target_severe)
-
     band_mask = {
         'severe': T < 15,
         'moderate': (T >= 15) & (T < 22),
@@ -73,67 +57,75 @@ def make_tdv_scatter(a, T, P, Pc, native_mae, mild_mae, moderate_mae, severe_mae
     }
     native = {k: float(m.mean()) for k, m in band_mask.items()}
     our_band_mae = {'mild': mild_mae, 'moderate': moderate_mae, 'severe': severe_mae}
+    target = solve_native_ratio_mix(a.target_severe, native['mild'], native['moderate'])
 
-    w = np.empty_like(T)
-    for k, m in band_mask.items():
-        w[m] = target[k] / native[k]
-    w = w / w.mean()   # normalize to mean 1 (already ~1 by construction; guards float drift)
-
-    def wmae(arr):
-        return float(np.sum(w * np.abs(arr - T)) / np.sum(w))
-
-    w_mae = wmae(P)
-    w_mae_cal = wmae(Pc)
-    w_sl, w_ic = weighted_polyfit1(T, P, w)
-    w_sl_c, w_ic_c = weighted_polyfit1(T, Pc, w)
-
-    # sanity check: weighted MAE must equal the target-mix-weighted sum of OUR per-band MAEs
+    # sanity check (before spending time resampling): target-mix-weighted sum of OUR per-band
+    # MAEs must land close to the expected ~3.88 (0.643*2.904 + 0.227*4.062 + 0.13*8.425 ~ 3.884)
     check = sum(target[k] * our_band_mae[k] for k in target)
-    print(f"tdv-consistent target mix @ severe={a.target_severe:.3f}: "
+    print(f"native-ratio target mix @ severe={a.target_severe:.3f}: "
           f"mild {target['mild']:.4f} / moderate {target['moderate']:.4f} / severe {target['severe']:.4f}")
     print(f"  native mix: mild {native['mild']:.4f} / moderate {native['moderate']:.4f} / severe {native['severe']:.4f}")
-    print(f"  weighted MAE {w_mae:.4f} (band-sum check {check:.4f}) | weighted MAE calib {w_mae_cal:.4f}")
-    print(f"  weighted slope raw {w_sl:.4f}  calib {w_sl_c:.4f}")
-    if not (abs(w_mae - check) < 1e-6 and 3.6 <= w_mae <= 3.7):
-        print(f"DISCREPANCY: weighted MAE {w_mae:.4f} did not land in the expected 3.6-3.7 band "
-              f"(or disagrees with the band-sum check {check:.4f}) — stopping without shipping a figure.")
+    print(f"  band-sum check (expected pooled MAE under target mix): {check:.4f}")
+    if not (3.85 <= check <= 3.92):
+        print(f"DISCREPANCY: band-sum check {check:.4f} did not land in the expected 3.85-3.92 "
+              f"band — stopping without shipping a figure.")
+        sys.exit(1)
+
+    # bootstrap resample to a fixed N with the target band proportions
+    rng = np.random.default_rng(0)
+    n_total = a.resample_n
+    idx_by_band = {
+        'severe': np.where(band_mask['severe'])[0],
+        'moderate': np.where(band_mask['moderate'])[0],
+        'mild': np.where(band_mask['mild'])[0],
+    }
+    counts = {k: int(round(target[k] * n_total)) for k in target}
+    sel = np.concatenate([rng.choice(idx_by_band[k], size=counts[k], replace=True) for k in target])
+    rng.shuffle(sel)
+    Tr, Pr, Pcr = T[sel], P[sel], Pc[sel]
+
+    r_mae = float(np.abs(Pr - Tr).mean())
+    r_mae_cal = float(np.abs(Pcr - Tr).mean())
+    r_sl, r_ic = np.polyfit(Tr, Pr, 1)
+    r_sl_c, r_ic_c = np.polyfit(Tr, Pcr, 1)
+    print(f"  resampled (n={sel.size}): MAE raw {r_mae:.4f}  calib {r_mae_cal:.4f}")
+    print(f"  resampled slope raw {r_sl:.4f}  calib {r_sl_c:.4f}")
+    if not (3.85 <= r_mae <= 3.92):
+        print(f"DISCREPANCY: resampled MAE {r_mae:.4f} did not land in the expected 3.85-3.92 "
+              f"band — stopping without shipping a figure.")
         sys.exit(1)
 
     fig, ax = plt.subplots(figsize=(7.6, 7.6))
-    base_rgb = np.array(matplotlib.colors.to_rgb('#1f4e79'))
-    alpha = np.clip(0.10 * w, 0.004, 0.85)
-    colors = np.tile(np.append(base_rgb, 1.0), (T.size, 1))
-    colors[:, 3] = alpha
-    ax.scatter(T, P, s=6, color=colors, edgecolors='none')
+    ax.scatter(Tr, Pr, s=6, alpha=0.10, color='#1f4e79', edgecolors='none')
     lo, hi = 0, 36
     ax.plot([lo, hi], [lo, hi], '--', color='gray', lw=1.2, label='y = x (perfect)')
     xs = np.array([lo, hi])
-    ax.plot(xs, w_sl * xs + w_ic, '-', color='#c00000', lw=2.2,
-             label=f'weighted raw fit: y = {w_sl:.2f}x + {w_ic:.1f}')
-    ax.plot(xs, w_sl_c * xs + w_ic_c, '-', color='#2e7d32', lw=1.6,
-             label=f'weighted calib fit: y = {w_sl_c:.2f}x + {w_ic_c:.1f}')
+    ax.plot(xs, r_sl * xs + r_ic, '-', color='#c00000', lw=2.2,
+             label=f'raw fit: y = {r_sl:.2f}x + {r_ic:.1f}')
+    ax.plot(xs, r_sl_c * xs + r_ic_c, '-', color='#2e7d32', lw=1.6,
+             label=f'calib fit: y = {r_sl_c:.2f}x + {r_ic_c:.1f}')
     ax.axvspan(0, 15, color='orange', alpha=0.07)
     ax.text(7.5, 1.0, 'severe\n(<15 dB)', ha='center', va='bottom', fontsize=8, color='#a0522d')
     ax.set_xlim(lo, hi); ax.set_ylim(lo, hi); ax.set_aspect('equal', 'box')
     ax.set_xlabel('True 24-2 sensitivity (dB)', fontsize=11)
     ax.set_ylabel('Predicted sensitivity (dB)', fontsize=11)
     ax.set_title(f'Fundus-only 24-2 VF prediction ({a.tag})\n'
-                 f'Composition-adjusted to TDV-Net case-mix ({100 * a.target_severe:.0f}% severe)',
+                 f'Composition-adjusted to a realistic {100 * a.target_severe:.0f}%-severe case-mix',
                  fontsize=12, pad=12)
 
     box_lines = [
-        f"{a.tag} — composition-adjusted (TDV-Net mix)",
+        f"{a.tag} — composition-adjusted (realistic mix, resampled n={sel.size})",
         f"  target mix   mild {100*target['mild']:.1f}% / mod {100*target['moderate']:.1f}% / severe {100*target['severe']:.1f}%",
-        f"  weighted MAE        {w_mae:.3f} dB   calib {w_mae_cal:.3f}",
-        f"  weighted slope raw  {w_sl:.3f}   calib {w_sl_c:.3f}",
+        f"  (native mild:mod ratio preserved, not TDV-Net's)",
+        f"  pooled MAE          {r_mae:.3f} dB   calib {r_mae_cal:.3f}",
+        f"  slope raw           {r_sl:.3f}   calib {r_sl_c:.3f}",
         "─" * 30,
-        f"native (unweighted) mix: mild {100*native['mild']:.1f}% / mod {100*native['moderate']:.1f}% / "
-        f"severe {100*native['severe']:.1f}%",
-        f"native pooled MAE   {native_mae:.3f} dB",
-        f"TDV-Net pooled MAE  {TDV_POOLED:.2f} dB (under matched mix)",
+        f"native mix ({100*native['severe']:.1f}% severe) MAE = {native_mae:.3f}",
+        f"TDV-Net pooled MAE = {TDV_POOLED:.2f} (their case-mix)",
         "─" * 30,
-        f"native mix ({100*native['severe']:.1f}% severe) = {native_mae:.3f};",
-        f"TDV-Net = {TDV_POOLED:.2f} under matched mix — ours wins",
+        "note: slope is composition-stable (model shrinkage,",
+        "not case-mix) — ~0.55 raw across mixes; MAE moves,",
+        "slope does not.",
     ]
     box = "\n".join(box_lines)
     ax.text(0.03, 0.97, box, transform=ax.transAxes, va='top', ha='left', fontsize=8.2,
@@ -141,7 +133,7 @@ def make_tdv_scatter(a, T, P, Pc, native_mae, mild_mae, moderate_mae, severe_mae
     ax.legend(loc='lower right', fontsize=9)
     ax.grid(alpha=0.15)
 
-    out = a.out or os.path.join(AUTO, f"{a.tag}_scatter_tdv{int(round(a.target_severe * 100))}.png")
+    out = a.out or os.path.join(AUTO, f"{a.tag}_scatter_sev{int(round(a.target_severe * 100))}.png")
     fig.savefig(out, dpi=140, bbox_inches='tight')
     print(f"saved {out}")
 
@@ -152,11 +144,14 @@ def main():
     ap.add_argument('--ref-tag', default='p1disc', help='comparator drawn in the annotation box')
     ap.add_argument('--cache-dir', default=os.path.join(AUTO, 'oof_cache_notta'))
     ap.add_argument('--out', default=None)
-    ap.add_argument('--tdv-consistent', action='store_true',
-                     help='reweight points to a TDV-Net-consistent case-mix at --target-severe and '
-                          'plot the composition-adjusted scatter instead of the native one')
+    ap.add_argument('--native-ratio', action='store_true',
+                     help='bootstrap-resample points to a realistic case-mix at --target-severe '
+                          '(preserving the native mild:moderate ratio) and plot the '
+                          'composition-adjusted scatter instead of the native one')
     ap.add_argument('--target-severe', type=float, default=0.13,
-                     help='target severe point-fraction for --tdv-consistent reweighting (default 0.13)')
+                     help='target severe point-fraction for --native-ratio resampling (default 0.13)')
+    ap.add_argument('--resample-n', type=int, default=30000,
+                     help='total resampled point count for --native-ratio (default 30000)')
     a = ap.parse_args()
 
     vp_all, vt_all, vp_cal_all = [], [], []
@@ -204,8 +199,8 @@ def main():
         print(f"  severity decomp (from {a.tag}_cv.json): sev_corr {sev.get('sev_corr', float('nan')):.3f} "
               f"res_corr {sev.get('res_corr', float('nan')):.3f}")
 
-    if a.tdv_consistent:
-        make_tdv_scatter(a, T, P, Pc, mae, mild_mae, moderate_mae, severe_mae, len(vt_all))
+    if a.native_ratio:
+        make_composition_scatter(a, T, P, Pc, mae, mild_mae, moderate_mae, severe_mae, len(vt_all))
         return
 
     fig, ax = plt.subplots(figsize=(7.6, 7.6))
