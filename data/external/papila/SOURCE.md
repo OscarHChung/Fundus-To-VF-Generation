@@ -19,7 +19,7 @@
   291 (2022). https://doi.org/10.1038/s41597-022-01388-1 (PMC9184612). Cite this paper, not the
   figshare repository, per the depositors' own request in the figshare description.
 
-## License — a discrepancy, disclosed
+## License resolution
 
 Two different license statements exist for this dataset and we could not fully reconcile them
 programmatically, so both are recorded here:
@@ -30,13 +30,15 @@ programmatically, so both are recorded here:
   policy is CC-BY licensed) states in its own text that the work "is licensed under a Creative
   Commons Attribution 4.0 International License" (**CC-BY-4.0**).
 
-We are treating **CC-BY-4.0** (journal policy + the paper's explicit self-declaration) as the
-operative license for the dataset content, consistent with the task brief's assumption. The
+**Resolution: we treat CC-BY-4.0 as the operative license** (journal policy + the paper's explicit
+self-declaration), for **non-commercial research use with attribution** — cite Kovalyk et al.,
+*Scientific Data* 9, 291 (2022), not the figshare repository, per the depositors' own request. The
 figshare-item-level "GPL 3.0+" tag looks like metadata the depositors set incorrectly on the
 figshare item itself (GPL is a software license, not an obvious fit for a data+images corpus,
 and contradicts the paper's own CC-BY statement). **Flag for legal/PI review before any
 redistribution beyond internal research use** — this repo only uses PAPILA for (a) internal
 severity co-training and (b) internal external-validation reporting, consistent with CC-BY.
+This resolution is mirrored in `decoder/results/auto/paper_headline_results.md` §4.
 
 ## Archive structure (after `unzip PAPILA.zip`)
 
