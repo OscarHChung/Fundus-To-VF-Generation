@@ -8,7 +8,17 @@ per-point SPATIAL partial-corr probe on our folds.
 Two passes, ONE torch process at a time (16 GB box):
   python decoder/diag_encoder_bakeoff.py --cache                 # torch: cache every available encoder
   python decoder/diag_encoder_bakeoff.py --cache --only dinov2_l # torch: cache just one
+  python decoder/diag_encoder_bakeoff.py --cache --only retfound_mae --view disc --input-size 384 \
+      --disc-center detected                                     # torch: high-res detected-disc variant
   python decoder/diag_encoder_bakeoff.py --probe                 # numpy: curves + spatial + GATE
+
+--view {full,disc}: whole fundus image (baseline) vs. laterality-aware disc crop.
+--input-size N: frozen-encoder input resolution (RETFound-MAE only; must be a multiple of 16;
+  224 is today's baseline, byte-identical to the original model).
+--disc-center {fixed,detected}: disc-crop center — the fixed nominal box (baseline) or a
+  dependency-free green-channel-centroid detector. REQUIRES --view disc: disc_center='detected'
+  with view='full' is rejected with a clear ValueError (view='full' would silently ignore the
+  detected center yet still write a cache file mislabeled with the '_det' suffix).
 
 Gate (pre-committed, §A2 step 3): advance an encoder to Task A3 iff, vs the RETFound-MAE baseline
 measured IN THIS RUN by the identical pipeline,
@@ -84,11 +94,23 @@ def cache_encoder(name, view="full", input_size=224, disc_center="fixed"):
     disc crop (training.disc_crop_pil) BEFORE resizing to input_size; disc_center='detected' crops
     around _detect_disc_center's green-channel centroid instead of the fixed box; input_size != 224
     resizes to that size and drives encode_prefix's high-res (RETFound-MAE) path.
+
+    disc_center='detected' REQUIRES view='disc' (raises ValueError otherwise) — with view='full'
+    the detected-center offset is never consulted, so the run would silently take the plain
+    full@input_size branch yet still write a cache file mislabeled with the '_det' suffix.
     """
     if view not in ("full", "disc"):
         raise ValueError(f"unknown view {view!r}; choose 'full' or 'disc'")
     if disc_center not in ("fixed", "detected"):
         raise ValueError(f"unknown disc_center {disc_center!r}; choose 'fixed' or 'detected'")
+    if disc_center == "detected" and view != "disc":
+        raise ValueError(
+            "disc_center='detected' requires view='disc' (got view='full'): the full-image branch "
+            "never looks at the detected-center offset, so this combination would silently take the "
+            "plain full@input_size branch yet still write a cache file mislabeled with the '_det' "
+            "suffix — a mislabeled-cache footgun that probe()'s auto-discovery would then compare "
+            "as if it were a real detected-disc result."
+        )
     import torch, torch.nn.functional as F
     import encoders as EN, training as T
     from torch.utils.data import DataLoader, Dataset
@@ -368,6 +390,9 @@ def main():
                      help="disc crop center: 'fixed' box (baseline) or 'detected' green-channel centroid")
     ap.add_argument('--probe', action='store_true', help="pass 2: curves + spatial + gate (numpy)")
     a = ap.parse_args()
+    if a.disc_center == 'detected' and a.view != 'disc':
+        ap.error("--disc-center detected requires --view disc (view='full' would silently ignore "
+                 "the detected center yet still write a cache file mislabeled with the '_det' suffix)")
     if a.cache:
         cache_all(a.only, view=a.view, input_size=a.input_size, disc_center=a.disc_center)
     if a.probe:

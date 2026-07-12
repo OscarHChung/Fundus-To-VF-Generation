@@ -45,6 +45,16 @@ def test_highres_not_nan_and_finite():
     assert torch.isfinite(h).all()
 
 
+def test_highres_input_size_not_multiple_of_16_raises():
+    """input_size=225 isn't divisible by the patch16 grid; must fail clearly upfront rather than
+    deep inside a tensor add (e.g. a shape-mismatched pos-embed broadcast)."""
+    import pytest
+    enc = EN.load_encoder("retfound_mae")
+    x = torch.randn(1, 3, 225, 225)
+    with pytest.raises(ValueError):
+        enc.encode_prefix(x, input_size=225)
+
+
 def test_other_backbones_ignore_input_size_kwarg():
     """encode_prefix(imgs, input_size=224) must not break backbones that don't honour input_size
     (they should just accept and ignore the kwarg, running at their configured resolution)."""
@@ -96,6 +106,17 @@ def test_detect_disc_center_finds_bright_spot_in_laterality_quadrant():
     import training as T
     cx_os, cy_os = BO._detect_disc_center(img, 'OS')
     assert cx_os == T.DISC_CX_OS and cy_os == T.DISC_CY
+
+
+def test_cache_encoder_detected_center_requires_disc_view_raises():
+    """disc_center='detected' is only meaningful with view='disc'. With view='full' (the default),
+    the detected-center offset is silently ignored (the full-image branch never looks at it) yet
+    cache_encoder would still write a filename tagged '_det' — a plain full@224 cache mislabeled
+    as a detected-disc result, which probe()'s auto-discovery would then compare as if it were real.
+    Must raise ValueError instead of writing the mislabeled cache."""
+    import pytest
+    with pytest.raises(ValueError):
+        BO.cache_encoder("retfound_mae", view="full", input_size=224, disc_center="detected")
 
 
 def test_discover_configs_empty_when_no_extra_caches(tmp_path, monkeypatch):

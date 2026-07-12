@@ -2,7 +2,12 @@
 
 One responsibility: given an `--encoder` name, return a frozen module that exposes
 
-    enc.encode_prefix(imgs: Tensor[B,3,H,W]) -> Tensor[B, 1+P, D]   # CLS token at index 0
+    enc.encode_prefix(imgs: Tensor[B,3,H,W], input_size: int = 224) -> Tensor[B, 1+P, D]
+        # CLS token at index 0, then row-major patch tokens. input_size selects the patch grid to
+        # run the (RETFound-MAE) forward at; default 224 reproduces the original fixed-224 forward
+        # byte-for-byte. For RETFound-MAE, any input_size != 224 must be a multiple of 16 (the
+        # patch16 grid) or a clear ValueError is raised. Other backbones accept-and-ignore this
+        # kwarg, always running at their configured enc.input_size.
     enc.grid -> (gh, gw)   (P = gh*gw)      enc.dim -> int      enc.input_size -> int
 
 so the rest of the pipeline can treat every backbone uniformly. This isolates all backbone-specific
@@ -54,8 +59,10 @@ class FrozenEncoder(nn.Module):
         """(B,3,H,W) -> (B, 1+gh*gw, D). CLS/first token at index 0, then row-major patch tokens.
 
         input_size selects the patch grid to run the (RETFound-MAE) forward at; the default 224
-        reproduces the original fixed-224 forward byte-for-byte (see _mae_prefix). Other backbones
-        currently ignore this kwarg and always run at their configured `self.input_size`."""
+        reproduces the original fixed-224 forward byte-for-byte (see _mae_prefix). For RETFound-MAE,
+        any input_size != 224 must be a multiple of 16 (the patch16 grid) — otherwise _mae_prefix
+        raises a clear ValueError instead of failing deep inside a shape-mismatched tensor op. Other
+        backbones currently ignore this kwarg and always run at their configured `self.input_size`."""
         return self._prefix_fn(self.backbone, imgs, input_size)
 
 
@@ -78,6 +85,10 @@ def _mae_prefix(backbone, imgs, input_size=224):
         for blk in backbone.blocks:
             h = blk(h)
         return backbone.norm(h)
+    if input_size % 16 != 0:
+        raise ValueError(
+            f"input_size must be a multiple of 16 (RETFound-MAE patch16 grid); got {input_size}"
+        )
     if _RETFOUND_DIR not in sys.path:
         sys.path.insert(0, _RETFOUND_DIR)
     from util.pos_embed import get_2d_sincos_pos_embed
