@@ -158,13 +158,21 @@ def main():
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "vf_tests",
         "grape_rnfl_lookup.json"))
     # Task 11 — CORAL ordinal per-point head (frozen-feature probe P-C1: CORAL beat plain ridge by
-    # +0.040 sev_corr). REPLACES the continuous point head with K=20 rank-monotone ordinal bins (2dB
-    # each), decoded back to a continuous dB value — the (B,52) eval interface is unchanged. Default
-    # OFF = byte-identical to the standard point head (see tests_ordinal_head.py).
+    # +0.040 sev_corr). REPLACES the continuous point head OUTPUT with K=20 rank-monotone ordinal
+    # bins (2dB each), decoded back to a continuous dB value — the (B,52) eval interface is
+    # unchanged. Default OFF = byte-identical to the standard point head (see tests_ordinal_head.py).
+    # Fix (final code review): the CORAL BCE is trained as an ADDITIVE auxiliary term on top of the
+    # SAME Huber primary-fit loss the OFF path uses (not a replacement of it) — see --ordinal-weight
+    # and training.compute_loss's docstring.
     ap.add_argument('--ordinal-head', action='store_true',
                     help="Task 11: CORAL ordinal per-point head (K=20 bins, 2dB each) replacing the "
-                         "continuous point head; loss becomes the CORAL BCE (same GH weighting). "
-                         "Default OFF = byte-identical to the current model.")
+                         "continuous point head's OUTPUT (still decoded to a continuous dB value). "
+                         "The loss keeps the same Huber primary fit as OFF PLUS an additive CORAL "
+                         "BCE aux term scaled by --ordinal-weight. Default OFF = byte-identical to "
+                         "the current model.")
+    ap.add_argument('--ordinal-weight', type=float, default=T.ORDINAL_WEIGHT,
+                    help="λ on the additive CORAL BCE aux term when --ordinal-head is ON (the Huber "
+                         "primary fit is always kept at full weight). No effect when OFF.")
     a = ap.parse_args()
     if a.denoised and a.denoise_target:
         ap.error("--denoised and --denoise-target are mutually exclusive (two different "
@@ -194,13 +202,14 @@ def main():
         severity_cfg = dict(weight=a.severity_weight, ccc=a.severity_ccc,
                             eye_scale=a.severity_eye_scale)
     # Task 11 — fixed CORAL bin config (matches training.py's ORDINAL_* constants); None when OFF so
-    # compute_loss takes its default (byte-identical) Huber path.
-    ordinal_cfg = {'bin_width': T.ORDINAL_BIN_WIDTH, 'n_thresh': T.ORDINAL_N_THRESH} \
-        if a.ordinal_head else None
+    # compute_loss takes its default (byte-identical) Huber path. 'weight' scales the ADDITIVE CORAL
+    # BCE aux term on top of the (always-kept) Huber primary fit — see compute_loss docstring.
+    ordinal_cfg = {'bin_width': T.ORDINAL_BIN_WIDTH, 'n_thresh': T.ORDINAL_N_THRESH,
+                   'weight': a.ordinal_weight} if a.ordinal_head else None
     if a.ordinal_head:
         print(f"✓ Task11: CORAL ordinal head training ON (K={T.ORDINAL_N_BINS} bins × "
-              f"{T.ORDINAL_BIN_WIDTH:.0f}dB) — loss = CORAL BCE with the existing GH per-point "
-              f"weighting", flush=True)
+              f"{T.ORDINAL_BIN_WIDTH:.0f}dB) — loss = Huber primary fit (unchanged from OFF) + "
+              f"{a.ordinal_weight}×CORAL BCE aux (same GH per-point weighting)", flush=True)
     if a.warm_start:
         ck = torch.load(a.warm_start, map_location='cpu', weights_only=False)
         sd = ck.get('model', ck.get('model_state_dict', ck))
@@ -327,7 +336,8 @@ def main():
                             'rnfl_aux': a.rnfl_aux,
                             'disc_only': a.disc_only,
                             'disc_half': (a.disc_half if a.disc_half is not None else T.DISC_HALF),
-                            'ordinal_head': a.ordinal_head},
+                            'ordinal_head': a.ordinal_head,
+                            'ordinal_weight': a.ordinal_weight},
                            out_best)
                 tag = " ✓ saved"
             if ema: ema.restore()       # back to raw weights for continued training

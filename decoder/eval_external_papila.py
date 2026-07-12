@@ -174,6 +174,20 @@ def fit_grape_calibration(grape_preds, grape_trues):
     print(f"GRAPE OOF sanity check (should ~match p1disc_cv.json raw): "
           f"MAE {pooled['mae']:.3f} corr {pooled['corr']:.3f} slope {pooled['slope']:.3f} "
           f"(p1disc_cv.json: MAE 4.113 corr 0.684 slope 0.536)")
+    # Fix (final code review): this must ASSERT, not just print -- a silent encoder/timm/eval-path
+    # regression would otherwise still produce a "successful" external-validation report built on a
+    # champion that no longer reproduces its own reported CV number.
+    _p1disc_cv_path = os.path.join(AUTO_DIR, "p1disc_cv.json")
+    with open(_p1disc_cv_path) as _f:
+        _stored_raw = json.load(_f)["raw"]
+    _mae_tol = 0.01
+    _mae_delta = abs(pooled["mae"] - _stored_raw["mae"])
+    assert _mae_delta < _mae_tol, (
+        f"GRAPE OOF reproduction check FAILED: live pooled MAE {pooled['mae']:.4f} vs stored "
+        f"{_p1disc_cv_path} raw MAE {_stored_raw['mae']:.4f} (|Δ|={_mae_delta:.4f} >= tol "
+        f"{_mae_tol}) -- the champion checkpoints no longer reproduce their reported CV number "
+        f"(encoder/timm/eval-path regression?); fix that before trusting this external-validation "
+        f"run.")
     print(f"GRAPE per-eye severity calibration: slope={slope:.4f} intercept={intercept:.3f} "
           f"| sev_corr={sev_corr:.3f} sev_mae={sev_mae:.3f} (n={len(pred_mean)})")
     return dict(slope=float(slope), intercept=float(intercept), n_eyes=int(len(pred_mean)),

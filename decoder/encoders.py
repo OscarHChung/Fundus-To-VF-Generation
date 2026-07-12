@@ -224,6 +224,12 @@ def _load_retizero():
     enforced. Weights expected at encoder/RetiZero.pth (not checked into git; encoder/*.pth is
     gitignored) or at the path in $RETIZERO_CKPT.
 
+    LICENSE STATUS (explicit): these weights are ALL-RIGHTS-RESERVED / license-UNCERTAIN — RetiZero
+    ships no LICENSE file, so no redistribution/use rights are granted beyond the paper's own
+    research-use description. Do NOT use this encoder for any REPORTED or REDISTRIBUTED result
+    without first resolving licensing with the authors. This loader is EXPLORATORY INFRA ONLY
+    (encoder bake-off probes), not cleared for the champion pipeline or any published number.
+
     Checkpoint layout (verified): a CLIP-style state_dict with 'vision_model.model.lora_vit.*'
     (RETFound ViT-L/16, LoRA rank-8 on q/v, depth 24, D=1024, patch16@224 — architecturally
     identical to timm's vit_large_patch16_224), 'vision_model.projection_head_vision.*' (CLIP joint
@@ -277,6 +283,13 @@ def _load_retfound_green():
     images, native 392x392, D=384. Ungated: a plain public GitHub Release binary (`wget`, no login/
     access request) — retfoundgreen_statedict.pth at the URL below. No LICENSE file found in the
     repo at time of writing (noted, not enforced).
+
+    LICENSE STATUS (explicit): these weights are ALL-RIGHTS-RESERVED / license-UNCERTAIN — no
+    LICENSE file has been found in the source repo, so no redistribution/use rights are granted
+    beyond whatever the paper itself describes. Do NOT use this encoder for any REPORTED or
+    REDISTRIBUTED result without first resolving licensing with the authors. This loader is
+    EXPLORATORY INFRA ONLY (encoder bake-off probes), not cleared for the champion pipeline or any
+    published number.
 
     Preprocessing NOTE (caller's responsibility, NOT enforced here): the released model expects
     392x392 images normalized with mean=std=0.5 per channel (NOT ImageNet stats) — different from

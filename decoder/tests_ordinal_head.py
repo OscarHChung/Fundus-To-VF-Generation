@@ -26,6 +26,10 @@ Validates:
   (6) compute_loss: ordinal_logits=None (default) is byte-identical to the current Huber loss;
       supplying ordinal_logits/ordinal_cfg gives a finite CORAL loss that still respects the SAME
       per-point weighting path, while MAE (computed from pred/target only) is unaffected.
+  (7) compute_loss ordinal ON-path fix: the CORAL BCE is an ADDITIVE auxiliary term (scaled by
+      ordinal_cfg['weight'], default ORDINAL_WEIGHT) on top of the SAME Huber primary-fit term used
+      OFF -- NOT a replacement. Proof: ordinal_weight=0.0 ON reduces byte-identical to the OFF/Huber
+      loss, and the loss is LINEAR in ordinal_weight.
 """
 import os, sys
 import numpy as np
@@ -156,6 +160,58 @@ def test_compute_loss_ordinal_gating_and_finite():
       f"ON gives a finite CORAL loss {float(l_c):.4f}, MAE unaffected ({mae_c:.4f})")
 
 
+def test_compute_loss_ordinal_additive_not_replacing():
+    """Fix (final code review, task-11 follow-up): the ordinal ON-path must be an ADDITIVE
+    auxiliary term (ordinal_weight * CORAL BCE) on top of the SAME Huber primary-fit term used by
+    the OFF path -- NOT a replacement of it. A replacement would (a) starve the global-spatial/M1
+    severity heads of gradient from the primary point-fit term (they only touch `pred`, the FINAL
+    prediction, not the pre-decode logits) and (b) put a ~10-13 nat/point BCE on a completely
+    different scale than the single-digit-dB^2 Huber it replaced, silently down-weighting every
+    other pre-tuned aux term (CCC/variance/bias/severity/entropy) by ~10x.
+
+    Proof:
+      (1) ordinal_weight=0.0 ON reduces BYTE-IDENTICAL to the OFF/Huber-only loss on a fixed batch
+          -- only possible if the Huber term is still the primary fit (a replacement would give a
+          totally different loss value even at weight 0, since the "replaced" Huber would be gone).
+      (2) The loss is LINEAR in ordinal_weight: loss(w) - loss(weight=0) scales proportionally
+          with w for two different w's -- the signature of an ADDED term, not a substituted one.
+    """
+    import training as T
+    torch.manual_seed(4)
+    B = 6
+    pred = torch.rand(B, 52) * 30 + 4
+    target = torch.full((B, 72), 99.0)
+    for i in range(B):
+        for j, vi in enumerate(T.valid_indices_od):
+            target[i, vi] = pred[i, j].item() + float(torch.randn(1) * 2.0)
+    lat = ['OD'] * B
+    logits = torch.randn(B, 52, T.ORDINAL_N_THRESH)
+
+    l_off, mae_off, n_off = T.compute_loss(pred, target, lat, epoch=10)
+
+    cfg0 = {'bin_width': T.ORDINAL_BIN_WIDTH, 'n_thresh': T.ORDINAL_N_THRESH, 'weight': 0.0}
+    l_w0, mae_w0, n_w0 = T.compute_loss(pred, target, lat, epoch=10,
+                                        ordinal_logits=logits, ordinal_cfg=cfg0)
+    assert abs(float(l_off) - float(l_w0)) < 1e-6, \
+        ("ordinal_weight=0.0 ON must reduce to the OFF/Huber-only loss -- proves the Huber "
+         f"primary-fit term is still present when ordinal-head is ON (off={float(l_off):.6f} "
+         f"w0={float(l_w0):.6f})")
+    assert mae_w0 == mae_off and n_w0 == n_off
+
+    cfg1 = {'bin_width': T.ORDINAL_BIN_WIDTH, 'n_thresh': T.ORDINAL_N_THRESH, 'weight': 0.3}
+    cfg2 = {'bin_width': T.ORDINAL_BIN_WIDTH, 'n_thresh': T.ORDINAL_N_THRESH, 'weight': 0.6}
+    l_w1, _, _ = T.compute_loss(pred, target, lat, epoch=10, ordinal_logits=logits, ordinal_cfg=cfg1)
+    l_w2, _, _ = T.compute_loss(pred, target, lat, epoch=10, ordinal_logits=logits, ordinal_cfg=cfg2)
+    assert np.isfinite(float(l_w1)) and np.isfinite(float(l_w2))
+    d1 = float(l_w1) - float(l_w0)
+    d2 = float(l_w2) - float(l_w0)
+    assert d1 > 1e-6, "ordinal term at weight>0 must add positive loss on top of the Huber baseline"
+    assert abs(d2 - 2 * d1) < 1e-4, \
+        f"loss must be LINEAR in ordinal_weight (additive term), got d1={d1:.6f} d2={d2:.6f}"
+    P(f"compute_loss ordinal ON is ADDITIVE: weight=0 == OFF loss ({float(l_off):.4f}); "
+      f"loss linear in ordinal_weight (Δ@0.3={d1:.4f}, Δ@0.6={d2:.4f})")
+
+
 if __name__ == "__main__":
     print("Task 11 (CORAL ordinal head) tests:")
     test_ordinal_head_off_is_noop()
@@ -164,4 +220,5 @@ if __name__ == "__main__":
     test_coral_logits_rank_monotone()
     test_coral_decode_matches_closed_form()
     test_compute_loss_ordinal_gating_and_finite()
+    test_compute_loss_ordinal_additive_not_replacing()
     print("ALL PASSED")

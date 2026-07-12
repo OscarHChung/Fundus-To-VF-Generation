@@ -177,6 +177,11 @@ LDS_MAX_WEIGHT = 4.0       # cap on any single bin's weight (run-4: 6 over-deepe
 ORDINAL_N_BINS    = 20                        # K bins, 2 dB each, spanning [0,40) dB
 ORDINAL_BIN_WIDTH = 40.0 / ORDINAL_N_BINS     # 2.0 dB per bin
 ORDINAL_N_THRESH  = ORDINAL_N_BINS - 1        # K-1 = 19 ordered CORAL thresholds
+# Fix (final code review): the CORAL BCE is an ADDITIVE auxiliary term (this weight × per-point
+# BCE), NOT a replacement of the Huber primary-fit term -- see compute_loss docstring. Default
+# chosen to keep the ~10-13 nat/point BCE from swamping the pre-tuned aux-term balance (single
+# digit dB^2 Huber + CCC/variance/bias/severity/entropy), threaded via --ordinal-weight.
+ORDINAL_WEIGHT    = 0.2
 
 # Weight EMA — exponential moving average of decoder weights, evaluated/saved
 # instead of the raw weights. Low-risk variance reduction on the plateau (the
@@ -1239,11 +1244,19 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
 
     Task 11 — CORAL ordinal head (opt-in, ordinal_logits=None → baseline exactly). When
     ordinal_logits (matching `pred`'s (B,52,K-1) CORAL logits) and ordinal_cfg (dict with
-    'bin_width'/'n_thresh') are both given, the per-point Huber term is REPLACED by the CORAL
-    loss (sum of K-1 BCEs on "true > threshold_k") for that eye, still multiplied by the SAME
-    per-point `weights` (value/LDS × Garway–Heath) used by the Huber baseline. Every other term
-    (bias-control, dispersion, per-eye CCC, variance, severity, entropy) is untouched — they only
-    look at `pred`/`target`, i.e. the already-decoded continuous CORAL prediction.
+    'bin_width'/'n_thresh', optional 'weight') are both given, the per-point Huber term on `pred`
+    (the FINAL prediction — i.e. AFTER the global-spatial head and M1 severity head, exactly like
+    the OFF path) is kept EXACTLY as-is, and the CORAL loss (sum of K-1 BCEs on "true >
+    threshold_k", computed on the pre-decode logits) is ADDED as an auxiliary term, scaled by
+    ordinal_cfg.get('weight', ORDINAL_WEIGHT) and using the SAME per-point `weights` (value/LDS ×
+    Garway–Heath) as the Huber term. This is NOT a replacement: with ordinal_cfg['weight']=0.0 the
+    loss is byte-identical to the OFF/Huber-only path (see
+    tests_ordinal_head.py::test_compute_loss_ordinal_additive_not_replacing) — so the global +
+    severity heads still receive gradient from the primary fit term, and the pre-tuned aux-term
+    balance (CCC/variance/bias/severity/entropy) is preserved regardless of whether the ordinal
+    head is on. Every other term (bias-control, dispersion, per-eye CCC, variance, severity,
+    entropy) is untouched — they only look at `pred`/`target`, i.e. the already-decoded continuous
+    CORAL prediction.
     """
     device = pred.device
     target = target.to(device)
@@ -1261,6 +1274,7 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
 
     total_huber = total_mae = n_valid = 0
     total_dist_ce = 0.0
+    total_ordinal_bce = 0.0   # Task 11 fix — additive aux accumulator (parallels total_dist_ce)
     eye_ccc_losses = []
     bias_sq_terms  = []
     disp_terms     = []
@@ -1305,26 +1319,31 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
         # Per-point Huber, with an asymmetric penalty on OVER-predicting deep
         # points (pred>gt AND gt<floor) — directly counters the positive bias /
         # scotoma-depth underestimation seen in the first GH run.
-        if ordinal_logits is not None and ordinal_cfg is not None:
-            # Task 11 — CORAL loss REPLACES the Huber term; SAME per-point `weights` applies below.
-            ol = ordinal_logits[i][mask]                                  # (nv, K-1)
-            huber_pp = coral_bce_per_point(
-                ol, t, bin_width=ordinal_cfg.get('bin_width', ORDINAL_BIN_WIDTH),
-                n_thresh=ordinal_cfg.get('n_thresh', ORDINAL_N_THRESH))
-        else:
-            huber_pp = F.huber_loss(p, t, reduction='none', delta=HUBER_DELTA)
-            if deep_cfg is not None and deep_cfg.get('overpred_penalty', 0.0) > 0:
-                over_deep = (p > t) & (t < deep_cfg['floor_db'])
-                huber_pp = huber_pp * torch.where(
-                    over_deep,
-                    torch.full_like(p, 1.0 + deep_cfg['overpred_penalty']),
-                    torch.ones_like(p))
+        huber_pp = F.huber_loss(p, t, reduction='none', delta=HUBER_DELTA)
+        if deep_cfg is not None and deep_cfg.get('overpred_penalty', 0.0) > 0:
+            over_deep = (p > t) & (t < deep_cfg['floor_db'])
+            huber_pp = huber_pp * torch.where(
+                over_deep,
+                torch.full_like(p, 1.0 + deep_cfg['overpred_penalty']),
+                torch.ones_like(p))
         huber = (huber_pp * weights).mean()
         mae   = (p - t).abs().mean()
 
         total_huber += huber * mask.sum().item()
         total_mae   += mae.item() * mask.sum().item()
         n_valid     += mask.sum().item()
+
+        # Task 11 fix — CORAL ordinal AUXILIARY term. ADDITIVE on top of the Huber term above (NOT
+        # a replacement): the primary fit stays on `pred` (the FINAL prediction, after the
+        # global-spatial + M1 severity heads), so those heads keep receiving gradient from the
+        # point-fit loss exactly as the OFF path does. Uses the SAME per-point `weights`.
+        if ordinal_logits is not None and ordinal_cfg is not None:
+            ol = ordinal_logits[i][mask]                                  # (nv, K-1)
+            ordinal_bce_pp = coral_bce_per_point(
+                ol, t, bin_width=ordinal_cfg.get('bin_width', ORDINAL_BIN_WIDTH),
+                n_thresh=ordinal_cfg.get('n_thresh', ORDINAL_N_THRESH))
+            ordinal_bce = (ordinal_bce_pp * weights).mean()
+            total_ordinal_bce = total_ordinal_bce + ordinal_bce * mask.sum().item()
 
         # Method A — pool this eye's valid (pred, target, weight) for a single batch-wide BMC.
         if use_bmc:
@@ -1380,6 +1399,14 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
     if dist_logits is not None and dist_cfg is not None and \
        isinstance(total_dist_ce, torch.Tensor):
         loss = loss + dist_cfg.get('weight', DIST_LOSS_WEIGHT) * (total_dist_ce / n_valid)
+
+    # Task 11 fix — CORAL ordinal AUXILIARY term: ADDED on top of the primary Huber fit above
+    # (which already ran on `pred`, the FINAL prediction), NOT substituted for it. weight=0.0
+    # reduces this to a no-op, so ON with ordinal_cfg['weight']=0.0 is byte-identical to OFF (see
+    # tests_ordinal_head.py::test_compute_loss_ordinal_additive_not_replacing).
+    if ordinal_logits is not None and ordinal_cfg is not None and \
+       isinstance(total_ordinal_bce, torch.Tensor):
+        loss = loss + ordinal_cfg.get('weight', ORDINAL_WEIGHT) * (total_ordinal_bce / n_valid)
 
     # Bias-control term — drives each eye's mean error toward 0 (decouples the
     # global level from the deep-point emphasis; the run-4 negative-bias fix).
