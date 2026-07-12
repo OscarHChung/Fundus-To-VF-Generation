@@ -16,3 +16,7 @@ __pycache__/
 
 # Generated checkpoint binaries inside results
 decoder/results/**/*.pth
+
+# Task 3 (P-A2): PAPILA frozen-feature cache -- reproducible via
+# `python decoder/diag_papila_severity.py --cache`; not committed.
+decoder/results/auto/papila_sev_features.npz
