@@ -19,10 +19,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))                       # decoder/
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))       # repo root
 import training as T
 import diagnostics as D
 from garway_heath_weighting import sector_weight_tensors
+import build_longitudinal_grape as BL
 
 AUTO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "auto")
 
@@ -114,6 +116,13 @@ def main():
                          "augmentation regularization; val stays deterministic)")
     ap.add_argument('--denoised', action='store_true',
                     help="Method B: use per-eye trend-denoised TRAIN targets (val stays RAW)")
+    ap.add_argument('--denoise-target', action='store_true',
+                    help="Task 7: use hvf_denoised (per-eye Theil-Sen TRAJECTORY fit over the "
+                         "eye's full visit timeline, evaluated at each record's own visit date) "
+                         "from data/vf_tests/grape_longitudinal.json as the TRAIN target, joined "
+                         "by PatientID_Laterality_VisitNumber onto the fold-train JSON; val/eval "
+                         "keep RAW hvf. Independent of --denoised (Method B's separate lookup "
+                         "file/threshold); mutually exclusive with it. Default OFF = byte-identical.")
     # P1 — disc-ROI as the SOLE encoder input (fundus-only; replaces the full image, not averaged).
     ap.add_argument('--disc-only', action='store_true',
                     help="P1: use a laterality-aware disc/ROI crop as the SOLE input (high-res "
@@ -149,10 +158,17 @@ def main():
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "vf_tests",
         "grape_rnfl_lookup.json"))
     a = ap.parse_args()
+    if a.denoised and a.denoise_target:
+        ap.error("--denoised and --denoise-target are mutually exclusive (two different "
+                 "TRAIN-target-denoising sources; pick one)")
     denoised_lookup = None
     if a.denoised:
         with open(T.DENOISED_TARGETS_PATH) as f:
             denoised_lookup = json.load(f)
+    elif a.denoise_target:
+        denoised_lookup = BL.load_denoise_target_lookup()
+        print(f"✓ Task7: trajectory-denoised TRAIN targets ON ({len(denoised_lookup)} keys "
+              f"from grape_longitudinal.json hvf_denoised) — val/eval keep RAW VF", flush=True)
     rnfl_lookup = None
     if a.rnfl_aux:
         with open(a.rnfl_lookup) as f:
@@ -191,7 +207,8 @@ def main():
 
     tr_tfm = T.train_transform if a.aug_views > 1 else T.val_transform
     print(f"Caching frozen prefix (blocks[:{n_frozen}]) — train ×{a.aug_views} views"
-          f"{' +denoised' if a.denoised else ''}{' +disc_only' if a.disc_only else ''} …", flush=True)
+          f"{' +denoised' if a.denoised else ''}{' +denoise_target' if a.denoise_target else ''}"
+          f"{' +disc_only' if a.disc_only else ''} …", flush=True)
     train_cache = cache_prefix(model, a.train_json, tr_tfm, n_passes=a.aug_views,
                                denoised_lookup=denoised_lookup, rnfl_lookup=rnfl_lookup,
                                disc_only=a.disc_only, disc_jitter=a.disc_jitter)
