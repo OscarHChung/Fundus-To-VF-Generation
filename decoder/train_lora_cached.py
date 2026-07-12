@@ -157,6 +157,14 @@ def main():
     ap.add_argument('--rnfl-lookup', default=os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "vf_tests",
         "grape_rnfl_lookup.json"))
+    # Task 11 — CORAL ordinal per-point head (frozen-feature probe P-C1: CORAL beat plain ridge by
+    # +0.040 sev_corr). REPLACES the continuous point head with K=20 rank-monotone ordinal bins (2dB
+    # each), decoded back to a continuous dB value — the (B,52) eval interface is unchanged. Default
+    # OFF = byte-identical to the standard point head (see tests_ordinal_head.py).
+    ap.add_argument('--ordinal-head', action='store_true',
+                    help="Task 11: CORAL ordinal per-point head (K=20 bins, 2dB each) replacing the "
+                         "continuous point head; loss becomes the CORAL BCE (same GH weighting). "
+                         "Default OFF = byte-identical to the current model.")
     a = ap.parse_args()
     if a.denoised and a.denoise_target:
         ap.error("--denoised and --denoise-target are mutually exclusive (two different "
@@ -179,11 +187,20 @@ def main():
                               lora_dropout=a.lora_dropout, copy_encoder=False,
                               severity_head=a.severity_head,
                               severity_blend=a.severity_blend,
-                              rnfl_aux=a.rnfl_aux).to(T.DEVICE)
+                              rnfl_aux=a.rnfl_aux,
+                              ordinal_head=a.ordinal_head).to(T.DEVICE)
     severity_cfg = None
     if a.severity_head:
         severity_cfg = dict(weight=a.severity_weight, ccc=a.severity_ccc,
                             eye_scale=a.severity_eye_scale)
+    # Task 11 — fixed CORAL bin config (matches training.py's ORDINAL_* constants); None when OFF so
+    # compute_loss takes its default (byte-identical) Huber path.
+    ordinal_cfg = {'bin_width': T.ORDINAL_BIN_WIDTH, 'n_thresh': T.ORDINAL_N_THRESH} \
+        if a.ordinal_head else None
+    if a.ordinal_head:
+        print(f"✓ Task11: CORAL ordinal head training ON (K={T.ORDINAL_N_BINS} bins × "
+              f"{T.ORDINAL_BIN_WIDTH:.0f}dB) — loss = CORAL BCE with the existing GH per-point "
+              f"weighting", flush=True)
     if a.warm_start:
         ck = torch.load(a.warm_start, map_location='cpu', weights_only=False)
         sd = ck.get('model', ck.get('model_state_dict', ck))
@@ -268,7 +285,10 @@ def main():
                                            attn_weights=model._last_attn_weights,
                                            sector_weights=sector_weights, sector_combine='sector_only',
                                            severity_pred=model._last_severity,
-                                           severity_cfg=severity_cfg)
+                                           severity_cfg=severity_cfg,
+                                           ordinal_logits=(model._last_ordinal_logits
+                                                           if a.ordinal_head else None),
+                                           ordinal_cfg=ordinal_cfg)
             if a.rnfl_aux and model._last_rnfl is not None:
                 rt = torch.stack([torch.as_tensor(train_cache[i]['rnfl'], dtype=torch.float32)
                                   for i in bidx]).to(T.DEVICE)                       # (B,5) z-scored
@@ -306,7 +326,8 @@ def main():
                             'severity_blend': a.severity_blend,
                             'rnfl_aux': a.rnfl_aux,
                             'disc_only': a.disc_only,
-                            'disc_half': (a.disc_half if a.disc_half is not None else T.DISC_HALF)},
+                            'disc_half': (a.disc_half if a.disc_half is not None else T.DISC_HALF),
+                            'ordinal_head': a.ordinal_head},
                            out_best)
                 tag = " ✓ saved"
             if ema: ema.restore()       # back to raw weights for continued training

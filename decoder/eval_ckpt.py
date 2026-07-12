@@ -35,7 +35,10 @@ def load_model(ckpt_path):
                               lora_alpha=ckpt.get('lora_alpha', 16),
                               lora_dropout=ckpt.get('lora_dropout', 0.1),
                               severity_head=ckpt.get('severity_head', False),
-                              severity_blend=ckpt.get('severity_blend', 1.0))
+                              severity_blend=ckpt.get('severity_blend', 1.0),
+                              # Task 11 — rebuild the CORAL head so eval reproduces training exactly;
+                              # ckpt.get(..., False) keeps older checkpoints (no such key) unaffected.
+                              ordinal_head=ckpt.get('ordinal_head', False))
     model.load_state_dict(state, strict=False)
     model.to(T.DEVICE)
     # P1 — if the model was trained on disc-ROI crops, eval MUST crop identically (fundus-only).

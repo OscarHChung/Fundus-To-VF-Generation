@@ -165,6 +165,19 @@ DIST_LOSS_WEIGHT = 0.5     # default λ on the soft-CE term in compute_loss
 LDS_SIGMA_DB = 2.0         # dB; Gaussian kernel σ for smoothing the label density
 LDS_MAX_WEIGHT = 4.0       # cap on any single bin's weight (run-4: 6 over-deepened)
 
+# Task 11 — CORAL ordinal per-point head (opt-in; --ordinal-head, default OFF).
+#   A frozen-feature probe (P-C1, diag_fusion_ordinal_probe.py) showed a CORAL ordinal readout
+#   beat plain ridge by +0.040 sev_corr. This discretizes the dB range into K bins and predicts
+#   K-1 RANK-MONOTONE CORAL logits per point (Cao et al. 2020: one shared trunk logit + strictly
+#   ORDERED biases -> automatic rank consistency, unlike independent per-threshold classifiers).
+#   Decoded back to a continuous dB value (E[value] = half-bin + bin_width * sum(P(y>threshold_k)))
+#   so the (B,52) continuous interface is UNCHANGED for eval/downstream code. Replaces the
+#   continuous point_head OUTPUT only when ON; the attention/GH-prior/global/M1 machinery is
+#   untouched either way.
+ORDINAL_N_BINS    = 20                        # K bins, 2 dB each, spanning [0,40) dB
+ORDINAL_BIN_WIDTH = 40.0 / ORDINAL_N_BINS     # 2.0 dB per bin
+ORDINAL_N_THRESH  = ORDINAL_N_BINS - 1        # K-1 = 19 ordered CORAL thresholds
+
 # Weight EMA — exponential moving average of decoder weights, evaluated/saved
 # instead of the raw weights. Low-risk variance reduction on the plateau (the
 # 211-eye generalization ceiling). 0 disables.
@@ -645,6 +658,92 @@ class DistPointHead(nn.Module):
         return self.net(x)   # (...,K) logits
 
 
+# ============== CORAL Ordinal Point Head (Task 11) ==============
+def ordinal_bin_centers(device=None):
+    """Fixed dB bin centers for the CORAL head (uniform bin_width apart), as a tensor."""
+    t = (torch.arange(ORDINAL_N_BINS, dtype=torch.float32) + 0.5) * ORDINAL_BIN_WIDTH
+    return t.to(device) if device is not None else t
+
+
+def coral_decode(logits, bin_width=ORDINAL_BIN_WIDTH):
+    """CORAL ordinal decode: continuous expected dB value from K-1 rank-monotone logits.
+
+    logits[..., k] approximates P(value > threshold_k) via sigmoid. For uniformly-spaced bins,
+    E[value] = half_bin + bin_width * sum_k P(value > threshold_k) -- equivalent to the
+    bin-probability-weighted mean of bin centers when the thresholds are monotone (guaranteed here
+    by CoralPointHead's ordered biases). logits (...,K-1) -> (...) continuous dB."""
+    probs = torch.sigmoid(logits)                          # (...,K-1) P(value > threshold_k)
+    return bin_width * (0.5 + probs.sum(dim=-1))
+
+
+def coral_targets(values, bin_width=ORDINAL_BIN_WIDTH, n_thresh=ORDINAL_N_THRESH):
+    """Binary "value > threshold_k" targets for k=1..n_thresh (thresholds at bin_width, 2*bin_width,
+    ...). values (...,) -> (...,n_thresh)."""
+    device = values.device
+    thresholds = torch.arange(1, n_thresh + 1, dtype=torch.float32, device=device) * bin_width
+    return (values.unsqueeze(-1) > thresholds.unsqueeze(0)).float()
+
+
+def coral_bce_per_point(logits, values, bin_width=ORDINAL_BIN_WIDTH, n_thresh=ORDINAL_N_THRESH):
+    """CORAL loss (Cao et al. 2020): sum of K-1 binary cross-entropies on "value > threshold_k",
+    UNREDUCED over points so the existing per-point (GH/value) weighting applies identically to the
+    Huber term it replaces. logits (...,K-1); values (...) -> (...)."""
+    targets = coral_targets(values, bin_width, n_thresh)
+    return F.binary_cross_entropy_with_logits(logits, targets, reduction='none').sum(dim=-1)
+
+
+class CoralPointHead(nn.Module):
+    """CORAL (COnsistent RAnk Logits) ordinal head, shared across all 52 points.
+
+    A single shared trunk maps the point features to ONE scalar logit; K-1 STRICTLY ORDERED biases
+    (built from a cumulative sum of non-negative softplus increments) are added to it, giving K-1
+    rank-monotone CORAL logits. Because every threshold reuses the SAME trunk output and the biases
+    are ordered by construction, logit_1 >= logit_2 >= ... >= logit_{K-1} holds for ANY input --
+    the rank-consistency guarantee that plain independent per-threshold classifiers lack."""
+    def __init__(self, input_dim=2048, hidden=256, dropout=0.4, n_thresh=ORDINAL_N_THRESH,
+                 bin_width=ORDINAL_BIN_WIDTH, init_center=PROJ_INIT_BIAS, init_temp=6.0):
+        super().__init__()
+        self.n_thresh = n_thresh
+        self.trunk = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.LayerNorm(hidden // 2),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(hidden // 2, 1),
+        )
+        nn.init.normal_(self.trunk[-1].weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.trunk[-1].bias)
+        # Unlike the other (blended / additive) heads' zero-init "no-op start" trick, this head
+        # REPLACES point_head entirely — there is no baseline path to fall back to — so the ordered
+        # biases are initialized as a smooth logistic ramp (logit_k = (init_center - threshold_k) /
+        # init_temp) so that at trunk_out≈0 the CORAL decode starts near `init_center` dB (matching
+        # PROJ_INIT_BIAS, the same warm-start scale point_head/mean_head/severity_head use) instead
+        # of an arbitrary/degenerate corner of the dB range. The ramp is still expressed via bias0 +
+        # cumsum(-softplus(bias_increments)), so the rank-monotonicity guarantee is UNCHANGED by
+        # this choice of init values (it holds for any bias_increments).
+        with torch.no_grad():
+            thresholds = torch.arange(1, n_thresh + 1, dtype=torch.float32) * bin_width
+            init_logits = (init_center - thresholds) / init_temp
+            step = bin_width / init_temp
+            inv_softplus_step = math.log(math.exp(step) - 1.0)
+        self.bias0 = nn.Parameter(init_logits[:1].clone())
+        self.bias_increments = nn.Parameter(torch.full((n_thresh - 1,), inv_softplus_step))
+
+    def _ordered_biases(self):
+        neg_steps = -F.softplus(self.bias_increments)          # (n_thresh-1,) strictly negative
+        rest = self.bias0 + torch.cumsum(neg_steps, dim=0)     # each strictly less than the previous
+        return torch.cat([self.bias0, rest], dim=0)            # (n_thresh,) strictly decreasing
+
+    def forward(self, x):
+        trunk_out = self.trunk(x)                              # (...,1) shared scalar logit
+        biases = self._ordered_biases()                        # (n_thresh,)
+        return trunk_out + biases                               # (...,n_thresh) rank-monotone
+
+
 # ============== Cross-Point Refinement ==============
 class CrossPointRefinement(nn.Module):
     def __init__(self, num_points=52, hidden=104, dropout=0.15):
@@ -708,7 +807,8 @@ class PerPointVFModel(nn.Module):
     def __init__(self, encoder, use_dist=False, dist_blend=DIST_BLEND, unfreeze_blocks=0,
                  mean_residual=False, global_head=False, finetune_norm=False,
                  lora=False, lora_rank=8, lora_blocks=8, lora_alpha=16, lora_dropout=0.1,
-                 copy_encoder=True, severity_head=False, severity_blend=1.0, rnfl_aux=False):
+                 copy_encoder=True, severity_head=False, severity_blend=1.0, rnfl_aux=False,
+                 ordinal_head=False):
         super().__init__()
         # Method C — LoRA replaces submodules in place. When the caller might reuse the shared
         # module-global base_model (eval: many models per process), deep-copy so it is never
@@ -875,11 +975,40 @@ class PerPointVFModel(nn.Module):
         else:
             print(f"  Trainable: attention={attn_p:,} + head={head_p:,} + refinement={ref_p:,} = {total:,}")
 
+        # Task 11 — CORAL ordinal per-point head. MUST be the LAST thing constructed in __init__:
+        # everything above this line draws from the global RNG in the SAME order/count whether or
+        # not this feature exists, so --ordinal-head=False (default) is BYTE-IDENTICAL to the
+        # pre-Task-11 model for a given seed (see tests_ordinal_head.py). Always built (mirrors M1's
+        # dist_head/severity_head) so checkpoints load with strict=False either way and the OFF path
+        # can be proven a no-op by scrambling its (unused) weights; only USED when ordinal_head=True,
+        # where it REPLACES the continuous point_head output entirely (no blend).
+        self.use_ordinal_head = ordinal_head
+        self._last_ordinal_logits = None
+        self.ordinal_head = CoralPointHead(input_dim=self.embed_dim * 2, hidden=256,
+                                           dropout=HEAD_DROPOUT, n_thresh=ORDINAL_N_THRESH)
+        if ordinal_head:
+            ord_p = sum(p.numel() for p in self.ordinal_head.parameters())
+            print(f"✓ Task11: CORAL ordinal per-point head ON (K={ORDINAL_N_BINS} bins × "
+                  f"{ORDINAL_BIN_WIDTH:.0f}dB, {ORDINAL_N_THRESH} ordered thresholds, "
+                  f"{ord_p:,} params) — REPLACES the continuous point head; decoded to a "
+                  f"(B,52) dB expectation")
+
     def _apply_heads(self, point_feats, cls_token, B):
-        """Scalar (+ optional distributional) heads → blended per-point pred.
-        Stores the per-image dist logits on self._last_dist_logits."""
+        """Scalar (+ optional distributional / CORAL-ordinal) heads → per-point pred.
+        Stores the per-image dist logits on self._last_dist_logits (and CORAL logits on
+        self._last_ordinal_logits)."""
         cls_expanded = cls_token.unsqueeze(1).expand(B, NUM_VALID_POINTS, self.embed_dim)
         combined = torch.cat([point_feats, cls_expanded], dim=2)
+        if self.use_ordinal_head:
+            # Task 11 — CORAL ordinal head REPLACES the continuous point_head entirely (no blend):
+            # K-1 rank-monotone logits per point, decoded back to a continuous (B,52) dB value so
+            # the attention/GH-prior/global/M1 machinery downstream is untouched.
+            logits = self.ordinal_head(combined)                     # (B,52,K-1)
+            pred = coral_decode(logits)                              # (B,52) continuous
+            self._last_ordinal_logits = logits
+            self._last_dist_logits = None
+            return pred
+        self._last_ordinal_logits = None
         scalar = self.point_head(combined)                          # (B,52)
         if self.mean_residual:
             m = self.mean_head(cls_token)                           # (B,1) eye-mean (severity)
@@ -1088,7 +1217,8 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
                  sector_weights=None, sector_combine='both', deep_cfg=None,
                  dist_logits=None, dist_cfg=None, lds_weights=None,
                  bias_penalty=BIAS_PENALTY_WEIGHT, dispersion_weight=DISPERSION_WEIGHT,
-                 loss_mode=None, bmc_sigma=None, severity_pred=None, severity_cfg=None):
+                 loss_mode=None, bmc_sigma=None, severity_pred=None, severity_cfg=None,
+                 ordinal_logits=None, ordinal_cfg=None):
     """Weighted Huber loss (+ CCC / variance / attention-entropy terms).
 
     Garway–Heath sector weighting is opt-in and fully backward-compatible:
@@ -1106,6 +1236,14 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
 
     Only the per-point Huber term is affected; the returned MAE stays unweighted
     so validation MAE remains apples-to-apples with the baseline.
+
+    Task 11 — CORAL ordinal head (opt-in, ordinal_logits=None → baseline exactly). When
+    ordinal_logits (matching `pred`'s (B,52,K-1) CORAL logits) and ordinal_cfg (dict with
+    'bin_width'/'n_thresh') are both given, the per-point Huber term is REPLACED by the CORAL
+    loss (sum of K-1 BCEs on "true > threshold_k") for that eye, still multiplied by the SAME
+    per-point `weights` (value/LDS × Garway–Heath) used by the Huber baseline. Every other term
+    (bias-control, dispersion, per-eye CCC, variance, severity, entropy) is untouched — they only
+    look at `pred`/`target`, i.e. the already-decoded continuous CORAL prediction.
     """
     device = pred.device
     target = target.to(device)
@@ -1167,13 +1305,20 @@ def compute_loss(pred, target, laterality, epoch=0, attn_weights=None,
         # Per-point Huber, with an asymmetric penalty on OVER-predicting deep
         # points (pred>gt AND gt<floor) — directly counters the positive bias /
         # scotoma-depth underestimation seen in the first GH run.
-        huber_pp = F.huber_loss(p, t, reduction='none', delta=HUBER_DELTA)
-        if deep_cfg is not None and deep_cfg.get('overpred_penalty', 0.0) > 0:
-            over_deep = (p > t) & (t < deep_cfg['floor_db'])
-            huber_pp = huber_pp * torch.where(
-                over_deep,
-                torch.full_like(p, 1.0 + deep_cfg['overpred_penalty']),
-                torch.ones_like(p))
+        if ordinal_logits is not None and ordinal_cfg is not None:
+            # Task 11 — CORAL loss REPLACES the Huber term; SAME per-point `weights` applies below.
+            ol = ordinal_logits[i][mask]                                  # (nv, K-1)
+            huber_pp = coral_bce_per_point(
+                ol, t, bin_width=ordinal_cfg.get('bin_width', ORDINAL_BIN_WIDTH),
+                n_thresh=ordinal_cfg.get('n_thresh', ORDINAL_N_THRESH))
+        else:
+            huber_pp = F.huber_loss(p, t, reduction='none', delta=HUBER_DELTA)
+            if deep_cfg is not None and deep_cfg.get('overpred_penalty', 0.0) > 0:
+                over_deep = (p > t) & (t < deep_cfg['floor_db'])
+                huber_pp = huber_pp * torch.where(
+                    over_deep,
+                    torch.full_like(p, 1.0 + deep_cfg['overpred_penalty']),
+                    torch.ones_like(p))
         huber = (huber_pp * weights).mean()
         mae   = (p - t).abs().mean()
 
