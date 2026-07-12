@@ -26,3 +26,9 @@ decoder/results/auto/papila_sev_features.npz
 # RETFound-Green caching script (see .superpowers/sdd/task-4-report.md); not committed.
 decoder/results/auto/bakeoff_retizero.npz
 decoder/results/auto/bakeoff_retfound_green__full392.npz
+
+# Session 6: large frozen-feature caches + external eval features (regenerable, do not commit)
+decoder/results/auto/*.npz
+decoder/results/auto/oof_cache*/
+# Paper draft PDF (large, author-managed)
+*.pdf

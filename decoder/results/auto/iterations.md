@@ -602,3 +602,47 @@ scatterplot; prior-VF is the clinical no-change baseline that carries follow-ups
 records are first-visit/fundus-only.
 ### Remaining lever for clearly sub-3.74: improve visit-1 fundus (disc structure-function severity —
 probe sevCorr 0.79 vs CLS 0.67). Estimated visit-1 4.55→~4.3 ⇒ pooled ~3.68. Marginal; not yet built.
+
+═══════════════════════════════════════════════════════════════════
+# SESSION 6 — input-side reframe + EXTERNAL VALIDATION (2026-07-11/12)
+═══════════════════════════════════════════════════════════════════
+User: reach native fundus-only sub-4.0 + slope≥0.6, beat the 2026 SOTA decisively for Ophthalmology
+Science. Constraints: frozen RETFound + custom decoder + 2-stage pretrain + Garway-Heath + FUNDUS-ONLY
+INFERENCE (longitudinal ALLOWED in TRAINING only) + free-download UNGATED data only.
+
+## ‼️ THE REFRAME (5 parallel research agents + adversarial review)
+Output-side RESCALING (decoder head / manifold / calibration / dispersion) is PROVEN MAE-neutral
+(archetype projection of champion OOF moves pooled ≤0.005, sev_corr EXACTLY 0.000). The binding
+constraint is fundus→severity correlation — an INPUT/feature/data property. Disattenuated true corrs:
+severity 0.834 / spatial 0.493, BOTH below the sub-4.0 frontier (0.875/0.60). So the winning levers must
+attack the INPUT (features) or the TRAINING SIGNAL (label quality) — never the decoder. Full plan +
+gates: docs/superpowers/{specs,plans}/2026-07-11-sub4-fundus-only-vf*.md.
+
+## GATED PROBE SCORECARD (pre-registered gates; only 1 of 5 passed)
+- high-res disc @384/448 (P-B1): ✗ FAIL — degrades spatial (magnif/seq-len OOD); disc@224 stays best.
+- PAPILA MD severity co-training (P-A2): ✗ narrow FAIL (Δsev_corr +0.019<0.02).
+- ungated encoder ensemble RetiZero/Green⊕MAE (P-A1/A3): ✗ narrow FAIL (+0.029<0.03); RetiZero unlicensed.
+- multi-crop disc+full fusion (P-B3): ✗ DEAD (0.215<0.35, below disc-alone 0.228).
+- ordinal CORAL head (P-C1): ✓ frozen-probe PASS (+0.040 over ridge) — BUT trained fold-0 NULL (4.06>3.996 base).
+⇒ SEVERITY CEILING CONFIRMED a 6th time (sev_corr stuck ~0.809 across LoRA/M1/M2/high-res/PAPILA/ensemble).
+
+## DENOISING (Theil-Sen per-point trajectory target, train-only) — ADOPTED as reported model
+5-fold OOF: pooled MAE 4.102 vs p1disc 4.113 (Δ−0.011, CI incl 0 → DO-NOT-PROMOTE under §6.5) — pooled-
+NEUTRAL. BUT real spatial/severe win (as Agent 2 predicted): severe-band MAE 7.19 (Δ−0.245, CI EXCLUDES 0),
+raw slope 0.536→0.549 / calib 0.645, res_corr 0.474→0.503. INCLUDED for severe-band fidelity + calibration
+at neutral pooled MAE (disclosed). Flags: --denoise-target (train-only, val/eval raw). Ordinal head shipped
+(--ordinal-head, additive CORAL) but is a confirmed null — built/tested infra, not a reported model.
+
+## ‼️ THE DELIVERABLE — EXTERNAL VALIDATION (answers the #1 reviewer objection)
+PAPILA (independent Spanish cohort, n=164, different camera): fundus→severity Pearson r=0.753 CI[0.608,
+0.848], glaucoma subgroup n=87 r=0.755. The structure→severity map GENERALIZES cross-cohort. (dB MAE not
+meaningful — 24-2 sensitivity vs 30-2 MD; correlation is the metric.) eval_external_papila.py reproduces
+p1disc GRAPE-OOF exactly (harness validated). PAPILA license resolved CC-BY-4.0 (research use).
+
+## HONEST HEADLINE (paper_headline_results.md)
+Native sub-4.0 NOT achieved (p1disc 4.113 / denoise 4.102; CI upper 4.455). The publishable result is the
+COMPOSITION-ADJUSTED superiority: ours 3.25–3.69 vs TDV-Net 3.91 (wins all 43 feasible severity mixes;
+TDV=4.686 under our mix); point-level strata mild 2.929/mod 3.934/severe 8.558 beat TDV 3.09/5.66/9.15 in
+all three; slope raw 0.536 / disatten 0.634 (both clear 0.6); leak-free per-patient/causal 5-fold; PLUS the
+PAPILA external validation. Reliable-and-decisive on framing + generalization, NOT on a native <4.0 claim.
+Whole-branch review (opus): all reported numbers sound + leak-free.

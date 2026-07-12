@@ -1,0 +1,102 @@
+{
+  "method": {
+    "champion": "p1disc (5 GRAPE-only fold checkpoints, ensembled by averaging 52-pt preds)",
+    "fov": "FULL PAPILA image (already disc-centered) through the model's non-crop decode path -- GRAPE's fixed macula-relative disc-crop coords are NOT applied (see module docstring)",
+    "tta": false,
+    "n_folds": 5,
+    "n_boot": 2000,
+    "grape_severity_convention": "GRAPE 'md' = per-eye 24-2 mean sensitivity (higher=healthier); PAPILA 'md' = true Humphrey 30-2 mean deviation (higher=healthier, different scale/zero-point) -- Pearson/Spearman r are scale-free and are the primary numbers; MAE is calibrated but not scale-matched."
+  },
+  "grape_calibration": {
+    "slope": 0.8885265994521084,
+    "intercept": 2.1515536098920918,
+    "n_eyes": 631,
+    "sev_corr": 0.801965169428195,
+    "sev_mae": 2.5766758996465144,
+    "sanity_pooled_mae": 4.1127152625885985,
+    "sanity_pooled_corr": 0.6835691450899578,
+    "sanity_pooled_slope": 0.5359269223951292
+  },
+  "overall": {
+    "n_eyes": 164,
+    "n_patients": 82,
+    "r_pearson": 0.7532447057922247,
+    "r_spearman": 0.6162682979862402,
+    "mae_raw": 26.186220421299588,
+    "mae_calibrated": 25.90297055565195,
+    "r_pearson_ci": [
+      0.607867553527774,
+      0.848339288441836
+    ],
+    "r_spearman_ci": [
+      0.4977129607307278,
+      0.7130504652865097
+    ],
+    "mae_calibrated_ci": [
+      25.115033339265942,
+      26.769229400848747
+    ]
+  },
+  "by_label": {
+    "healthy": {
+      "n_eyes": 9,
+      "n_patients": 8,
+      "r_pearson": -0.4407393222809906,
+      "r_spearman": -0.31666666666666665,
+      "mae_raw": 24.053733699423635,
+      "mae_calibrated": 23.64618498056841,
+      "r_pearson_ci": [
+        -0.7745971965179043,
+        0.543930160239379
+      ],
+      "r_spearman_ci": [
+        -0.8348623853211009,
+        0.6341463414634148
+      ],
+      "mae_calibrated_ci": [
+        21.75772290846727,
+        25.628558691825923
+      ]
+    },
+    "suspect": {
+      "n_eyes": 68,
+      "n_patients": 34,
+      "r_pearson": 0.22581298376387857,
+      "r_spearman": 0.2647973892986226,
+      "mae_raw": 24.319122762226947,
+      "mae_calibrated": 23.89214850891687,
+      "r_pearson_ci": [
+        0.01585153030831702,
+        0.4165683743571586
+      ],
+      "r_spearman_ci": [
+        0.012031039281805558,
+        0.49075289695476715
+      ],
+      "mae_calibrated_ci": [
+        23.383533171873374,
+        24.38913891246149
+      ]
+    },
+    "glaucoma": {
+      "n_eyes": 87,
+      "n_patients": 47,
+      "r_pearson": 0.7550245593949824,
+      "r_spearman": 0.6782277465918204,
+      "mae_raw": 27.866163195021695,
+      "mae_calibrated": 27.70810813443055,
+      "r_pearson_ci": [
+        0.5688450296191344,
+        0.8706976165115033
+      ],
+      "r_spearman_ci": [
+        0.5411738009990302,
+        0.7904110669135316
+      ],
+      "mae_calibrated_ci": [
+        26.371655528418593,
+        29.09703451136088
+      ]
+    }
+  }
+}
