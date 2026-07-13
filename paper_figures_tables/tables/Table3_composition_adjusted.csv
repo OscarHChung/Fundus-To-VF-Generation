@@ -1,0 +1,7 @@
+severity_stratum,our_mae_db,our_pct_points,park_mae_db,delta_ours_minus_theirs
+Mild (>=22 dB),2.90,61.2%,3.09,-0.19 (equivalent)
+Moderate (15-22 dB),4.06,21.6%,5.66,-1.60
+Severe (<15 dB),8.43,17.2%,9.15,-0.73
+"Pooled, native mix",4.10,,3.91,+0.19 (case-mix inversion)
+"Pooled, matched mix",3.27-3.65,,3.91,<= -0.26
+Park et al. under our mix,,,4.69,

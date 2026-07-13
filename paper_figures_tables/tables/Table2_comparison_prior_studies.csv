@@ -1,0 +1,5 @@
+study,data_source,prediction_target,pooled_mae_db,mild_mod_severe_db,external_validation
+This study,"GRAPE, open-access (631 records)",24-2 raw sensitivity,4.10 (composition-adjusted 3.27-3.65),2.90 / 4.06 / 8.43,"PAPILA, r 0.75"
+Park et al. 2026 (10),"Private, 2 tertiary hospitals (~37.9k photos)",24-2 total deviation,3.91,3.09 / 5.66 / 9.15,None reported
+Huang et al. 2025 (11),"Private (1,129 eyes)",Octopus 59-point sensitivity (dagger),3.10-4.13,,None reported
+Kang et al. 2024 (9),Private,VF image (cGAN) (double-dagger),,,None reported

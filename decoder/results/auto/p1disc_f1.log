@@ -23,3 +23,21 @@ Caching frozen prefix (blocks[:16]) — train ×1 views +disc_only …
 [E04] train MAE 4.24 | VAL MAE 4.069 slope 0.477 corr 0.634 σp/σt 0.75
 [E06] train MAE 4.23 | VAL MAE 4.214 slope 0.458 corr 0.635 σp/σt 0.72
 [E08] train MAE 4.03 | VAL MAE 4.128 slope 0.572 corr 0.657 σp/σt 0.87
+[E10] train MAE 3.91 | VAL MAE 4.111 slope 0.519 corr 0.646 σp/σt 0.80
+[E12] train MAE 3.78 | VAL MAE 4.164 slope 0.524 corr 0.654 σp/σt 0.80
+[E14] train MAE 3.85 | VAL MAE 4.230 slope 0.595 corr 0.649 σp/σt 0.92
+[E16] train MAE 3.69 | VAL MAE 4.226 slope 0.558 corr 0.659 σp/σt 0.85
+[E18] train MAE 3.66 | VAL MAE 4.099 slope 0.511 corr 0.642 σp/σt 0.80
+[E20] train MAE 3.43 | VAL MAE 4.101 slope 0.511 corr 0.647 σp/σt 0.79
+[E22] train MAE 3.48 | VAL MAE 4.189 slope 0.558 corr 0.653 σp/σt 0.85
+[E24] train MAE 3.37 | VAL MAE 4.140 slope 0.527 corr 0.638 σp/σt 0.83
+[E26] train MAE 3.38 | VAL MAE 4.152 slope 0.536 corr 0.644 σp/σt 0.83
+[E28] train MAE 3.31 | VAL MAE 4.162 slope 0.531 corr 0.647 σp/σt 0.82
+[E30] train MAE 3.22 | VAL MAE 4.155 slope 0.513 corr 0.641 σp/σt 0.80
+[E32] train MAE 3.24 | VAL MAE 4.141 slope 0.519 corr 0.638 σp/σt 0.81
+[E34] train MAE 3.20 | VAL MAE 4.152 slope 0.530 corr 0.640 σp/σt 0.83
+[E36] train MAE 3.21 | VAL MAE 4.166 slope 0.533 corr 0.641 σp/σt 0.83
+[E38] train MAE 3.24 | VAL MAE 4.173 slope 0.537 corr 0.641 σp/σt 0.84
+[E40] train MAE 3.25 | VAL MAE 4.170 slope 0.535 corr 0.641 σp/σt 0.83
+BEST val: MAE 4.025 slope 0.406 corr 0.627 @ep3 → /Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/results/auto/p1disc_f1_best.pth
+===== FOLD 1 done Wed Jul  8 16:20:52 PDT 2026 =====

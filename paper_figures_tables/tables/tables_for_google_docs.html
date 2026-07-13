@@ -1,0 +1,94 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Fundus2VF — Tables for Google Docs</title>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; color:#111; max-width: 1100px; margin: 24px auto; padding: 0 16px; }
+  h2 { font-size: 15px; margin: 28px 0 6px; }
+  p.legend { font-size: 12px; color:#333; margin: 6px 0 0; line-height:1.4; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 8px; }
+  th, td { border: 1px solid #444; padding: 6px 9px; text-align: left; vertical-align: top; }
+  thead th { background: #d9e2f3; font-weight: bold; }
+  tr.highlight td { background: #eef4ff; font-weight: bold; }
+  .note { font-size:12px; color:#555; background:#f6f6f6; border:1px solid #ddd; padding:10px 12px; border-radius:6px; }
+</style>
+</head>
+<body>
+
+<p class="note"><b>How to use:</b> open this file in your browser, click just above the top-left cell
+of a table and drag to the bottom-right (or triple-click inside and select the whole table), press
+<b>Cmd/Ctrl+C</b>, then paste into Google Docs. It arrives as a real, editable Docs table. Repeat per
+table. (Prefer pixel-perfect images? Use the PNGs in this same folder.)</p>
+
+<h2>Table 1 — Sectoral MAE (Garway-Heath)</h2>
+<table>
+  <thead><tr><th>Garway-Heath sector</th><th>MAE (dB)</th></tr></thead>
+  <tbody>
+    <tr><td>Inferior-arcuate</td><td>3.80</td></tr>
+    <tr><td>Inferonasal</td><td>3.80</td></tr>
+    <tr><td>Central-inferior</td><td>3.80</td></tr>
+    <tr><td>Nasal-periphery</td><td>4.14</td></tr>
+    <tr><td>Central-superior</td><td>4.15</td></tr>
+    <tr><td>Superonasal</td><td>4.25</td></tr>
+    <tr><td>Superior-arcuate</td><td>4.37</td></tr>
+    <tr><td>Temporal-wedge</td><td>4.37</td></tr>
+  </tbody>
+</table>
+<p class="legend"><b>Legend.</b> Pooled per-location MAE within each Garway-Heath disc sector
+(out-of-fold, leak-free per-patient 5-fold CV). Error is lowest in inferior/central sectors and
+highest in the superior-arcuate and temporal-wedge sectors — the sectors corresponding to the
+superior field, where glaucomatous defects are common.</p>
+
+<h2>Table 2 — Comparison with prior fundus-to-VF studies</h2>
+<table>
+  <thead><tr>
+    <th>Study</th><th>Data (source)</th><th>Prediction target</th><th>Pooled MAE (dB)</th>
+    <th>Mild / Mod / Severe (dB)</th><th>External validation</th>
+  </tr></thead>
+  <tbody>
+    <tr class="highlight">
+      <td>This study</td><td>GRAPE, open-access (631 records)</td><td>24-2 raw sensitivity</td>
+      <td>4.10 (composition-adjusted 3.27–3.65)</td><td>2.90 / 4.06 / 8.43</td><td>PAPILA, r 0.75</td>
+    </tr>
+    <tr>
+      <td>Park et al. 2026 (10)</td><td>Private, 2 tertiary hospitals (~37.9k photos)</td>
+      <td>24-2 total deviation</td><td>3.91</td><td>3.09 / 5.66 / 9.15</td><td>None reported</td>
+    </tr>
+    <tr>
+      <td>Huang et al. 2025 (11)</td><td>Private (1,129 eyes)</td>
+      <td>Octopus 59-point sensitivity†</td><td>3.10–4.13</td><td>—</td><td>None reported</td>
+    </tr>
+    <tr>
+      <td>Kang et al. 2024 (9)</td><td>Private</td><td>VF image (cGAN)‡</td>
+      <td>—</td><td>—</td><td>None reported</td>
+    </tr>
+  </tbody>
+</table>
+<p class="legend"><b>Legend.</b> † Different device/point layout/dynamic range — not directly
+comparable to 24-2 dB. ‡ Image-translation output judged by PSNR 30.61 dB / SSIM 0.48, not clinical
+sensitivity error. Mild = each location's true sensitivity ≥22 dB; moderate 15–22; severe &lt;15. Our
+mild figure is statistically equivalent to Park et al.'s (within measurement error).</p>
+
+<h2>Table 3 — Composition-adjusted comparison vs Park et al. 2026</h2>
+<table>
+  <thead><tr>
+    <th>Severity stratum</th><th>Our MAE (dB)</th><th>Our % of points</th>
+    <th>Park et al. MAE (dB)</th><th>Δ (ours − theirs)</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Mild (≥22 dB)</td><td>2.90</td><td>61.2%</td><td>3.09</td><td>−0.19 (equivalent)</td></tr>
+    <tr><td>Moderate (15–22 dB)</td><td>4.06</td><td>21.6%</td><td>5.66</td><td>−1.60</td></tr>
+    <tr><td>Severe (&lt;15 dB)</td><td>8.43</td><td>17.2%</td><td>9.15</td><td>−0.73</td></tr>
+    <tr><td>Pooled, native mix</td><td>4.10</td><td>—</td><td>3.91</td><td>+0.19 (case-mix inversion)</td></tr>
+    <tr><td>Pooled, matched mix</td><td>3.27–3.65</td><td>—</td><td>3.91</td><td>≤ −0.26</td></tr>
+    <tr><td>Park et al. under our mix</td><td>—</td><td>—</td><td>4.69</td><td>—</td></tr>
+  </tbody>
+</table>
+<p class="legend"><b>Legend.</b> Each model recomputed under matched severity compositions using our
+own out-of-fold errors (no retraining). Pooled native MAEs are not directly comparable because the
+cohorts differ in severity mix; the matched-mix rows are. Point-level strata (each point bucketed by
+its own true sensitivity) — the convention Park et al.'s numbers are directly comparable under.</p>
+
+</body>
+</html>

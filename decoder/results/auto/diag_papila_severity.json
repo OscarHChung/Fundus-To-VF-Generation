@@ -1,0 +1,43 @@
+{
+  "primary": {
+    "label": "primary: GRAPE disc224 + PAPILA",
+    "n_grape": 631,
+    "n_papila": 164,
+    "corr_base": 0.7532919978710706,
+    "mae_base": 0.527163174047694,
+    "corr_plus": 0.7711196992935277,
+    "mae_plus": 0.5139857844637178,
+    "delta": 0.017827701422457154,
+    "delta_boot_mean": 0.017708950296658522,
+    "delta_ci_lo": 0.002996124914695417,
+    "delta_ci_hi": 0.033831583925559565
+  },
+  "fallback_a": {
+    "label": "fallback (a): GRAPE FULL + PAPILA",
+    "n_grape": 631,
+    "n_papila": 164,
+    "corr_base": 0.720279323048019,
+    "mae_base": 0.5573121705367343,
+    "corr_plus": 0.7393360885053669,
+    "mae_plus": 0.5495239488209654,
+    "delta": 0.019056765457347913,
+    "delta_boot_mean": 0.019047457623954347,
+    "delta_ci_lo": 0.0010782853247491703,
+    "delta_ci_hi": 0.03751834562535462
+  },
+  "fallback_b": {
+    "label": "fallback (b): disc224 + PAPILA, per-dataset centering",
+    "n_grape": 631,
+    "n_papila": 164,
+    "corr_base": 0.7532919978710706,
+    "mae_base": 0.527163174047694,
+    "corr_plus": 0.7665562613991362,
+    "mae_plus": 0.5248937157172707,
+    "delta": 0.013264263528065645,
+    "delta_boot_mean": 0.013192985659215648,
+    "delta_ci_lo": -2.50695408343576e-05,
+    "delta_ci_hi": 0.02796029398192159
+  },
+  "gate_threshold": 0.02,
+  "verdict": "FAIL -- PAPILA severity transfer does not hold (domain shift); skip Task 10 (PAPILA remains usable for external validation, Task 13)"
+}

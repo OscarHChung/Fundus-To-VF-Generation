@@ -1,0 +1,22 @@
+FIGURE 1 — G1 → 24-2 spatial mapping schematic
+================================================
+
+STATUS: "Keep — unchanged" (per the figure/table checklist in Fundus2VF_paper_revision.md).
+
+There is NO standalone, regenerated asset for Figure 1 anywhere in this repository. It is a
+hand-made conceptual diagram that lives only inside the existing manuscript:
+
+    ../../Fundus2VF Paper Draft.pdf      (repo root: "Fundus2VF Paper Draft.pdf")
+
+ACTION FOR THE AUTHOR:
+  - Reuse the Figure 1 already in your paper draft (it is unchanged by this revision), OR
+  - Export it from your original figure-drawing source (PowerPoint/Illustrator/etc.) at
+    publication resolution and drop the PNG/TIFF into this folder as Figure1_g1_to_242_mapping.png.
+
+Updated legend (from Fundus2VF_paper_revision.md, §2.1):
+  "To produce a standard 24-2 output, we remapped each G1 field onto the 24-2 layout. The G1
+   points — originally ordered in a spiral from the center outward (clockwise for OD,
+   counter-clockwise for OS) — were first re-ordered from top-left to bottom-right. Each G1 and
+   24-2 location was labeled with its (x, y) position in degrees from fixation, and each G1 point
+   was matched to its nearest 24-2 location with a KD-tree; where several G1 points fell on the
+   same 24-2 location, we took their distance-weighted average."

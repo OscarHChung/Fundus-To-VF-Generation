@@ -1,0 +1,33 @@
+✓ Using MPS (Apple Silicon GPU)
+✓ Loaded RETFound
+✓ Encoder: FROZEN
+✓ Method C: LoRA ON — 8 adapters in last 8 blocks (rank=8, alpha=16, dropout=0.1); 262,144 trainable LoRA params; RETFound base frozen
+✓ Per-point attention (dropout=0.4, temp_init=2.0)
+✓ Shared point head (dropout=0.4)
+✓ Joint global-spatial head ON (ADDITIVE: per-point pred + zero-mean global pattern from mean-pool patches‖CLS; zero-init=no-op start) — targets eyeCorr 0.51
+✓ M1: severity head ON (CLS→ΔMD uniform-shift correction on the emergent eye-mean, zero-init=no-op start, blend=1.0) — de-shrunk severity
+✓ Cross-point refinement
+  Trainable: attention=425,985 + head=558,337 + refinement=11,181 = 995,503
+  Train: 109 eyes → 109 images
+  Train: 130 eyes → 130 images
+  Train: 120 eyes → 120 images
+  Train: 141 eyes → 141 images
+  Train: 131 eyes → 131 images
+cached 631 features (2048-d) → d1_retfound_features.npz
+====================================================================================
+D1 severity learning curve — frozen RETFound features (2048-d), OOF sev_corr
+------------------------------------------------------------------------------------
+ n_train_eyes   sev_corr   sev_MAE   (mean ± sd over held-out folds × resamples)
+           40      0.403     4.355
+           80      0.544     4.019  Δ+0.140
+          120      0.598     3.872  Δ+0.054
+          170      0.628     3.754  Δ+0.030
+          210      0.651     3.691  Δ+0.022
+          300      0.673     3.564  Δ+0.023
+          400      0.688     3.482  Δ+0.015
+          505      0.738     3.488  Δ+0.050
+------------------------------------------------------------------------------------
+sev_corr change n=210→505: +0.087   (STILL RISING → data/encoder-limited)
+refs: m1sev OOF sev_corr 0.807 ; p1disc (disc crop) 0.802 ; frontier for sub-4.0 needs ≈0.875
+====================================================================================
+D1_DONE Fri Jul 10 11:56:02 PDT 2026

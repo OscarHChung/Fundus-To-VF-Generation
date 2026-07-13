@@ -1,0 +1,36 @@
+✓ Using MPS (Apple Silicon GPU)
+✓ Loaded RETFound
+✓ Encoder: FROZEN
+✓ Method C: LoRA ON — 8 adapters in last 8 blocks (rank=8, alpha=16, dropout=0.1); 262,144 trainable LoRA params; RETFound base frozen
+✓ Per-point attention (dropout=0.4, temp_init=2.0)
+✓ Shared point head (dropout=0.4)
+✓ Joint global-spatial head ON (ADDITIVE: per-point pred + zero-mean global pattern from mean-pool patches‖CLS; zero-init=no-op start) — targets eyeCorr 0.51
+✓ M1: severity head ON (CLS→ΔMD uniform-shift correction on the emergent eye-mean, zero-init=no-op start, blend=1.0) — de-shrunk severity
+✓ Cross-point refinement
+  Trainable: attention=425,985 + head=558,337 + refinement=11,181 = 995,503
+  Val: 130 eyes with 130 images
+  TTA: 3 rotations [-5, 0, 5]°
+  Val: 501 eyes with 501 images
+  TTA: 3 rotations [-5, 0, 5]°
+  fold 1: scored + cached → m2rnfl_f1.npz
+  fold 1: MAE 4.088 | floor 10.81(n550) | deep 8.64 | slope 0.456 | corr 0.621 | eyeCorr 0.460 | bias +0.79 | σp/σt 0.73
+
+(scored 1 of 5 folds — pooled numbers below are PARTIAL)
+
+============================================================================================
+m2rnfl  5-FOLD OOF (130 recs)  RAW    MAE 4.088 | floor 10.81(n550) | deep 8.64 | slope 0.456 | corr 0.621 | eyeCorr 0.460 | bias +0.79 | σp/σt 0.73
+  severity-stratified (per-eye true mean dB):
+    severe   n= 20 | MAE 7.490 | floor 9.20 | slope 0.135
+    moderate n= 36 | MAE 5.567 | floor 13.46 | slope 0.206
+    mild     n= 74 | MAE 2.448 | floor 12.64 | slope 0.372
+m2rnfl  5-FOLD OOF (130 recs)  CALIB  MAE 4.413 | floor 9.72(n550) | deep 8.27 | slope 0.588 | corr 0.621 | eyeCorr 0.460 | bias +0.22 | σp/σt 0.95
+  severity-stratified (per-eye true mean dB):
+    severe   n= 20 | MAE 7.802 | floor 8.02 | slope 0.161
+    moderate n= 36 | MAE 6.085 | floor 12.52 | slope 0.268
+    mild     n= 74 | MAE 2.684 | floor 10.86 | slope 0.487
+
+  SEVERITY decomp (pooled OOF): sev_corr 0.782  sev_shrink 0.90  sev_mae 2.55 | res_corr 0.378  res_shrink 0.50
+============================================================================================
+refs: long_global 4.290/0.473/r0.657/severe~7.49 ; loraC 4.220/0.485/r0.657/severe7.694
+TARGET: MAE<4.00 AND slope≥0.60 (raw), severe not worse, r≥0.72 ideally.
+→ /Users/oscarchung/Documents/Python Projects/Fundus-To-VF-Generation/decoder/results/auto/m2rnfl_cv.json
