@@ -24,14 +24,24 @@ CVDIR = os.path.join(BASE, "decoder", "results", "cv_long")
 CACHE = os.path.join(AUTO, "oof_cache_notta")
 FUND  = os.path.join(BASE, "data", "fundus", "grape_fundus_images")
 
-# Grid constants exported from garway_heath_weighting / diagnostics (query-order convention A).
-_G = json.load(open(os.path.join(
-    "/private/tmp/claude-501/-Users-oscarchung-Documents-Python-Projects-Fundus-To-VF-Generation/"
-    "f4b3cc59-4014-4e41-8eb4-5db61c1e602b/scratchpad", "grid.json")))
-VALID_OD = np.array(_G["valid_indices_od"], int)
-VALID_OS = np.array(_G["valid_indices_os"], int)
-SECTOR_OD = np.array(_G["SECTOR_GRID"], float)          # 8x9, -1 on masked cells
-SECTOR_OS = np.fliplr(SECTOR_OD)
+# ── VF 24-2 grid (inlined) + canonical Garway–Heath 6-sector map (query-order convention A) ──
+#   Formerly loaded from a since-deleted scratchpad grid.json; the sector map is now read from the
+#   single source of truth (decoder/garway_heath_sectors.json), so a re-section propagates here
+#   automatically.
+mask_OD = np.array([
+    [False, False, False, True,  True,  True,  True,  False, False],
+    [False, False, True,  True,  True,  True,  True,  True,  False],
+    [False, True,  True,  True,  True,  True,  True,  True,  True ],
+    [True,  True,  True,  True,  True,  True,  True,  False, True ],
+    [True,  True,  True,  True,  True,  True,  True,  False, True ],
+    [False, True,  True,  True,  True,  True,  True,  True,  True ],
+    [False, False, True,  True,  True,  True,  True,  True,  False],
+    [False, False, False, True,  True,  True,  True,  False, False],
+], dtype=bool)
+VALID_OD = np.array([i for i, v in enumerate(mask_OD.flatten()) if v], int)
+VALID_OS = np.array([i for i, v in enumerate(np.fliplr(mask_OD).flatten()) if v], int)
+SECTOR_OD = np.array(json.load(open(os.path.join(
+    BASE, "decoder", "garway_heath_sectors.json")))["sector_grid"], float)  # 8x9, -1 masked
 
 
 def vec_to_grid(vec52, eye):
@@ -41,6 +51,15 @@ def vec_to_grid(vec52, eye):
     g[vi] = vec52
     g = g.reshape(8, 9)
     return np.fliplr(g) if eye == "OS" else g
+
+
+def sector_disp(eye):
+    """Sector-id grid in the SAME display orientation `vec_to_grid` produces for `eye`, so the
+    boundary overlay lines up with the MAE grid for either eye (the old OS overlay used a raw
+    fliplr that was mirror-misaligned against the vec_to_grid'd OS MAE)."""
+    src = SECTOR_OD if eye == "OD" else np.fliplr(SECTOR_OD)
+    vi = VALID_OD if eye == "OD" else VALID_OS
+    return vec_to_grid(np.array([src.flat[i] for i in vi], float), eye)
 
 
 def load_records():
@@ -109,9 +128,9 @@ def make_heatmap(recs):
         f"OD MAE: {res['OD']['pooled']:.2f} dB   |   OS MAE: {res['OS']['pooled']:.2f} dB"
         f"   |   Combined: {comb:.2f} dB", fontsize=15, fontweight="bold")
     plot_grid(ax[0, 0], res["OD"]["mae"], "OD — Avg MAE per Location (Right Eye)",
-              "inferno", 0, 10, "MAE (dB)", boundaries=SECTOR_OD)
+              "inferno", 0, 10, "MAE (dB)", boundaries=sector_disp("OD"))
     plot_grid(ax[0, 1], res["OS"]["mae"], "OS — Avg MAE per Location (Left Eye)",
-              "inferno", 0, 10, "MAE (dB)", boundaries=SECTOR_OS)
+              "inferno", 0, 10, "MAE (dB)", boundaries=sector_disp("OS"))
     plot_grid(ax[1, 0], res["OD"]["gt"], "OD — Avg GT Sensitivity (Right Eye)",
               "inferno", 0, 30, "Sensitivity (dB)")
     plot_grid(ax[1, 1], res["OS"]["gt"], "OS — Avg GT Sensitivity (Left Eye)",

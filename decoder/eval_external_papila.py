@@ -19,10 +19,11 @@ off-center region, not the disc. So for PAPILA we bypass disc_crop_pil entirely 
 PAPILA image through the model's decoder at 224x224 (T.val_transform / T.get_tta_transforms, the
 SAME resize+normalize pipeline used everywhere else in this repo) -- this is the closest FOV match
 to the champion's intended disc view, and matches the precedent already established for PAPILA in
-diag_papila_severity.py. This FOV/domain gap (crop framing, camera, population) is part of what is
-being tested, not something to paper over.
+diag_papila_severity.py (that probe was removed in the 2026-07 cleanup; see git history). This
+FOV/domain gap (crop framing, camera, population) is part of what is being tested, not something
+to paper over.
 
-Severity-scale harmonization (see diag_papila_severity.py's docstring for the same note): GRAPE's
+Severity-scale harmonization (the removed probe's docstring carried the same note): GRAPE's
 ground truth ("md" throughout this codebase, e.g. bakeoff_retfound_mae__disc224.npz) is per-eye
 24-2 MEAN SENSITIVITY (~28 dB healthy, LOWER = worse -- GRAPE has no age-normative database, so
 there is no literal clinical MD to fit against). PAPILA's `md` is genuine Humphrey 30-2 MEAN

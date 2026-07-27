@@ -9,15 +9,19 @@ models. This is a NEW weight, distinct from the existing value-based (severity)
 weight in `training.compute_loss`; the two combine multiplicatively and the
 interaction is configurable (`both` / `sector_only` / `value_only`).
 
-Design notes (full write-up: decoder/specs/garway_heath_weighting.md):
+Design notes (full write-up: docs/specs/garway_heath_weighting.md):
 
   * 52 valid points live in an 8×9 = 72 grid masked by `mask_OD`. The model
     outputs a length-52 vector in `valid_indices_od` (query) order; OS targets
     are gathered with `valid_indices_os` derived from `fliplr(mask_OD)` — the
     SAME convention as decoder/training.py (NOT the `reversed()` convention
     used by predict_vf_from_fundus.py / visualize_MAE_heatmap.py).
-  * `SECTOR_GRID` is the single source of truth, defined ONCE on the 8×9 OD
-    grid. OS sectors are derived by mirroring (`fliplr`) so a query index maps
+  * `SECTOR_GRID` is the single source of truth: the canonical Garway–Heath
+    6-sector map (Garway-Heath 2000), defined ONCE on the 8×9 OD grid. It is now
+    used for anatomical *reporting* (per-sector MAE) and figures; sector loss
+    weights default to UNIFORM (see SECTOR_WEIGHTS). The legacy 8-sector draft
+    that trained the reported checkpoints is preserved as LEGACY_SECTOR_GRID_DRAFT.
+    OS sectors are derived by mirroring (`fliplr`) so a query index maps
     to the anatomically-correct sector for each eye. Because the blind-spot
     column is asymmetric, the per-query sector vectors differ between eyes even
     though the *displayed* sector maps mirror exactly (see selftest).
@@ -53,6 +57,9 @@ VAL_JSON    = os.path.join(BASE_DIR, "data", "vf_tests", "grape_test.json")
 TRAIN_JSON  = os.path.join(BASE_DIR, "data", "vf_tests", "grape_train.json")
 
 RESULTS_DIR    = os.path.join(CURRENT_DIR, "results", "garway_heath")
+# The resolved sector map is configuration, not a result — it is read by the paper-figure
+# generators and committed alongside the code, so it lives next to this module.
+SECTOR_CONFIG  = os.path.join(CURRENT_DIR, "garway_heath_sectors.json")
 BASELINE_MODEL = os.path.join(CURRENT_DIR, "inference_model.pth")           # baseline (value-only) checkpoint
 GH_MODEL       = os.path.join(RESULTS_DIR, "inference_model_gh.pth")        # sector-weighted checkpoint
 
@@ -78,21 +85,66 @@ valid_indices_os = [i for i, v in enumerate(mask_OS.flatten()) if v]   # trainin
 NUM_VALID_POINTS = len(valid_indices_od)                              # 52
 
 # ==============================================================
-# SECTOR MAP  —  EDITABLE SOURCE OF TRUTH (8 sectors, draft)
+# SECTOR MAP  —  canonical GARWAY–HEATH 6-sector map (Garway-Heath et al.,
+#               Ophthalmology 2000; "Mapping the visual field to the optic disc")
 # --------------------------------------------------------------
-# Defined ONCE on the 8×9 OD (right-eye) grid. Orientation:
+# Defined ONCE on the 8×9 OD (right-eye) grid. Orientation (FIELD view):
 #   rows 0-3 = SUPERIOR field, rows 4-7 = INFERIOR field
 #   low col  = NASAL,  col 4 = centre,  high col = TEMPORAL
 #   (blind spot is temporal: masked at col 7, rows 3 & 4)
 #
+# Sectors are named by the OPTIC-DISC region they map to, so the map crosses:
+# SUPERIOR field points → INFERIOR-disc sectors (IN / IT), INFERIOR field points
+# → SUPERIOR-disc sectors (SN / ST), and the temporal-wedge field → Nasal disc.
+# This is the empirical structure-function map, NOT a naive field-region carve-up.
+# Transcribed pixel-exact from the published 24-2 sector figure and verified to
+# match cell-for-cell (52 points, all 6 sectors used); see
+# docs/specs/2026-07-15-garway-heath-sectoring-fix-design.md.
+#
 # Sector ids → names (see SECTOR_NAMES). -1 marks the 20 masked grid cells.
-# This is a Garway–Heath-*style* 8-section variant adapted to this grid; it is a
-# DRAFT meant to be hand-edited. Just change the ids below to re-sector — the
-# rest of the module (weights, OS mirroring, metrics, figures) follows
-# automatically. `selftest()` re-verifies coverage / laterality after edits.
 # ==============================================================
 _C = -1
+# ids: 0=Temporal(T) 1=Superotemporal(ST) 2=Superonasal(SN) 3=Nasal(N)
+#      4=Inferonasal(IN) 5=Inferotemporal(IT)
 SECTOR_GRID = np.array([
+    [_C, _C, _C,  4,  4,  4,  4, _C, _C],
+    [_C, _C,  4,  5,  5,  5,  5,  4, _C],
+    [_C,  5,  5,  5,  5,  5,  5,  4,  3],
+    [ 5,  5,  5,  5,  0,  0,  0, _C,  3],
+    [ 2,  1,  1,  1,  0,  0,  0, _C,  3],
+    [_C,  2,  1,  1,  1,  1,  1,  2,  3],
+    [_C, _C,  2,  2,  1,  1,  2,  2, _C],
+    [_C, _C, _C,  2,  2,  2,  2, _C, _C],
+], dtype=int)
+
+N_SECTORS = 6
+SECTOR_NAMES = OrderedDict([
+    (0, "Temporal"),
+    (1, "Superotemporal"),
+    (2, "Superonasal"),
+    (3, "Nasal"),
+    (4, "Inferonasal"),
+    (5, "Inferotemporal"),
+])
+
+# ── Per-sector RAW weights ─────────────────────────────────────
+# UNIFORM (1.0) by default: the corrected map is used for anatomical *reporting*
+# (per-sector MAE) and figures; the loss no longer depends on any hand-drawn
+# sector weighting. With `--sector-combine sector_only`, uniform sector weights
+# make the per-point loss equivalent to a plain (unweighted) per-point loss.
+# NOTE ON PROVENANCE: the reported `p1disc`/`p1disc_denoise` checkpoints were
+# trained BEFORE this correction, using the legacy 8-sector DRAFT map + weights
+# preserved below (LEGACY_SECTOR_GRID_DRAFT / LEGACY_SECTOR_WEIGHTS). That was a
+# mild, mean-1-normalized spatial reweight of the loss; it does not structurally
+# determine predictions (the attention prior in training.py is a separate
+# retinotopic VF→patch map, not this sector grid). Changing this constant does
+# NOT alter those checkpoints or their cached OOF predictions.
+SECTOR_WEIGHTS = {s: 1.0 for s in range(N_SECTORS)}
+
+# ── Legacy 8-sector DRAFT (provenance only; used to train the reported ckpts) ──
+# Kept so the exact training loss of the reported checkpoints stays reproducible.
+# Do NOT use for new work — it is a non-canonical hand-drawn "GH-style" variant.
+LEGACY_SECTOR_GRID_DRAFT = np.array([
     [_C, _C, _C,  2,  2,  3,  3, _C, _C],
     [_C, _C,  2,  2,  3,  3,  3,  7, _C],
     [_C,  6,  2,  2,  0,  3,  3,  7,  7],
@@ -102,34 +154,8 @@ SECTOR_GRID = np.array([
     [_C, _C,  4,  4,  5,  5,  5,  7, _C],
     [_C, _C, _C,  4,  4,  5,  5, _C, _C],
 ], dtype=int)
-
-N_SECTORS = 8
-SECTOR_NAMES = OrderedDict([
-    (0, "Central-Superior"),
-    (1, "Central-Inferior"),
-    (2, "Superonasal"),
-    (3, "Superior-arcuate"),
-    (4, "Inferonasal"),
-    (5, "Inferior-arcuate"),
-    (6, "Nasal-periphery"),
-    (7, "Temporal-wedge"),
-])
-
-# ── Per-sector RAW weights (EDITABLE) ──────────────────────────
-# Upweight the peripheral / arcuate / nasal-step zones (where severe loss and
-# model underestimation concentrate); downweight the well-predicted centre.
-# These are normalised to mean 1.0 over the 52 valid points before use, so the
-# loss and the weighted-MAE stay on the dB scale (see sector_weight_vector).
-SECTOR_WEIGHTS = {
-    0: 0.75,   # Central-Superior   (spared until late; downweight)
-    1: 0.75,   # Central-Inferior
-    2: 1.10,   # Superonasal
-    3: 1.55,   # Superior-arcuate   (Bjerrum zone; lagged most in run-1 → biggest bump)
-    4: 1.15,   # Inferonasal
-    5: 1.50,   # Inferior-arcuate
-    6: 1.35,   # Nasal-periphery    (nasal step)
-    7: 1.25,   # Temporal-wedge     (far periphery)
-}
+LEGACY_SECTOR_WEIGHTS = {0: 0.75, 1: 0.75, 2: 1.10, 3: 1.55,
+                         4: 1.15, 5: 1.50, 6: 1.35, 7: 1.25}
 
 # ── Deep-floor loss shaping (EDITABLE) ─────────────────────────
 # Goal-1 rescue, driven by the first GH run: severe *eyes* and 7/8 sectors
@@ -359,7 +385,7 @@ def resolved_config(extra=None):
 
 
 def save_resolved_config(path=None, extra=None):
-    path = path or os.path.join(RESULTS_DIR, "config.json")
+    path = path or SECTOR_CONFIG
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(resolved_config(extra), f, indent=2)

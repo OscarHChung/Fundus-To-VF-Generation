@@ -38,7 +38,7 @@ figshare item itself (GPL is a software license, not an obvious fit for a data+i
 and contradicts the paper's own CC-BY statement). **Flag for legal/PI review before any
 redistribution beyond internal research use** — this repo only uses PAPILA for (a) internal
 severity co-training and (b) internal external-validation reporting, consistent with CC-BY.
-This resolution is mirrored in `decoder/results/auto/paper_headline_results.md` §4.
+This resolution is mirrored in `paper/headline_results.md` §4.
 
 ## Archive structure (after `unzip PAPILA.zip`)
 
@@ -99,7 +99,7 @@ healthy-labeled eyes) have no MD at all. (A handful of healthy-labeled fellow-ey
 do have an MD recorded — almost always because that patient's *other* eye was Group 1/2 and got a
 bilateral VF test at the same visit.)
 
-**Consequence for `decoder/tests_external_papila.py`:** the Task 0 brief's draft test asserted
+**Consequence for `decoder/tests/test_external_papila.py`:** the Task 0 brief's draft test asserted
 `len(recs) >= 200`. That count is unreachable by any faithful harmonization of this dataset —
 only 164 eyes have a real MD to keep. The committed test asserts `>= 150` instead, with a comment
 pointing back to this file. `label_counts` in the harmonized output: `{"suspect": 68, "glaucoma":
@@ -125,7 +125,7 @@ revisit only if Task 3's co-training probe specifically wants a binary auxiliary
 ## What is/ isn't committed to git
 
 - **Committed:** this `SOURCE.md`, `decoder/build_external_papila.py`,
-  `decoder/tests_external_papila.py`, and the small harmonized `data/external/papila_records.json`
+  `decoder/tests/test_external_papila.py`, and the small harmonized `data/external/papila_records.json`
   (52 KB).
 - **NOT committed (gitignored):** `data/external/papila/PAPILA.zip` and the entire extracted
   `data/external/papila/PapilaDB-PAPILA-*/` tree (raw images + spreadsheets + segmentations), per

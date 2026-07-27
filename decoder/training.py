@@ -145,7 +145,7 @@ FORCE_VAL_EVERY = 10    # validate every N epochs regardless of gate (sanity / m
 OUTLIER_CLIP_RANGE = (0, 35)
 
 # ══════════════════════════════════════════════════════════════
-# TIER-1 IMPROVEMENTS (opt-in; see decoder/specs/severe_point_improvement_plan.md)
+# TIER-1 IMPROVEMENTS (opt-in; see docs/specs/severe_point_improvement_plan.md)
 # ══════════════════════════════════════════════════════════════
 # M1 — Distributional / ordinal per-point head.
 #   The scalar Huber head structurally regresses rare deep points toward the
@@ -166,7 +166,7 @@ LDS_SIGMA_DB = 2.0         # dB; Gaussian kernel σ for smoothing the label dens
 LDS_MAX_WEIGHT = 4.0       # cap on any single bin's weight (run-4: 6 over-deepened)
 
 # Task 11 — CORAL ordinal per-point head (opt-in; --ordinal-head, default OFF).
-#   A frozen-feature probe (P-C1, diag_fusion_ordinal_probe.py) showed a CORAL ordinal readout
+#   A frozen-feature probe (P-C1, diag_fusion_ordinal_probe.py — removed in the 2026-07 cleanup; see git history) showed a CORAL ordinal readout
 #   beat plain ridge by +0.040 sev_corr. This discretizes the dB range into K bins and predicts
 #   K-1 RANK-MONOTONE CORAL logits per point (Cao et al. 2020: one shared trunk logit + strictly
 #   ORDERED biases -> automatic rank consistency, unlike independent per-threshold classifiers).
@@ -1718,7 +1718,7 @@ def diagnose_training(history, target_mae=SUBGOAL_TARGET_MAE):
                           f"(>{GOAL_PLATEAU_MIN_DELTA} dB) for {checks_since} checks; "
                           f"best {best_so_far:.2f} dB stays above the {target_mae:.1f} dB "
                           f"target. Further training won't reach it — switch methods "
-                          f"(decoder/specs/severe_point_improvement_plan.md)."), warns
+                          f"(docs/specs/severe_point_improvement_plan.md)."), warns
 
     # Soft warnings (printed live; do NOT stop).
     # Guard: require ≥5 checks so uninitialized-model noise doesn't fire these.
@@ -1862,19 +1862,18 @@ def train(weighting='baseline', sector_combine='both', epochs=EPOCHS,
     sector_weights = None
     if weighting == 'garway_heath':
         from garway_heath_weighting import (sector_weight_tensors,
-                                            save_resolved_config, RESULTS_DIR,
+                                            save_resolved_config, SECTOR_CONFIG,
                                             deep_loss_config)
         sector_weights = sector_weight_tensors(device=DEVICE, normalize=True)
         if deep_cfg is None:
             deep_cfg = deep_loss_config()
-        os.makedirs(RESULTS_DIR, exist_ok=True)
         save_resolved_config(extra={'combine': sector_combine, 'epochs': epochs,
                                     'deep_loss': deep_cfg})
         print(f"✓ Garway–Heath weighting ON  (combine={sector_combine})")
         print(f"  Deep-floor rescue: floor_db={deep_cfg['floor_db']:.1f} dB | "
               f"floor_boost={deep_cfg['floor_boost']:.2f} | "
               f"overpred_penalty={deep_cfg['overpred_penalty']:.2f}")
-        print(f"  Resolved config + checkpoints → {RESULTS_DIR}")
+        print(f"  Resolved sector config → {SECTOR_CONFIG}")
     else:
         deep_cfg = None
         print("✓ Weighting: baseline (value-based only)")
@@ -2328,7 +2327,7 @@ if __name__ == "__main__":
     parser.add_argument('--floor-db', type=float, default=None,
                         help="GH only: GT threshold (dB) defining the 'deep floor' for "
                              "the boost/penalty. Default from module.")
-    # ── Tier-1 improvements (see decoder/specs/severe_point_improvement_plan.md) ──
+    # ── Tier-1 improvements (see docs/specs/severe_point_improvement_plan.md) ──
     parser.add_argument('--head', choices=['scalar', 'distributional'], default='scalar',
                         help="'scalar' = original Huber regression head (default); "
                              "'distributional' = M1: add a per-point dB-bin head trained "

@@ -1,34 +1,27 @@
-encoder/RETFound_cfp_weights.pth
-data/fundus/grape_fundus_images/*.jpg
-data/*.pt
-decoder/*.pth
-encoder/*.pth
+# ── Large binaries: model weights ──────────────────────────────────────────────
+# Checkpoints bundle the frozen RETFound encoder (~500 MB - 1.2 GB each).
+*.pth
+*.pt
 
+# ── Large binaries: raw data ───────────────────────────────────────────────────
+data/fundus/grape_fundus_images/*.jpg
 # PAPILA raw download (zip + extracted images/spreadsheets) -- see data/external/papila/SOURCE.md
 # Only the harmonized data/external/papila_records.json + SOURCE.md are tracked.
 data/external/papila/*
 !data/external/papila/SOURCE.md
+# Paper draft PDF (large, author-managed)
+*.pdf
 
-# Python bytecode
+# ── Regenerable caches ─────────────────────────────────────────────────────────
+# Frozen-feature caches are large and rebuildable from the encoder; the per-fold
+# out-of-fold prediction caches are NOT ignored -- at ~160 KB each they are the
+# source of truth for every published number and reproduce all figures torch-free.
+decoder/results/auto/*.npz
+
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
 
-# Generated checkpoint binaries inside results
-decoder/results/**/*.pth
-
-# Task 3 (P-A2): PAPILA frozen-feature cache -- reproducible via
-# `python decoder/diag_papila_severity.py --cache`; not committed.
-decoder/results/auto/papila_sev_features.npz
-
-# Task 4 (P-A1/A3): RetiZero / RETFound-Green frozen-feature caches -- reproducible via
-# `python decoder/diag_encoder_bakeoff.py --cache --only retizero` and the dedicated
-# RETFound-Green caching script (see .superpowers/sdd/task-4-report.md); not committed.
-decoder/results/auto/bakeoff_retizero.npz
-decoder/results/auto/bakeoff_retfound_green__full392.npz
-
-# Session 6: large frozen-feature caches + external eval features (regenerable, do not commit)
-decoder/results/auto/*.npz
-decoder/results/auto/oof_cache*/
-# Paper draft PDF (large, author-managed)
-*.pdf
+# ── OS cruft ───────────────────────────────────────────────────────────────────
+.DS_Store
